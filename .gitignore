@@ -1,0 +1,46 @@
+# === Secrets ===
+.env
+.env.local
+*.pem
+
+# === Python ===
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# === Тестовые данные и исходные PDF (не пушим) ===
+*.pdf
+*.docx
+ЭТАЛОН — оригинал PDF + идеальный Markdown/
+new_files/*
+!new_files/pto_scoring_kit/
+new_files/pto_scoring_kit/*
+!new_files/pto_scoring_kit/score_real_testset.py
+!new_files/pto_scoring_kit/README.md
+
+# === Результаты прогонов и сгенерированные отчёты (регенерируемо) ===
+hf_runs/
+quality_viewer_ios2/
+bench_*.md
+bench_*.md.meta.json
+bench_*.compare.json
+bench_*.md.pages/
+ИОС2_итог.md
+ИОС2_таблицы_*.md
+REPORT_*.md
+RESULTS_*.md
+PTO_progress_presentation.html
+PTO_workflow_interactive.html
+
+# === Внутренние рабочие документы ===
+IC_PARK_*
+
+# === Мусор ===
+5.md
+
+# === OS ===
+Thumbs.db
+Desktop.ini
+.DS_Store
