@@ -451,10 +451,20 @@ def main() -> int:
     runs = collect_runs(None if args.all else args.since)
     log_p = ROOT / "report_log.json"
     log = json.loads(log_p.read_text(encoding="utf-8")) if log_p.exists() else []
+    # итог сверки итогового документа с исходником (build_match_viewer.py --json)
+    ready_p = ROOT / "readiness.json"
+    readiness = None
+    if ready_p.exists():
+        try:
+            readiness = json.loads(ready_p.read_text(encoding="utf-8"))
+        except Exception:
+            readiness = None
+
     data = {
         "built": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "runs": runs,
         "log": log,
+        "readiness": readiness,
     }
     tpl_p = ROOT / "report_template.html"
     tpl = tpl_p.read_text(encoding="utf-8") if tpl_p.exists() else HTML

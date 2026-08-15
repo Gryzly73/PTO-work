@@ -420,8 +420,8 @@ $('#kpis').innerHTML=[
   ${d?`<div class=d>${d}</div>`:''}</div>`).join('');
 
 // ── вкладки ───────────────────────────────────────────────────────────
-const TABS=[['quality','Качество'],['models','Модели'],['pages','По страницам'],
-  ['time','Время'],['compare','Сравнение'],['log','Журнал']];
+const TABS=[['ready','Готовность'],['quality','Качество'],['models','Модели'],
+  ['pages','По страницам'],['time','Время'],['compare','Сравнение'],['log','Журнал']];
 const tabsEl=$('#tabs'),panes=$('#panes');
 TABS.forEach(([id,label],i)=>{
   const b=document.createElement('button');b.className='tab';b.textContent=label;
@@ -434,6 +434,92 @@ TABS.forEach(([id,label],i)=>{
   const d=document.createElement('div');d.className='pane'+(i?' hide':'');
   d.id='pane-'+id;panes.appendChild(d);
 });
+
+// ── Готовность продукта ───────────────────────────────────────────────
+{
+  const p=$('#pane-ready');
+  const R=DATA.readiness;
+  if(!R){
+    p.innerHTML='<div class=card><h2>Готовность продукта</h2>'
+      +'<p class=hint>Нет данных сверки. Соберите её командой '
+      +'<code>python build_match_viewer.py --md ИОС2_итог.md --pdf &lt;файл&gt; '
+      +'--json readiness.json</code>.</p></div>';
+  } else {
+    const bar=(v,good)=>`<span class="bar" style="width:120px"><i style="width:${
+      Math.max(0,Math.min(100,v))}%;background:${good?'var(--good)':'var(--s1)'}"></i></span>`;
+    p.innerHTML=`<div class=card>
+      <h2>Итог: насколько данные выгрузки совпадают с исходником</h2>
+      <p class=hint>Сверка постранично по документу «${esc(R.doc||'')}»:
+      ${R.pages} страниц с текстом и таблицами. Эталон — текстовый слой PDF,
+      для листов со сломанным шрифтом кодировка восстановлена.</p>
+      <div class="kpis" style="margin-bottom:14px">
+        <div class=kpi><div class=v>${R.avg_recall}%</div>
+          <div class=l>Полнота данных</div>
+          <div class=d><span class=mut>сколько данных документа попало в выгрузку</span></div></div>
+        <div class=kpi><div class=v>${R.avg_prec}%</div>
+          <div class=l>Достоверность чисел</div>
+          <div class=d><span class=mut>доля чисел выгрузки, которые есть в документе</span></div></div>
+        <div class=kpi><div class=v>${R.fully_matched} из ${R.pages}</div>
+          <div class=l>Страниц сошлись полностью</div>
+          <div class=d><span class=mut>полнота ≥90% и достоверность ≥95%</span></div></div>
+      </div>
+      <h3>Из чего складывается результат</h3>
+      <div class=scroll><table>
+        <thead><tr><th>Слой данных</th><th>Источник</th><th class=num>Достоверность</th>
+          <th>Чем подтверждено</th></tr></thead>
+        <tbody>
+        <tr><td><b>Текст листов</b></td><td>текстовый слой PDF</td>
+          <td class="num ok">точно</td>
+          <td>копируется из документа, а не читается моделью</td></tr>
+        <tr><td><b>Таблицы</b></td><td>сетка PDF + координаты слов</td>
+          <td class="num ok">точно</td>
+          <td>на стр. 45 из слоя 190 чисел против 182 у модели, при 100% против 96.7% достоверности</td></tr>
+        <tr><td><b>Листы со сломанным шрифтом</b></td><td>подстановка, выведенная по документу</td>
+          <td class="num ok">99% символов</td>
+          <td>7 нечитаемых листов стали точным текстом; проверка — доля слов, нашедшихся в словаре</td></tr>
+        <tr><td><b>Шифр документа</b></td><td>штампы читаемых листов</td>
+          <td class="num ok">точно</td>
+          <td>один шифр на комплект, источник подписан в тексте</td></tr>
+        <tr><td><b>Описание листа</b></td><td>модель (VLM)</td>
+          <td class="num ${R.vlm_avg_prec>=95?'warnc':'badc'}">${R.vlm_avg_prec}%</td>
+          <td>единственный слой, где возможна выдумка — здесь остаётся основной риск</td></tr>
+        </tbody></table></div>
+      <p class=hint style="margin-top:12px">Полнота «только вывода модели» —
+      ${R.vlm_avg_recall}%, и это не дефект: описание не обязано повторять весь
+      текст листа, данные берутся из слоя. Смотреть в этом срезе нужно на
+      достоверность чисел.</p>
+    </div>
+    <div class=card>
+      <h2>Что готово, а что нет</h2>
+      <div class=grid2>
+        <div>
+          <h3 style="color:var(--good)">Готово</h3>
+          <ul class=log style="padding-left:0">
+            <li><div>Текст и таблицы текстовых листов выгружаются точно и без
+              участия модели, значит не могут быть перевраны</div></li>
+            <li><div>Листы со сломанной кодировкой перестали быть слепой зоной</div></li>
+            <li><div>Есть бесплатная метрика, позволяющая мерить качество
+              неограниченно и без затрат на API</div></li>
+            <li><div>Стоимость и время упали: вызовов к модели в 7.3 раза меньше</div></li>
+          </ul>
+        </div>
+        <div>
+          <h3 style="color:var(--warn)">Требует работы</h3>
+          <ul class=log style="padding-left:0">
+            <li><div>Описание листа моделью содержит ${(100-R.vlm_avg_prec).toFixed(1)}%
+              чисел, которых в документе нет</div></li>
+            <li><div>Разделители в шифрах (дефисы, слэши) отсутствуют в слое PDF —
+              из него их не восстановить</div></li>
+            <li><div>Чертежи и планы не проверялись: у них нет пригодного
+              текстового слоя, там работает только модель</div></li>
+            <li><div>Выводы по моделям сделаны по одному прогону и требуют
+              подтверждения</div></li>
+          </ul>
+        </div>
+      </div>
+    </div>`;
+  }
+}
 
 // ── Качество ──────────────────────────────────────────────────────────
 {
