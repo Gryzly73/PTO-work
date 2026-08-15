@@ -45,6 +45,14 @@ python hf_api_bench.py --model qwen3vl-32b --pages 5,35,45 --sheet-aware `
 # hard pages с зонами и высоким DPI
 python hf_api_bench.py --model qwen3vl-32b --pages 2,4 --high-dpi --zone-crop --runs 2
 
+# лист-таблица: PASS-T «перенеси таблицу как в исходнике» вместо тайлов
+# (авторотация повёрнутых листов через Tesseract OSD работает всегда)
+python hf_api_bench.py --model qwen3vl-32b --pages 5 --table-pages 5
+
+# union выводов двух разных моделей (лучший замер: easy 56-57% / 77%)
+python build_model_union.py --base <runA>/out.md --extra <runB>/out.md `
+  --extra-label qwen3vl-32b --reclean -o union.md
+
 # one-shot: VLM → union с OCR → скоринг
 python hf_api_bench.py --model qwen3vl-32b --pipeline --pages 1,3,5
 

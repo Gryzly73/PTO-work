@@ -281,6 +281,67 @@ CATALOG: list[ModelSpec] = [
         "featherless-ai",
         "dense 32B — сильнее общий VLM на hard pages",
     ),
+    # ── новая волна (2026-08): мультимодальные Qwen3.6, GLM-V, Kimi, gemma-4 ──
+    ModelSpec(
+        "qwen36-35b-a3b",
+        "Qwen/Qwen3.6-35B-A3B",
+        "vlm",
+        "awq",
+        "deepinfra",
+        "мультимодальный MoE A3B — прямой наследник серверного класса; "
+        "thinking отключается через chat_template_kwargs; alt: scaleway",
+    ),
+    ModelSpec(
+        "qwen36-27b",
+        "Qwen/Qwen3.6-27B",
+        "vlm",
+        "awq",
+        "deepinfra",
+        "dense 27B мультимодальный, наследник 32B; thinking отключён; alt: ovhcloud",
+    ),
+    ModelSpec(
+        "qwen3vl-235b",
+        "Qwen/Qwen3-VL-235B-A22B-Instruct",
+        "vlm",
+        "tight",
+        "deepinfra",
+        "MoE 235B-A22B — потолок качества Qwen VL; на 4×A16 НЕ влезет, "
+        "только API ($0.2/$0.88 deepinfra); alt: novita",
+    ),
+    ModelSpec(
+        "glm-46v-flash",
+        "zai-org/GLM-4.6V-Flash",
+        "vlm",
+        "easy",
+        "novita",
+        "дешёвый vision 10B ($0.3/$0.9); в smoke искажал фразы — проверить",
+    ),
+    ModelSpec(
+        "glm-45v",
+        "zai-org/GLM-4.5V",
+        "vlm",
+        "tight",
+        "novita",
+        "MoE 108B-A12B vision ($0.6/$1.8); на 4×A16 не влезет",
+    ),
+    ModelSpec(
+        "kimi-k3",
+        "moonshotai/Kimi-K3",
+        "vlm",
+        "tight",
+        "deepinfra",
+        "Moonshot триллионник, мультимодальный; ДОРОГОЙ ($2.85/$14.25) — "
+        "только как потолок качества, не для прода",
+    ),
+    ModelSpec(
+        "gemma4-26b-a4b",
+        "google/gemma-4-26B-A4B-it",
+        "vlm",
+        "awq",
+        "deepinfra",
+        "MoE A4B, самый дешёвый ($0.07/$0.34); gemma3 выдумывала — "
+        "проверить галлюцинации; alt: novita",
+    ),
     ModelSpec(
         "deepseek-ocr",
         "deepseek-ai/DeepSeek-OCR",
@@ -456,6 +517,32 @@ DEEPSEEK_OCR_PROMPTS = {
     "figure": "Parse the figure.",
 }
 
+# PASS-T: лист-таблица → один вызов «перенеси таблицу как в исходнике».
+# Тайлы таблицу разрывают (шапка в одном фрагменте, строки в другом);
+# после авторотации целый лист в высоком разрешении работает лучше —
+# проверено на стр.5 эталона (КР5): все строки/ячейки сходятся с исходником.
+SYSTEM_TABLE_EXACT = (
+    "Ты переносишь таблицы с русских строительных чертежей в Markdown БЕЗ ПОТЕРЬ. "
+    "Кириллицу не латинизировать (ИГЭ≠IGE, В1≠B1). Числа копируй точно, "
+    "запятую как десятичный разделитель сохраняй. Не выдумывай значения."
+)
+
+PROMPT_TABLE_EXACT = (
+    "Воспроизведи главную таблицу листа ОДНОЙ markdown-таблицей (GFM), "
+    "максимально близко к исходнику:\n"
+    "1) Многоуровневую шапку сплющи в одну строку колонок вида «Группа: подколонка» "
+    "(например «Удельное сцепление С, кПа: по СП»).\n"
+    "2) Первая колонка — метки строк (ИГЭ-…, позиции, номера) с названиями.\n"
+    "3) Сохрани ВСЕ строки и ВСЕ ячейки. Пустая ячейка → «-». Ничего не пропускай "
+    "и не сокращай («…» запрещено). Объединённые ячейки повторяй по строкам.\n"
+    "4) Если строка содержит сводные значения на несколько колонок (Rб, ρб, К разм "
+    "и т.п.) — запиши их текстом в этой строке, не размножай пустые ячейки.\n"
+    "5) После таблицы отдельными строками: заголовок листа, примечания под таблицей, "
+    "шифр из штампа.\n"
+    "Если на листе несколько таблиц — каждая отдельной GFM-таблицей с подзаголовком. "
+    "Только markdown, без рассуждений."
+)
+
 SYSTEM_SYNTH = (
     "Ты консервативный редактор извлечений с русских строительных чертежей. "
     "Объедини черновик и OCR БЕЗ сжатия и БЕЗ выдумок. "
@@ -527,6 +614,39 @@ def dpi_for_budget(page: fitz.Page, page_max: int) -> int:
     return max(36, int(page_max / (longest / 72.0)))
 
 
+_PAGE_ROTATION_CACHE: dict[tuple[str, int], int] = {}
+
+
+def detect_rotation_osd(im: Image.Image, *, min_conf: float = 1.0) -> int:
+    """Ориентация текста через Tesseract OSD: 0/90/180/270 (по часовой,
+    сколько нужно повернуть, чтобы текст стал горизонтальным).
+
+    Кейс: таблицы грунтов (КР5) свёрстаны на листе с поворотом 90° —
+    VLM читает вертикальные заголовки по буквам и теряет структуру.
+    При недоступном tesseract / низкой уверенности — 0 (не вращаем).
+    """
+    try:
+        import pytesseract
+
+        import local_ocr
+
+        cmd = local_ocr.resolve_tesseract_cmd()
+        if cmd:
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        small = im.copy()
+        small.thumbnail((2000, 2000))
+        osd = pytesseract.image_to_osd(small, config="--psm 0")
+        rot, conf = 0, 0.0
+        for line in osd.splitlines():
+            if line.startswith("Rotate:"):
+                rot = int(line.split(":", 1)[1])
+            elif line.startswith("Orientation confidence:"):
+                conf = float(line.split(":", 1)[1])
+        return rot if conf >= min_conf else 0
+    except Exception:
+        return 0
+
+
 def render_page(page: fitz.Page, page_max: int) -> Image.Image:
     dpi = dpi_for_budget(page, page_max)
     pix = page.get_pixmap(dpi=dpi)
@@ -537,6 +657,18 @@ def render_page(page: fitz.Page, page_max: int) -> Image.Image:
             (max(1, int(im.width * scale)), max(1, int(im.height * scale))),
             Image.LANCZOS,
         )
+    key = (getattr(page.parent, "name", "") or "?", page.number)
+    if key not in _PAGE_ROTATION_CACHE:
+        _PAGE_ROTATION_CACHE[key] = detect_rotation_osd(im)
+        if _PAGE_ROTATION_CACHE[key]:
+            print(
+                f"  [rotation] p{page.number + 1}: повёрнутый лист, "
+                f"вращаю на {_PAGE_ROTATION_CACHE[key]}° по часовой",
+                flush=True,
+            )
+    rot = _PAGE_ROTATION_CACHE[key]
+    if rot:
+        im = im.rotate(-rot, expand=True)
     return im
 
 
@@ -672,6 +804,17 @@ def call_with_retries(fn, *, retries: int, base_delay: float, usage: UsageTotals
     raise last
 
 
+# Гибридные thinking-модели: без этого весь max_tokens уходит в рассуждения,
+# а content возвращается пустым (проверено на Qwen3.6 @ deepinfra).
+NO_THINK_HF_IDS = {"Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.6-27B"}
+
+
+def _extra_body_for(model: str) -> dict | None:
+    if model in NO_THINK_HF_IDS:
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return None
+
+
 def chat_text(
     client,
     model: str,
@@ -687,6 +830,7 @@ def chat_text(
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
+        extra_body=_extra_body_for(model),
         max_tokens=max_tokens,
         temperature=0.0,
     )
@@ -733,6 +877,7 @@ def chat_vision(
         messages=messages,
         max_tokens=max_tokens,
         temperature=0.0,
+        extra_body=_extra_body_for(model),
     )
     if usage is not None:
         usage.add(extract_usage(resp))
@@ -751,7 +896,7 @@ def vision_defaults(spec: ModelSpec) -> dict:
             "max_tokens": 1536,
             "max_tiles": 4,
         }
-    if "32b" in spec.id or "30b" in spec.id:
+    if any(k in spec.id for k in ("32b", "30b", "235b", "35b-a3b", "36-27b", "45v", "k3")):
         return {
             "page_max": 2000,
             "tile_max": 700,
@@ -918,12 +1063,92 @@ def collapse_numbered_hallucination(text: str, *, min_repeats: int = 8) -> str:
     return "\n".join(out)
 
 
+def collapse_inline_repetition(
+    text: str, *, min_repeats: int = 4, min_seg_len: int = 6
+) -> str:
+    """Схлопывает повтор фразы ВНУТРИ одной строки (кейс стр.35 ИОС2:
+    «…подземные инженерные сети, подземные инженерные коммуникации, …» ×N).
+    dedupe_lines работает построчно и такое пропускает.
+
+    Markdown-таблицы (|…|) не трогаем: повтор одинаковых ячеек легален.
+    """
+    out: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if len(s) < 60 or s.startswith("|"):
+            out.append(ln)
+            continue
+        segs = re.split(r"\s*[,;]\s*", s)
+        if len(segs) < min_repeats:
+            out.append(ln)
+            continue
+        norm = [re.sub(r"\s+", " ", x).strip().lower() for x in segs]
+        counts: dict[str, int] = {}
+        for n in norm:
+            if len(n) >= min_seg_len:
+                counts[n] = counts.get(n, 0) + 1
+        if not counts or max(counts.values()) < min_repeats:
+            out.append(ln)
+            continue
+        seen: set[str] = set()
+        kept: list[str] = []
+        for seg, n in zip(segs, norm):
+            if len(n) >= min_seg_len and n in seen:
+                continue
+            seen.add(n)
+            kept.append(seg)
+        out.append(", ".join(kept) + " [inline-повторы схлопнуты]")
+    return "\n".join(out)
+
+
+def join_value_line_runs(text: str, *, min_run: int = 6, max_len: int = 18) -> str:
+    """Серию «голых» значений столбиком (DN200 / NC / 102.55 / -1.380 …, каждая
+    на своей строке) склеивает в одну строку через запятую: столбики одиночных
+    меток с чертежа нечитаемы и раздувают вывод, а токены при склейке
+    сохраняются (recall не страдает).
+
+    Не трогаем: markdown-таблицы, заголовки, строки с пробелами (реальные
+    фразы) и короткие серии (<min_run).
+    """
+    val_re = re.compile(r"[\w.,/№()+±-]+", re.UNICODE)
+
+    def as_value(ln: str) -> str | None:
+        s = ln.strip()
+        if not s or len(s) > max_len or s.startswith(("|", "#")):
+            return None
+        s = re.sub(r"^[-*•]\s+", "", s)  # буллет только с пробелом: «-1.380» — не буллет
+        if not s or " " in s:
+            return None
+        return s if val_re.fullmatch(s) else None
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        v = as_value(lines[i])
+        if v is not None:
+            j = i
+            vals: list[str] = []
+            while j < len(lines) and (vv := as_value(lines[j])) is not None:
+                vals.append(vv)
+                j += 1
+            if len(vals) >= min_run:
+                out.append("Значения на фрагменте: " + ", ".join(vals))
+                i = j
+                continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
 def clean_vlm_text(text: str) -> str:
     """Anti-loop + дедуп строк + обрезка галлюцинаций вида 1,2,3…N."""
     text = collapse_repetition(text)
     text = collapse_numeric_list(text)
     text = collapse_numbered_hallucination(text)
     text = dedupe_lines(text)
+    text = collapse_inline_repetition(text)
+    text = join_value_line_runs(text)
     # голый возрастающий список чисел (PASS-A иногда печатает 1..500)
     m = re.search(
         r"((?:\b\d{1,4}\b(?:\s*,\s*|\s+)){25,}\b\d{1,4}\b)",
@@ -1008,6 +1233,7 @@ def run_vlm(
     retry_delay: float = 2.0,
     usage: UsageTotals | None = None,
     sheet_aware: bool = False,
+    table_pages: set[int] | None = None,
 ) -> Path:
     usage = usage or UsageTotals()
     doc = fitz.open(pdf)
@@ -1169,6 +1395,74 @@ def run_vlm(
                 print(f"    PASS-A: {len(desc)} chars {time.time()-t0:.1f}s", flush=True)
 
             sections.append(f"### PASS-A Описание листа\n\n{desc}")
+
+        # ── PASS-T: лист-таблица → «перенеси как в исходнике» вместо тайлов ─
+        if table_pages and num in table_pages:
+            t_im = render_page(page, max(local_page_max, 3200))
+            print(
+                f"  p{num}: PASS-T таблица целиком {t_im.size[0]}x{t_im.size[1]}",
+                flush=True,
+            )
+            def _table_rows_with_digits(txt: str) -> int:
+                return sum(
+                    1
+                    for ln in txt.splitlines()
+                    if ln.lstrip().startswith("|") and re.search(r"\d", ln)
+                )
+
+            # VLM недетерминированна: тот же лист то даёт идеальную таблицу,
+            # то петлю пустых ячеек → до 3 попыток (чуть разный max_px),
+            # держим лучший вариант по числу строк с цифрами.
+            t0 = time.time()
+            ttxt, best_rows = "", -1
+            for attempt, px in enumerate((2600, 2200, 3000), start=1):
+                try:
+                    cand = call_with_retries(
+                        lambda px=px: chat_vision(
+                            client,
+                            spec.hf_id,
+                            SYSTEM_TABLE_EXACT,
+                            PROMPT_TABLE_EXACT,
+                            image_to_data_url(t_im, max_px=px, quality=90),
+                            max_tokens=max(6000, local_pass_a_tokens),
+                            prompt_style=spec.prompt_style,
+                            usage=usage,
+                        ),
+                        retries=retries,
+                        base_delay=retry_delay,
+                        usage=usage,
+                    )
+                    cand = dedupe_lines(cand)  # мягкая чистка: full clean режет GFM
+                    rows_ok = _table_rows_with_digits(cand)
+                    print(
+                        f"    PASS-T attempt {attempt} (px={px}): "
+                        f"{len(cand)} chars, {rows_ok} строк с цифрами",
+                        flush=True,
+                    )
+                    if rows_ok > best_rows:
+                        ttxt, best_rows = cand, rows_ok
+                    if rows_ok >= 5:
+                        break
+                except Exception as e:
+                    usage.failed_tiles += 1
+                    print(f"    PASS-T attempt {attempt} FAIL {e}", flush=True)
+                    if fail_fast:
+                        doc.close()
+                        raise
+            if not ttxt:
+                ttxt = "(ошибка таблицы: все попытки PASS-T не удались)"
+            print(f"    PASS-T: {len(ttxt)} chars {time.time()-t0:.1f}s", flush=True)
+            sections.append("### PASS-B Таблица целиком\n\n" + ttxt)
+            content = "\n\n".join(sections)
+            if stamp_crop:
+                try:
+                    from local_ocr import append_stamp_missing, ocr_stamp
+
+                    stamp_raw, codes = ocr_stamp(im)
+                    content = append_stamp_missing(content, stamp_raw, codes)
+                except Exception as e:
+                    print(f"    stamp OCR skip: {e}", flush=True)
+            return content
 
         # ── Pass B: тайлы → markdown-текст/таблицы ────────────────────────
         rows, cols = tile_grid(w, h, local_tile_max, max_tiles=local_max_tiles)
@@ -1491,6 +1785,12 @@ def main() -> int:
         help="Доп. VLM-кропы углов штампа + локальный Tesseract stamp OCR.",
     )
     ap.add_argument(
+        "--table-pages",
+        default="",
+        help="страницы-таблицы (формат как --pages): вместо тайлов — один вызов "
+        "«перенеси таблицу как в исходнике» (PASS-T) по целому листу",
+    )
+    ap.add_argument(
         "--zone-crop",
         action="store_true",
         help="Зональные кропы экспликации/легенды/таблиц (ОДИ/КР).",
@@ -1680,7 +1980,8 @@ def main() -> int:
         if role == "vlm" or args.pipeline:
             pdf = args.pdf or find_etalon_pdf()
             doc = fitz.open(pdf)
-            page_nums = parse_pages(args.pages, doc.page_count)
+            doc_page_count = doc.page_count
+            page_nums = parse_pages(args.pages, doc_page_count)
             doc.close()
             out_path = run_vlm(
                 client,
@@ -1703,6 +2004,11 @@ def main() -> int:
                 retries=args.retries,
                 retry_delay=args.retry_delay,
                 usage=usage,
+                table_pages=(
+                    set(parse_pages(args.table_pages, doc_page_count))
+                    if args.table_pages
+                    else None
+                ),
                 sheet_aware=args.sheet_aware,
             )
             if args.pipeline:

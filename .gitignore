@@ -23,6 +23,7 @@ new_files/pto_scoring_kit/*
 # === Результаты прогонов и сгенерированные отчёты (регенерируемо) ===
 hf_runs/
 quality_viewer_ios2/
+quality_viewer_union/
 bench_*.md
 bench_*.md.meta.json
 bench_*.compare.json
@@ -33,6 +34,7 @@ REPORT_*.md
 RESULTS_*.md
 PTO_progress_presentation.html
 PTO_workflow_interactive.html
+PRESENTATION_status.html
 
 # === Внутренние рабочие документы ===
 IC_PARK_*
