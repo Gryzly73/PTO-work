@@ -22,8 +22,7 @@ new_files/pto_scoring_kit/*
 
 # === Результаты прогонов и сгенерированные отчёты (регенерируемо) ===
 hf_runs/
-quality_viewer_ios2/
-quality_viewer_union/
+quality_viewer_*/
 bench_*.md
 bench_*.md.meta.json
 bench_*.compare.json
@@ -46,3 +45,4 @@ IC_PARK_*
 Thumbs.db
 Desktop.ini
 .DS_Store
+ОТЧЁТ_*.html

@@ -430,7 +430,11 @@ SYSTEM_VLM = (
     "6) Не перечисляй голые номера подряд (1,2,3…100) без названий объектов.\n"
     "7) Графические символы/значки описывай СЛОВАМИ по-русски (например «круг», "
     "«треугольник», «стрелка вниз», «задвижка»). НИКОГДА не вставляй эмодзи, "
-    "смайлы или значки Unicode — только текст."
+    "смайлы или значки Unicode — только текст.\n"
+    "8) ЗАПРЕЩЕНО добавлять сведения из своих знаний: ссылки на ГОСТ/СП/СНиП/ТУ, "
+    "номера пунктов, «типовые» значения (температуры, напоры, диаметры, нормы). "
+    "Любое число в ответе должно быть НАПЕЧАТАНО на изображении. Не вычисляй "
+    "новые числа и не подставляй недостающие — пропуск лучше выдумки."
 )
 
 PROMPT_TILE = (
@@ -457,7 +461,10 @@ SYSTEM_DESC = (
     "эмодзи/смайлы; повторять одну и ту же короткую метку (В1, W1, К1) десятки раз — "
     "достаточно указать метку один раз и где она встречается. "
     "Графические символы — словами («кран шаровый», «стрелка вниз»). "
-    "Если текст на чертеже наложился/нечитаем — напиши «неразборчиво», не выдумывай."
+    "Если текст на чертеже наложился/нечитаем — напиши «неразборчиво», не выдумывай. "
+    "ЗАПРЕЩЕНО пояснять лист сведениями из своих знаний: ссылками на ГОСТ/СП/СНиП, "
+    "номерами пунктов, «типовыми» значениями (температура, напор, диаметр, норма). "
+    "Любое число в описании должно быть НАПЕЧАТАНО на листе; ничего не вычисляй."
 )
 
 PROMPT_DESC = (
@@ -517,6 +524,10 @@ DEEPSEEK_OCR_PROMPTS = {
     "figure": "Parse the figure.",
 }
 
+# layer-aware: ниже этого объёма текстовый слой считаем декоративным
+# (штамп/рамка) и на него не опираемся — страница всё равно идёт через тайлы.
+LAYER_MIN_CHARS = 400
+
 # PASS-T: лист-таблица → один вызов «перенеси таблицу как в исходнике».
 # Тайлы таблицу разрывают (шапка в одном фрагменте, строки в другом);
 # после авторотации целый лист в высоком разрешении работает лучше —
@@ -527,20 +538,54 @@ SYSTEM_TABLE_EXACT = (
     "запятую как десятичный разделитель сохраняй. Не выдумывай значения."
 )
 
+# Порядок важен: контекст ДО таблицы — если модель уйдёт в петлю/обрежется
+# на таблице, текст вокруг (заголовок, примечания, штамп) уже будет выдан.
 PROMPT_TABLE_EXACT = (
-    "Воспроизведи главную таблицу листа ОДНОЙ markdown-таблицей (GFM), "
-    "максимально близко к исходнику:\n"
+    "На листе есть таблица и текст вокруг неё. Выведи ВСЁ содержимое листа "
+    "в markdown, строго в этом порядке:\n"
+    "СНАЧАЛА раздел «Текст вне таблицы»: заголовок листа, примечания, подписи, "
+    "сноски, номера листа/страницы и содержимое штампа (шифр, стадия, лист). "
+    "Ничего из текста вокруг таблицы не пропускай.\n"
+    "ЗАТЕМ главную таблицу ОДНОЙ markdown-таблицей (GFM), максимально близко "
+    "к исходнику:\n"
     "1) Многоуровневую шапку сплющи в одну строку колонок вида «Группа: подколонка» "
     "(например «Удельное сцепление С, кПа: по СП»).\n"
     "2) Первая колонка — метки строк (ИГЭ-…, позиции, номера) с названиями.\n"
     "3) Сохрани ВСЕ строки и ВСЕ ячейки. Пустая ячейка → «-». Ничего не пропускай "
     "и не сокращай («…» запрещено). Объединённые ячейки повторяй по строкам.\n"
-    "4) Если строка содержит сводные значения на несколько колонок (Rб, ρб, К разм "
-    "и т.п.) — запиши их текстом в этой строке, не размножай пустые ячейки.\n"
-    "5) После таблицы отдельными строками: заголовок листа, примечания под таблицей, "
-    "шифр из штампа.\n"
+    "4) КАЖДАЯ строка исходника — ровно ОДНА строка таблицы: не объединяй соседние "
+    "строки и не переноси значения между ними; число ячеек в каждой строке должно "
+    "совпадать с шапкой.\n"
+    "5) Числа переписывай посимвольно, перепроверяя разряды; нечитаемое значение → "
+    "«?» — угадывать запрещено.\n"
+    "6) Сводная строка со значениями на несколько колонок (Rб, ρб, К разм и т.п.) — "
+    "это ОТДЕЛЬНАЯ последняя строка таблицы: запиши значения текстом в ней и НЕ "
+    "сливай её с последней строкой данных (у той свои ячейки, обычно «-»).\n"
+    "7) После последней строки с данными таблицу ЗАВЕРШИ: пустые строки вида "
+    "«| | |» не добавляй.\n"
     "Если на листе несколько таблиц — каждая отдельной GFM-таблицей с подзаголовком. "
     "Только markdown, без рассуждений."
+)
+
+# Спасение тайла, где VLM увидела таблицу, но зациклилась на пустых ячейках:
+# повторное чтение того же фрагмента с бОльшим разрешением и табличным промптом.
+PROMPT_TILE_TABLE_RESCUE = (
+    "На фрагменте есть таблица. Перенеси её в GFM построчно: шапка одной "
+    "строкой, затем строки данных. Пустая ячейка → «-». ЗАПРЕЩЕНО выводить "
+    "длинные последовательности пустых ячеек. Если таблица обрезана краем "
+    "фрагмента — перенеси только видимые строки и колонки, не догадывайся об "
+    "остальном. Нечитаемое → «(не читается)», выдумывать значения запрещено. "
+    "Помимо таблицы перенеси весь остальной текст фрагмента. "
+    "Только markdown, без рассуждений."
+)
+
+# Отдельный fallback-вызов, если PASS-T выдал только таблицу без контекста.
+PROMPT_TABLE_CONTEXT = (
+    "Перечисли ВЕСЬ текст листа, который находится ВНЕ основной таблицы: "
+    "заголовок листа, примечания, подписи, сноски, условные обозначения, "
+    "номера листа/страницы и содержимое штампа (шифр, стадия, лист, раздел). "
+    "Основную таблицу НЕ повторяй. Нечитаемое → «(не читается)», выдумывать "
+    "запрещено. Только markdown, без рассуждений."
 )
 
 SYSTEM_SYNTH = (
@@ -990,6 +1035,76 @@ def dedupe_lines(text: str, *, max_same: int = 2) -> str:
     return "\n".join(out)
 
 
+def strip_empty_table_rows(text: str) -> str:
+    """Убирает ПУСТЫЕ строки GFM-таблиц («| | | |») — артефакт петли VLM
+    в конце таблицы (модель размножает пустые ряды и обрезается по токенам).
+
+    Не трогаем: строки с «-» (пустая ячейка → «-» по контракту PASS-T) и
+    пустую строку-шапку перед разделителем «|---|» (легитимна в GFM, напр.
+    у таблиц штампа)."""
+    lines = text.splitlines()
+    sep_re = re.compile(r"^\s*\|[\s:|-]*-[\s:|-]*\|?\s*$")
+    out: list[str] = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith("|") and re.fullmatch(r"[|\s]+", s):
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            if not sep_re.match(nxt):
+                continue
+        out.append(ln)
+    return "\n".join(out)
+
+
+def _pass_t_has_context(text: str) -> bool:
+    """Есть ли в выводе PASS-T текст ВНЕ таблицы (заголовок/примечания/штамп)."""
+    return any(
+        len(s) >= 8 and not s.startswith("|")
+        for s in (ln.strip() for ln in text.splitlines())
+        if s
+    )
+
+
+def _pass_t_rows_consistent(text: str) -> bool:
+    """Число ячеек в строках данных совпадает с шапкой (±1 — сводные строки).
+
+    Детектор слитых рядов: строка, в которую VLM склеила два ряда исходника,
+    даёт заметно больше ячеек, чем шапка."""
+    header_n: int | None = None
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s.startswith("|"):
+            header_n = None  # граница таблицы: у следующей — своя шапка
+            continue
+        cells = s.strip("|").split("|")
+        if re.fullmatch(r"[\s:|-]+", s) and "-" in s:
+            continue  # разделитель |---|
+        if header_n is None:
+            header_n = len(cells)
+            continue
+        if len(cells) > header_n + 1:
+            return False
+    return True
+
+
+def score_pass_t(text: str) -> tuple[int, int]:
+    """(score, rows_with_digits) для выбора лучшего кандидата PASS-T.
+
+    Ряды с цифрами — основа; контекст вне таблицы и целостность рядов —
+    бонусы, чтобы кандидат «идеальная таблица, но без штампа/примечаний»
+    не выигрывал у полного."""
+    rows = sum(
+        1
+        for ln in text.splitlines()
+        if ln.lstrip().startswith("|") and re.search(r"\d", ln)
+    )
+    score = rows
+    if _pass_t_has_context(text):
+        score += 3
+    if _pass_t_rows_consistent(text):
+        score += 2
+    return score, rows
+
+
 def collapse_numeric_list(text: str, *, min_run: int = 20) -> str:
     """Режет длинные монотонные простыни маркированных чисел/отметок:
     «- 112.25», «- 112.15» … «- 98.30» или «- Ось 1» … (тут ловит stem-версия).
@@ -1063,6 +1178,168 @@ def collapse_numbered_hallucination(text: str, *, min_repeats: int = 8) -> str:
     return "\n".join(out)
 
 
+def collapse_empty_cell_runs(text: str, *, min_cells: int = 15) -> str:
+    """«| Заголовок таблицы | | | | … |» — петля пустых ячеек в ОДНОЙ строке:
+    VLM увидела таблицу, выдала шапку/название и зациклилась на пустых ячейках.
+    Схлопываем хвост в маркер; по маркеру же тайл детектится как кандидат
+    на table-rescue (повторное чтение с бОльшим разрешением)."""
+    pat = re.compile(r"(?:\|[ \t]*){%d,}\|" % min_cells)
+    out: list[str] = []
+    for ln in text.splitlines():
+        if ln.lstrip().startswith("|") and pat.search(ln):
+            ln = pat.sub("| [петля пустых ячеек] |", ln)
+        out.append(ln)
+    return "\n".join(out)
+
+
+def collapse_progression_runs(text: str, *, min_run: int = 12) -> str:
+    """Режет арифметические прогрессии-галлюцинации внутри одной строки:
+    «-17.41, -17.42, … -21.41» — сотни выдуманных отметок с постоянным шагом
+    (построчный collapse_numeric_list такое не видит). Реальные ряды значений
+    с чертежа настолько регулярными не бывают; оставляем начало/конец + маркер."""
+    num_re = re.compile(r"-?\d{1,5}(?:[.,]\d{1,3})?")
+    out: list[str] = []
+    for ln in text.splitlines():
+        if len(ln) < min_run * 3 or not re.search(r"\d", ln):
+            out.append(ln)
+            continue
+        toks = [
+            (m.start(), m.end(), float(m.group().replace(",", ".")))
+            for m in num_re.finditer(ln)
+        ]
+        if len(toks) < min_run:
+            out.append(ln)
+            continue
+        # максимальный подряд идущий run с постоянным шагом; между числами
+        # допускаем только короткий разделитель (", », «; », пробел)
+        best: tuple[int, int] | None = None  # (idx_from, idx_to) включительно
+        i = 0
+        while i < len(toks) - 1:
+            j = i + 1
+            step: float | None = None
+            while j < len(toks):
+                if toks[j][0] - toks[j - 1][1] > 3:
+                    break
+                d = round(toks[j][2] - toks[j - 1][2], 4)
+                if step is None:
+                    step = d
+                elif d != step:
+                    break
+                j += 1
+            if j - i >= min_run and (best is None or j - i > best[1] - best[0]):
+                best = (i, j - 1)
+            i = max(i + 1, j - 1)
+        if best is None:
+            out.append(ln)
+            continue
+        a, b = best
+        n = b - a + 1
+        ln = (
+            ln[: toks[a + 1][1]]
+            + f" … [truncated-progression: {n} значений с постоянным шагом] … "
+            + ln[toks[b][0] :]
+        )
+        out.append(ln)
+    return "\n".join(out)
+
+
+def collapse_table_progression_rows(text: str, *, min_repeats: int = 10) -> str:
+    """Схлопывает подряд идущие строки GFM-таблицы с ОДИНАКОВЫМ текстом и
+    регулярно растущими числами: «| 37 | Песчаник | 7.30-7.50 |» ×92 — модель
+    галлюцинирует ряды по шаблону. У реальных таблиц текст строк различается;
+    порог высокий, плюс требуется арифметическая прогрессия первого числа."""
+
+    def stem_nums(ln: str) -> tuple[str | None, list[float]]:
+        s = ln.strip()
+        if not s.startswith("|") or re.fullmatch(r"[\s:|-]+", s):
+            return None, []
+        nums = [
+            float(x.replace(",", ".")) for x in re.findall(r"-?\d+(?:[.,]\d+)?", s)
+        ]
+        if not nums:
+            return None, []
+        stem = re.sub(r"-?\d+(?:[.,]\d+)?", "#", s)
+        return re.sub(r"\s+", " ", stem).lower(), nums
+
+    lines = text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        stem, nums = stem_nums(lines[i])
+        if stem is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i + 1
+        firsts = [nums[0]]
+        while j < len(lines):
+            s2, n2 = stem_nums(lines[j])
+            if s2 != stem:
+                break
+            firsts.append(n2[0])
+            j += 1
+        run = j - i
+        if run >= min_repeats:
+            diffs = {round(b - a, 4) for a, b in zip(firsts, firsts[1:])}
+            if len(diffs) == 1:
+                out.extend(lines[i : i + 3])
+                out.append(
+                    f"[truncated-table-progression: ещё {run - 3} "
+                    f"однотипных строк с постоянным шагом]"
+                )
+                i = j
+                continue
+        out.extend(lines[i:j])
+        i = j
+    return "\n".join(out)
+
+
+def table_content_rows(text: str) -> int:
+    """Строки таблицы с реальными данными (цифры + ≥2 непустые ячейки)."""
+    rows = 0
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s.startswith("|") or not re.search(r"\d", s):
+            continue
+        if re.fullmatch(r"[\s:|-]+", s):
+            continue  # разделитель
+        if sum(1 for c in s.strip("|").split("|") if c.strip()) >= 2:
+            rows += 1
+    return rows
+
+
+def table_text_score(text: str) -> int:
+    """Сравнение «оригинал vs table-rescue»: содержательные строки таблицы
+    весят на порядки больше длины текста."""
+    score = table_content_rows(text) * 1000 + min(len(text), 999)
+    if "[петля пустых ячеек]" in text:
+        score -= 500
+    return score
+
+
+def _collapse_segments(s: str, *, min_repeats: int, min_seg_len: int) -> str | None:
+    """Ядро inline-схлопывания: повтор фразы внутри строки/ячейки через
+    запятую/точку с запятой. None — если повторов нет."""
+    segs = re.split(r"\s*[,;]\s*", s)
+    if len(segs) < min_repeats:
+        return None
+    norm = [re.sub(r"\s+", " ", x).strip().lower() for x in segs]
+    counts: dict[str, int] = {}
+    for n in norm:
+        if len(n) >= min_seg_len:
+            counts[n] = counts.get(n, 0) + 1
+    if not counts or max(counts.values()) < min_repeats:
+        return None
+    seen: set[str] = set()
+    kept: list[str] = []
+    for seg, n in zip(segs, norm):
+        if len(n) >= min_seg_len and n in seen:
+            continue
+        seen.add(n)
+        kept.append(seg)
+    return ", ".join(kept) + " [inline-повторы схлопнуты]"
+
+
 def collapse_inline_repetition(
     text: str, *, min_repeats: int = 4, min_seg_len: int = 6
 ) -> str:
@@ -1070,34 +1347,90 @@ def collapse_inline_repetition(
     «…подземные инженерные сети, подземные инженерные коммуникации, …» ×N).
     dedupe_lines работает построчно и такое пропускает.
 
-    Markdown-таблицы (|…|) не трогаем: повтор одинаковых ячеек легален.
+    В markdown-таблицах обрабатываем КАЖДУЮ ячейку отдельно (галлюцинация
+    «…с утилизацией, с переработкой, …»×N живёт и внутри ячеек); повтор
+    одинаковых КОРОТКИХ ячеек между собой легален и не трогается.
     """
     out: list[str] = []
     for ln in text.splitlines():
         s = ln.strip()
-        if len(s) < 60 or s.startswith("|"):
+        if len(s) < 60:
             out.append(ln)
             continue
-        segs = re.split(r"\s*[,;]\s*", s)
-        if len(segs) < min_repeats:
-            out.append(ln)
+        if s.startswith("|"):
+            cells = s.strip("|").split("|")
+            changed = False
+            for ci, cell in enumerate(cells):
+                if len(cell.strip()) < 60:
+                    continue
+                fixed = _collapse_segments(
+                    cell.strip(), min_repeats=min_repeats, min_seg_len=min_seg_len
+                )
+                if fixed is not None:
+                    cells[ci] = " " + fixed + " "
+                    changed = True
+            out.append("| " + " | ".join(c.strip() for c in cells) + " |" if changed else ln)
             continue
-        norm = [re.sub(r"\s+", " ", x).strip().lower() for x in segs]
-        counts: dict[str, int] = {}
-        for n in norm:
-            if len(n) >= min_seg_len:
-                counts[n] = counts.get(n, 0) + 1
-        if not counts or max(counts.values()) < min_repeats:
-            out.append(ln)
-            continue
-        seen: set[str] = set()
-        kept: list[str] = []
-        for seg, n in zip(segs, norm):
-            if len(n) >= min_seg_len and n in seen:
+        fixed = _collapse_segments(s, min_repeats=min_repeats, min_seg_len=min_seg_len)
+        out.append(fixed if fixed is not None else ln)
+    return "\n".join(out)
+
+
+def collapse_line_cycles(
+    text: str, *, max_period: int = 6, min_cycles: int = 4
+) -> str:
+    """Схлопывает ЦИКЛ из нескольких чередующихся строк («Символ ● с крестом…/
+    с линией…/с точкой…» ×N): dedupe_lines ловит только период 1, а VLM
+    зацикливается и на блоках из 2–6 строк."""
+    lines = text.splitlines()
+    norm = [re.sub(r"\s+", " ", ln.strip().lower()) for ln in lines]
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        collapsed = False
+        for p in range(2, max_period + 1):
+            if i + p * min_cycles > len(lines):
+                break
+            block = norm[i : i + p]
+            if not any(block):  # цикл из пустых строк не интересен
                 continue
-            seen.add(n)
-            kept.append(seg)
-        out.append(", ".join(kept) + " [inline-повторы схлопнуты]")
+            reps = 1
+            while (
+                i + (reps + 1) * p <= len(lines)
+                and norm[i + reps * p : i + (reps + 1) * p] == block
+            ):
+                reps += 1
+            if reps >= min_cycles:
+                out.extend(lines[i : i + p])
+                out.append(f"[truncated-cycle: блок из {p} строк повторён {reps} раз]")
+                i += reps * p
+                collapsed = True
+                break
+        if not collapsed:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+def fix_separator_rows(text: str) -> str:
+    """Разделитель GFM «|---|---|…» иногда разрастается на сотни ячеек
+    (петля VLM). Детерминированно урезаем его до ширины строки-шапки СВЕРХУ
+    (или до 60 ячеек, если шапки нет) — информации разделитель не несёт."""
+    # хвост может быть оборван (обрезка по токенам): допускаем незакрытую ячейку
+    sep_re = re.compile(r"^\s*\|(?:\s*:?-+:?\s*\|){3,}\s*:?-*\s*$")
+    lines = text.splitlines()
+    out: list[str] = []
+    for idx, ln in enumerate(lines):
+        if sep_re.match(ln):
+            n_sep = ln.count("|") - 1
+            n_hdr = 0
+            if out and out[-1].strip().startswith("|"):
+                n_hdr = out[-1].strip().strip("|").count("|") + 1
+            cap = n_hdr if n_hdr else 60
+            if n_sep > max(cap, 2):
+                out.append("|" + "---|" * max(cap, 2))
+                continue
+        out.append(ln)
     return "\n".join(out)
 
 
@@ -1128,13 +1461,27 @@ def join_value_line_runs(text: str, *, min_run: int = 6, max_len: int = 18) -> s
         v = as_value(lines[i])
         if v is not None:
             j = i
+            last_val = i
             vals: list[str] = []
-            while j < len(lines) and (vv := as_value(lines[j])) is not None:
+            while j < len(lines):
+                if not lines[j].strip():  # пустые строки внутри столбика не рвут run
+                    j += 1
+                    continue
+                vv = as_value(lines[j])
+                if vv is None:
+                    break
                 vals.append(vv)
+                last_val = j
                 j += 1
             if len(vals) >= min_run:
-                out.append("Значения на фрагменте: " + ", ".join(vals))
-                i = j
+                # зеркальные/повторные чтения одного столбика → дубли не несут
+                # информации, схлопываем с пометкой (recall не страдает)
+                uniq = list(dict.fromkeys(vals))
+                joined = "Значения на фрагменте: " + ", ".join(uniq)
+                if len(uniq) < len(vals):
+                    joined += f" [дубли схлопнуты: {len(vals) - len(uniq)}]"
+                out.append(joined)
+                i = last_val + 1
                 continue
         out.append(lines[i])
         i += 1
@@ -1143,9 +1490,16 @@ def join_value_line_runs(text: str, *, min_run: int = 6, max_len: int = 18) -> s
 
 def clean_vlm_text(text: str) -> str:
     """Anti-loop + дедуп строк + обрезка галлюцинаций вида 1,2,3…N."""
+    # табличные нормализации — ДО общих anti-loop, чтобы петли пустых ячеек
+    # и раздутые разделители не путали collapse_repetition
+    text = collapse_empty_cell_runs(text)
+    text = fix_separator_rows(text)
     text = collapse_repetition(text)
     text = collapse_numeric_list(text)
+    text = collapse_progression_runs(text)
     text = collapse_numbered_hallucination(text)
+    text = collapse_table_progression_rows(text)
+    text = collapse_line_cycles(text)
     text = dedupe_lines(text)
     text = collapse_inline_repetition(text)
     text = join_value_line_runs(text)
@@ -1234,6 +1588,7 @@ def run_vlm(
     usage: UsageTotals | None = None,
     sheet_aware: bool = False,
     table_pages: set[int] | None = None,
+    layer_aware: bool = False,
 ) -> Path:
     usage = usage or UsageTotals()
     doc = fitz.open(pdf)
@@ -1403,19 +1758,14 @@ def run_vlm(
                 f"  p{num}: PASS-T таблица целиком {t_im.size[0]}x{t_im.size[1]}",
                 flush=True,
             )
-            def _table_rows_with_digits(txt: str) -> int:
-                return sum(
-                    1
-                    for ln in txt.splitlines()
-                    if ln.lstrip().startswith("|") and re.search(r"\d", ln)
-                )
-
             # VLM недетерминированна: тот же лист то даёт идеальную таблицу,
-            # то петлю пустых ячеек → до 3 попыток (чуть разный max_px),
-            # держим лучший вариант по числу строк с цифрами.
+            # то петлю пустых ячеек → до 3 попыток (чуть разный max_px, высокое
+            # разрешение первым — точность цифр), держим лучший вариант по
+            # score_pass_t (строки с цифрами + контекст вне таблицы +
+            # целостность рядов).
             t0 = time.time()
-            ttxt, best_rows = "", -1
-            for attempt, px in enumerate((2600, 2200, 3000), start=1):
+            ttxt, best_score = "", -1
+            for attempt, px in enumerate((3000, 2600, 2200), start=1):
                 try:
                     cand = call_with_retries(
                         lambda px=px: chat_vision(
@@ -1424,7 +1774,7 @@ def run_vlm(
                             SYSTEM_TABLE_EXACT,
                             PROMPT_TABLE_EXACT,
                             image_to_data_url(t_im, max_px=px, quality=90),
-                            max_tokens=max(6000, local_pass_a_tokens),
+                            max_tokens=max(8000, local_pass_a_tokens),
                             prompt_style=spec.prompt_style,
                             usage=usage,
                         ),
@@ -1432,16 +1782,27 @@ def run_vlm(
                         base_delay=retry_delay,
                         usage=usage,
                     )
-                    cand = dedupe_lines(cand)  # мягкая чистка: full clean режет GFM
-                    rows_ok = _table_rows_with_digits(cand)
+                    # мягкая чистка: full clean режет GFM; пустые ряды —
+                    # детерминированно, до скоринга
+                    cand = strip_empty_table_rows(
+                        collapse_empty_cell_runs(dedupe_lines(cand))
+                    )
+                    sc, rows_ok = score_pass_t(cand)
                     print(
                         f"    PASS-T attempt {attempt} (px={px}): "
-                        f"{len(cand)} chars, {rows_ok} строк с цифрами",
+                        f"{len(cand)} chars, {rows_ok} строк с цифрами, "
+                        f"score={sc} ctx={_pass_t_has_context(cand)} "
+                        f"rows_ok={_pass_t_rows_consistent(cand)}",
                         flush=True,
                     )
-                    if rows_ok > best_rows:
-                        ttxt, best_rows = cand, rows_ok
-                    if rows_ok >= 5:
+                    if sc > best_score:
+                        ttxt, best_score = cand, sc
+                    # ранний выход только если и таблица, и контекст, и ряды целы
+                    if (
+                        rows_ok >= 5
+                        and _pass_t_has_context(cand)
+                        and _pass_t_rows_consistent(cand)
+                    ):
                         break
                 except Exception as e:
                     usage.failed_tiles += 1
@@ -1451,6 +1812,35 @@ def run_vlm(
                         raise
             if not ttxt:
                 ttxt = "(ошибка таблицы: все попытки PASS-T не удались)"
+            elif not _pass_t_has_context(ttxt):
+                # таблица есть, но текст вокруг неё потерян → отдельный дешёвый
+                # вызов только за контекстом (заголовок/примечания/штамп)
+                try:
+                    ctx = call_with_retries(
+                        lambda: chat_vision(
+                            client,
+                            spec.hf_id,
+                            SYSTEM_TABLE_EXACT,
+                            PROMPT_TABLE_CONTEXT,
+                            image_to_data_url(t_im, max_px=2600, quality=90),
+                            max_tokens=2000,
+                            prompt_style=spec.prompt_style,
+                            usage=usage,
+                        ),
+                        retries=retries,
+                        base_delay=retry_delay,
+                        usage=usage,
+                    )
+                    ctx = dedupe_lines(ctx).strip()
+                    if ctx:
+                        ttxt = "#### Текст вне таблицы\n\n" + ctx + "\n\n" + ttxt
+                    print(
+                        f"    PASS-T context fallback: {len(ctx)} chars",
+                        flush=True,
+                    )
+                except Exception as e:
+                    usage.failed_tiles += 1
+                    print(f"    PASS-T context fallback FAIL {e}", flush=True)
             print(f"    PASS-T: {len(ttxt)} chars {time.time()-t0:.1f}s", flush=True)
             sections.append("### PASS-B Таблица целиком\n\n" + ttxt)
             content = "\n\n".join(sections)
@@ -1464,6 +1854,39 @@ def run_vlm(
                     print(f"    stamp OCR skip: {e}", flush=True)
             return content
 
+        # ── layer-aware: чистый текстовый слой делает тайлы бессмысленными ─
+        # Тайлы существуют, чтобы вычитать мелкий текст с картинки. Если у
+        # страницы есть исправный текстовый слой, тот же текст уже доступен
+        # точно и бесплатно — тайлы только жгут токены и добавляют выдуманные
+        # цифры. Правило универсальное: смотрим на качество слоя, а не на номер
+        # страницы; при битом ToUnicode или его отсутствии всё работает как
+        # раньше.
+        if layer_aware:
+            try:
+                from build_ios2_md import is_garbled_pdf_text
+
+                raw_layer = page.get_text("text")
+                layer_ok = (
+                    len(raw_layer.strip()) >= LAYER_MIN_CHARS
+                    and not is_garbled_pdf_text(raw_layer)
+                )
+            except Exception as e:
+                print(f"    layer-aware: проверка слоя не удалась ({e})", flush=True)
+                layer_ok = False
+            if layer_ok:
+                print(
+                    f"  p{num}: layer-aware — текстовый слой исправен "
+                    f"({len(raw_layer.strip())} симв.), PASS-B пропущен",
+                    flush=True,
+                )
+                sections.append(
+                    "### PASS-B пропущен (layer-aware)\n\n"
+                    "Текстовый слой PDF исправен: текст и таблицы этой страницы "
+                    "берутся из него детерминированно, вычитывание тайлами не "
+                    "нужно."
+                )
+                return "\n\n".join(sections)
+
         # ── Pass B: тайлы → markdown-текст/таблицы ────────────────────────
         rows, cols = tile_grid(w, h, local_tile_max, max_tiles=local_max_tiles)
         tw, th = w / cols, h / rows
@@ -1473,12 +1896,22 @@ def run_vlm(
             f"two_pass={use_two_pass} sheet_aware={sheet_aware}",
             flush=True,
         )
-        jobs: list[tuple[str, Image.Image, str, int | None]] = []
+        # (label, crop, prompt, px_override, frac_box) — frac_box в долях листа
+        # нужен table-rescue, чтобы перерендерить тайл из PDF с бОльшим DPI
+        jobs: list[tuple[str, Image.Image, str, int | None, tuple | None]] = []
         for r in range(rows):
             for c in range(cols):
                 x0, y0 = int(c * tw), int(r * th)
                 x1, y1 = min(w, int((c + 1) * tw)), min(h, int((r + 1) * th))
-                jobs.append((f"r{r+1}c{c+1}", im.crop((x0, y0, x1, y1)), prompt, None))
+                jobs.append(
+                    (
+                        f"r{r+1}c{c+1}",
+                        im.crop((x0, y0, x1, y1)),
+                        prompt,
+                        None,
+                        (x0 / w, y0 / h, x1 / w, y1 / h),
+                    )
+                )
 
         if (
             sheet_aware
@@ -1496,7 +1929,7 @@ def run_vlm(
                 for label, crop, zprompt in generic_describe_zones(
                     zone_im, passport.kind
                 ):
-                    jobs.append((label, crop, zprompt, 1800))
+                    jobs.append((label, crop, zprompt, 1800, None))
                 print(
                     f"    +generic zones kind={passport.kind} "
                     f"(page_max={zone_page_max})",
@@ -1516,7 +1949,7 @@ def run_vlm(
                 )
                 zjobs = crop_content_zones(zone_im, num)
                 for label, crop, zprompt in zjobs:
-                    jobs.append((label, crop, zprompt, 2000))
+                    jobs.append((label, crop, zprompt, 2000, None))
                 print(
                     f"    +{len(zjobs)} zone crops "
                     f"(page_max={zone_page_max}, send_px=2000)",
@@ -1530,13 +1963,16 @@ def run_vlm(
                 from local_ocr import crop_stamp_regions
 
                 for name, crop in crop_stamp_regions(im).items():
-                    jobs.append((f"stamp_{name}", crop, PROMPT_STAMP, 1600))
+                    jobs.append((f"stamp_{name}", crop, PROMPT_STAMP, 1600, None))
             except Exception as e:
                 print(f"    stamp-crop skip regions: {e}", flush=True)
 
         tile_parts: list[str] = []
         dropped_garbage = 0
-        for i, (label, crop, tile_prompt, px_override) in enumerate(jobs, start=1):
+        table_rescue_left = 2  # бюджет спасений табличных тайлов на страницу
+        for i, (label, crop, tile_prompt, px_override, frac_box) in enumerate(
+            jobs, start=1
+        ):
             send_px = (
                 px_override
                 if px_override is not None
@@ -1573,6 +2009,67 @@ def run_vlm(
                         f"Пример: --provider {spec.preferred_provider}"
                     ) from e
                 txt = f"(ошибка тайла: {e})"
+            # ── table-rescue: тайл увидел таблицу, но зациклился на пустых
+            # ячейках → перечитываем тот же фрагмент с бОльшим DPI и табличным
+            # промптом; принимаем только если содержательных строк стало больше
+            # (keep-better, LOOP_LEDGER: только hard-signatures)
+            if (
+                table_rescue_left > 0
+                and frac_box is not None
+                and "[петля пустых ячеек]" in txt
+                and spec.prompt_style != "deepseek_ocr"
+            ):
+                table_rescue_left -= 1
+                try:
+                    hi_im = render_page(page, min(max(w, h) * 2, 4200))
+                    hw, hh = hi_im.size
+                    # попытка 1: тот же тайл с бОльшим DPI; попытка 2 (если
+                    # строк данных так и нет — таблица шире тайла): вся
+                    # горизонтальная полоса листа на той же высоте
+                    cand_boxes = [
+                        ("tile", frac_box),
+                        ("band", (0.0, frac_box[1], 1.0, frac_box[3])),
+                    ]
+                    for stage, (fx0, fy0, fx1, fy1) in cand_boxes:
+                        hi_crop = hi_im.crop(
+                            (
+                                int(fx0 * hw),
+                                int(fy0 * hh),
+                                int(fx1 * hw),
+                                int(fy1 * hh),
+                            )
+                        )
+                        rtxt = call_with_retries(
+                            lambda hi_crop=hi_crop: chat_vision(
+                                client,
+                                spec.hf_id,
+                                SYSTEM_TABLE_EXACT,
+                                PROMPT_TILE_TABLE_RESCUE,
+                                image_to_data_url(hi_crop, max_px=2400, quality=92),
+                                max_tokens=local_tile_tokens,
+                                prompt_style=spec.prompt_style,
+                                usage=usage,
+                            ),
+                            retries=retries,
+                            base_delay=retry_delay,
+                            usage=usage,
+                        )
+                        rtxt = clean_vlm_text(rtxt)
+                        old_s, new_s = table_text_score(txt), table_text_score(rtxt)
+                        if new_s > old_s:
+                            txt = rtxt
+                        print(
+                            f"    tile {i}/{len(jobs)} ({label}): "
+                            f"table-rescue[{stage}] "
+                            f"{'OK' if new_s > old_s else 'не лучше'} "
+                            f"(score {old_s}→{new_s})",
+                            flush=True,
+                        )
+                        if table_content_rows(txt) >= 2:
+                            break
+                except Exception as e:
+                    usage.failed_tiles += 1
+                    print(f"    table-rescue ({label}) FAIL {e}", flush=True)
             if sheet_aware and is_garbage_tile(txt):
                 dropped_garbage += 1
                 tile_parts.append(
@@ -1791,6 +2288,12 @@ def main() -> int:
         "«перенеси таблицу как в исходнике» (PASS-T) по целому листу",
     )
     ap.add_argument(
+        "--layer-aware",
+        action="store_true",
+        help="если у страницы исправный текстовый слой — пропускать PASS-B "
+        "(тайлы): текст и таблицы берутся из слоя точно и бесплатно",
+    )
+    ap.add_argument(
         "--zone-crop",
         action="store_true",
         help="Зональные кропы экспликации/легенды/таблиц (ОДИ/КР).",
@@ -1944,6 +2447,7 @@ def main() -> int:
         "pipeline": bool(args.pipeline),
         "two_pass": bool(args.two_pass),
         "sheet_aware": bool(args.sheet_aware),
+        "layer_aware": bool(args.layer_aware),
         "runs": args.runs,
         "synth": args.synth,
         "provider": provider,
@@ -2010,6 +2514,7 @@ def main() -> int:
                     else None
                 ),
                 sheet_aware=args.sheet_aware,
+                layer_aware=args.layer_aware,
             )
             if args.pipeline:
                 if not ocr_dir or not Path(ocr_dir).exists():

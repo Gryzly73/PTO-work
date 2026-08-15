@@ -186,13 +186,84 @@ def build(
     )
     blocks.append(header)
 
+    # ── шифр документа из листов с исправным слоем ────────────────────────
+    # В комплекте рабочей документации шифр в штампе один и тот же на всех
+    # листах. Значит его можно прочитать там, где текстовый слой цел, и
+    # подсказать на листах, где слой повреждён и VLM шифр не разобрала.
+    # Механизм универсален: ничего не выдумывается, источник подписан, а если
+    # шифров в документе несколько (сшивка разделов) — подсказка не даётся.
+    # ── починка сломанного ToUnicode ──────────────────────────────────────
+    # Порча оказалась посимвольной подстановкой: отображение подбирается по
+    # словарю читаемых листов (плюс текст VLM как подсказка) и делает слой
+    # повреждённых страниц точным. Включаем только при высоком качестве
+    # подбора — иначе продолжаем опираться на VLM, как раньше.
+    glyph_map: dict[str, str] = {}
+    glyph_stats: dict = {}
+    try:
+        from deglyph import build_mapping, coverage, verify
+
+        _vlm_text = "\n".join(run_pages.values())
+        _m = build_mapping(doc, _vlm_text)
+        if _m:
+            _cov = coverage(doc, _m)
+            _ver = verify(doc, _m, _vlm_text)
+            glyph_stats = {"cov": _cov, "ver": _ver}
+            if (_cov["pct"] or 0) >= 90 and (_ver["pct"] or 0) >= 85:
+                glyph_map = _m
+                print(
+                    f"текстовый слой починен: {_cov['glyphs']} глифов, "
+                    f"{_cov['pct']}% символов, слов в словаре {_ver['pct']}%"
+                )
+            else:
+                print(
+                    f"починка слоя отклонена гейтом: символов {_cov['pct']}%, "
+                    f"слов {_ver['pct']}% (нужно 90% и 85%)"
+                )
+    except Exception as e:
+        print(f"починка слоя пропущена: {e}")
+
+    # отпечатки рамки со штампом — считаются один раз на документ
+    try:
+        from pdf_tables import frame_signatures
+
+        frames = frame_signatures(doc)
+        if frames:
+            print(f"рамка листа распознана и исключена из таблиц ({len(frames)} шт.)")
+    except Exception as e:
+        frames = set()
+        print(f"распознавание рамки пропущено: {e}")
+
+    doc_codes: dict[str, int] = {}
+    code_re = re.compile(r"\b\d{2,3}-[А-ЯЁA-Z]{2,5}-[\w./-]{3,}", re.UNICODE)
+    for _p in range(total):
+        _t = doc[_p].get_text("text")
+        if is_garbled_pdf_text(_t):
+            continue
+        for _m in code_re.finditer(_t):
+            _c = _m.group().rstrip(".,;")
+            doc_codes[_c] = doc_codes.get(_c, 0) + 1
+    # берём шифр, встречающийся на большинстве читаемых листов
+    main_code = None
+    if doc_codes:
+        _best, _cnt = max(doc_codes.items(), key=lambda kv: kv[1])
+        if _cnt >= 3 and _cnt >= 0.5 * sum(doc_codes.values()):
+            main_code = _best
+    if main_code:
+        print(f"шифр документа из штампов: {main_code} ({doc_codes[main_code]} листов)")
+
     skipped_garbled = 0
     for n in range(1, total + 1):
         body = run_pages.get(n, "")
         pass_0, pass_a, pass_b = extract_pass(body)
         page = doc[n - 1]
-        pdf_text = normalize_pdf_text(page.get_text("text"))
-        garbled = is_garbled_pdf_text(pdf_text)
+        raw_text = page.get_text("text")
+        garbled = is_garbled_pdf_text(raw_text)
+        repaired = False
+        if garbled and glyph_map:
+            fixed = "".join(glyph_map.get(c, c) for c in raw_text)
+            if not is_garbled_pdf_text(fixed):
+                raw_text, garbled, repaired = fixed, False, True
+        pdf_text = normalize_pdf_text(raw_text)
         drawing = is_drawing_page(page)
         use_tiles = (
             include_tiles if include_tiles is not None else drawing
@@ -215,6 +286,24 @@ def build(
             chunk.append(tile_title)
             chunk.append(pass_b + "\n")
 
+        # Таблицы из текстового слоя: точная сетка + точные значения без VLM.
+        # Ставим ПЕРЕД сырым текстом — читателю нужна структура, а не поток слов.
+        if not garbled:
+            try:
+                from pdf_tables import page_tables_md
+
+                tables_md = page_tables_md(
+                    page, glyph_map if repaired else None, frames
+                )
+            except Exception:
+                tables_md = []
+            if tables_md:
+                chunk.append("### Таблицы листа (из PDF)\n")
+                for ti, tmd in enumerate(tables_md, start=1):
+                    if len(tables_md) > 1:
+                        chunk.append(f"**Таблица {ti}**\n")
+                    chunk.append(tmd + "\n")
+
         if garbled:
             skipped_garbled += 1
             chunk.append("### Текст листа (из PDF)\n")
@@ -222,8 +311,21 @@ def build(
                 "*(текстовый слой PDF повреждён — битая кодировка шрифта CAD. "
                 "Опирайся на описание VLM выше.)*\n"
             )
+            # шифр не выдумываем: помечаем, что он взят из штампов других листов
+            if main_code and main_code.lower() not in "\n".join(chunk).lower():
+                chunk.append(
+                    f"\n*Шифр документа: `{main_code}` — прочитан из штампов "
+                    f"других листов этого комплекта, на самом листе слой "
+                    f"повреждён.*\n"
+                )
         elif pdf_text:
             chunk.append("### Текст листа (из PDF)\n")
+            if repaired:
+                chunk.append(
+                    "*(шрифт листа отдавал неверные коды символов; кодировка "
+                    "восстановлена подстановкой, выведенной по читаемым листам "
+                    "этого же документа)*\n"
+                )
             chunk.append(pdf_text + "\n")
         else:
             chunk.append("### Текст листа (из PDF)\n")
