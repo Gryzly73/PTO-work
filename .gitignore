@@ -1,50 +1,89 @@
-# === Secrets ===
+# ────────────────────────────────────────────────────────────────
+# В репозиторий попадает только ПРОЕКТ: код конвейера + документация.
+# Всё, что можно пересобрать (прогоны, отчёты, вьюеры) и всё, что
+# нельзя публиковать (PDF заказчика, эталоны, токены) — остаётся локально.
+# ────────────────────────────────────────────────────────────────
+
+# === Секреты ===
 .env
-.env.local
+.env.*
+!.env.example
 *.pem
+*.key
 
 # === Python ===
 __pycache__/
 *.py[cod]
 .venv/
 venv/
+env/
 *.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
 
-# === Тестовые данные и исходные PDF (не пушим) ===
+# === Документы заказчика и тестовые данные ===
 *.pdf
 *.docx
-ЭТАЛОН — оригинал PDF + идеальный Markdown/
+*.xlsx
+*.zip
+ЭТАЛОН*/
 new_files/*
 !new_files/pto_scoring_kit/
 new_files/pto_scoring_kit/*
 !new_files/pto_scoring_kit/score_real_testset.py
 !new_files/pto_scoring_kit/README.md
 
-# === Результаты прогонов и сгенерированные отчёты (регенерируемо) ===
+# === Результаты прогонов (регенерируется запуском раннера) ===
 hf_runs/
-quality_viewer_*/
 bench_*.md
 bench_*.md.meta.json
-bench_*.compare.json
 bench_*.md.pages/
-ИОС2_итог.md
-ИОС2_таблицы_*.md
-REPORT_*.md
-RESULTS_*.md
+bench_*.compare.json
+*.compare.json
+pdftext.json
+readiness.json
+
+# === Собранные выгрузки Markdown (артефакты, а не исходники) ===
+ИОС2_*.md
+*_итог.md
+итог*.md
+union*.md
+out.md
+5.md
+
+# === Сгенерированные отчёты, презентации, вьюеры ===
+ОТЧЁТ_*.html
+ОТЧЁТ_*.md
+СВЕРКА_*.html
+СВЕРКА_*.md
+PRESENTATION_*.html
 PTO_progress_presentation.html
 PTO_workflow_interactive.html
-PRESENTATION_status.html
+REPORT_*.md
+RESULTS_*.md
+quality_viewer_*/
+match_viewer*/
+*_viewer/
 
-# === Внутренние рабочие документы ===
+# === Внутренние рабочие документы (не часть продукта) ===
 IC_PARK_*
+WORKFLOW_PTO_CHECK.md
+NEXT_PHASE_research.md
 
-# === Мусор ===
-5.md
+# === Логи и временное ===
+*.log
+*.tmp
+*.bak
+tmp/
+scratch/
+
+# === Локальные настройки инструментов ===
+.claude/
+.vscode/
+.idea/
 
 # === OS ===
 Thumbs.db
 Desktop.ini
 .DS_Store
-ОТЧЁТ_*.html
-СВЕРКА_*.html
-readiness.json
