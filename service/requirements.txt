@@ -1,0 +1,5 @@
+# Зависимости HTTP-слоя. Сам конвейер ставится из ../requirements.txt —
+# держим отдельно, чтобы CLI-прогоны не тянули веб-стек.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9

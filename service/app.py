@@ -1,0 +1,418 @@
+"""HTTP-лицо конвейера.
+
+Задача сервиса — дать фронтенду ровно те данные, которые он уже умеет
+показывать: статус документа, текущий лист, шаг обработки и готовые страницы
+в формате DocumentPage. Всё тяжёлое (markdown листов) лежит файлами в папке
+прогона, наружу отдаётся по запросу.
+
+Запуск:
+    cd backend
+    python -m service            # или: uvicorn service.app:app --port 8000
+"""
+from __future__ import annotations
+
+import shutil
+import uuid
+from html import escape
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from service import config
+from service.jobs import (
+    ACTIVE_STATUSES,
+    STATUS_CANCELED,
+    STATUS_DONE,
+    STATUS_ERROR,
+    STATUS_PROCESSING,
+    STATUS_QUEUED,
+    JobStore,
+    now_iso,
+)
+from service.pipeline import Pipeline, PipelineError, pdf_page_count
+from service.worker import Worker, load_page_json
+
+store = JobStore()
+pipeline = Pipeline()
+worker = Worker(store, pipeline)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config.ensure_dirs()
+    revived = store.reconcile()
+    if revived:
+        print(
+            f"[service] после перезапуска вернул в очередь задач: {len(revived)}",
+            flush=True,
+        )
+    worker.start()
+    print(
+        f"[service] режим={config.MODE} модель={config.MODEL} "
+        f"прогоны={config.RUNS_DIR}",
+        flush=True,
+    )
+    yield
+    worker.shutdown()
+
+
+app = FastAPI(title="ПТО: конвейер PDF → Markdown", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=config.CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- вспомогательное --------------------------------------------------------
+def _job_or_404(job_id: str):
+    job = store.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Задача не найдена")
+    return job
+
+
+def _resolve_pdf_path(raw_path: str) -> Path:
+    """PDF по пути принимаем только из разрешённых каталогов."""
+    candidate = Path(raw_path).expanduser().resolve()
+    if not candidate.exists() or not candidate.is_file():
+        raise HTTPException(status_code=400, detail=f"Файл не найден: {candidate}")
+    for root in config.ALLOWED_PDF_ROOTS:
+        try:
+            candidate.relative_to(root)
+            return candidate
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            "Путь вне разрешённых каталогов. Добавьте его в PTO_ALLOWED_PDF_ROOTS "
+            "или загрузите файл через multipart."
+        ),
+    )
+
+
+def _parse_pages(spec: str | None, total: int) -> list[int]:
+    if not spec or spec.strip().lower() in {"all", "все", "*"}:
+        return list(range(1, total + 1))
+    from hf_api_bench import parse_pages
+
+    pages = parse_pages(spec, total)
+    if not pages:
+        raise HTTPException(status_code=400, detail=f"Не разобрал страницы: {spec}")
+    return pages
+
+
+def _new_run_dir(job_hint: str) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    name = f"{stamp}_{config.MODEL}_svc-{job_hint[:8]}"
+    path = config.RUNS_DIR / name
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _create_job(
+    *,
+    pdf_path: Path,
+    original_name: str,
+    project_id: str | None,
+    document_id: str | None,
+    pages_spec: str | None,
+):
+    try:
+        total = pdf_page_count(pdf_path)
+    except Exception as error:
+        raise HTTPException(status_code=400, detail=f"Не удалось прочитать PDF: {error}")
+    if total == 0:
+        raise HTTPException(status_code=400, detail="В PDF нет страниц")
+
+    pages = _parse_pages(pages_spec, total)
+    run_dir = _new_run_dir(uuid.uuid4().hex)
+    job = store.create(
+        originalName=original_name,
+        pdfPath=str(pdf_path),
+        runDir=str(run_dir),
+        pageCount=total,
+        pagesRequested=pages,
+        projectId=project_id,
+        documentId=document_id,
+        profile=pipeline.describe(),
+    )
+    worker.wake()
+    return job
+
+
+# --- маршруты ---------------------------------------------------------------
+@app.get("/", response_class=HTMLResponse)
+def index():
+    """Страница «сервис жив».
+
+    Без неё человек, открывший http://127.0.0.1:8000 в браузере, видит голое
+    404 Not Found и решает, что сервис не поднялся.
+    """
+    jobs = store.list()
+    active = [job for job in jobs if job.status in ACTIVE_STATUSES]
+    rows = "".join(
+        "<tr><td>{name}</td><td>{status}</td><td>{done}/{total}</td>"
+        "<td>{page}</td></tr>".format(
+            name=escape(job.originalName),
+            status=escape(job.status),
+            done=len(job.pagesDone),
+            total=job.pages_total,
+            page=job.processingPage if job.processingPage else "—",
+        )
+        for job in jobs[-10:][::-1]
+    )
+    mode_note = (
+        "имитация без обращения к модели"
+        if config.MODE == "mock"
+        else "настоящий прогон VLM, страницы уходят провайдеру HF"
+    )
+    return f"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>ПТО — конвейер</title>
+<style>
+ body {{ font: 15px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 46rem; }}
+ code {{ background: #f4f4f5; padding: .1rem .3rem; border-radius: 3px; }}
+ table {{ border-collapse: collapse; margin-top: .5rem; width: 100%; }}
+ td, th {{ text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #e4e4e7; }}
+</style></head><body>
+<h1>Конвейер PDF → Markdown</h1>
+<p>Сервис работает. Режим <code>{escape(config.MODE)}</code> — {mode_note}.</p>
+<p>Модель: <code>{escape(str(config.MODEL))}</code>. В очереди и в работе: {len(active)}.</p>
+<h2>Последние задачи</h2>
+<table><tr><th>Документ</th><th>Статус</th><th>Листов</th><th>Текущий</th></tr>
+{rows or '<tr><td colspan="4">пока пусто</td></tr>'}</table>
+<h2>Куда дальше</h2>
+<ul>
+ <li><a href="/health">/health</a> — состояние в JSON</li>
+ <li><a href="/jobs">/jobs</a> — очередь целиком</li>
+ <li><a href="/docs">/docs</a> — интерактивная документация API</li>
+</ul>
+<p>Интерфейс для инженера — это фронтенд на <a href="http://localhost:8080">8080</a>,
+здесь только API.</p>
+</body></html>"""
+
+
+@app.get("/health")
+def health():
+    jobs = store.list()
+    return {
+        "ok": True,
+        "mode": config.MODE,
+        "profile": pipeline.describe(),
+        "runsDir": str(config.RUNS_DIR),
+        "queue": {
+            "queued": sum(1 for j in jobs if j.status == STATUS_QUEUED),
+            "processing": sum(1 for j in jobs if j.status == STATUS_PROCESSING),
+            "done": sum(1 for j in jobs if j.status == STATUS_DONE),
+            "error": sum(1 for j in jobs if j.status == STATUS_ERROR),
+            "canceled": sum(1 for j in jobs if j.status == STATUS_CANCELED),
+        },
+        "currentJobId": worker.current_job_id,
+        "time": now_iso(),
+    }
+
+
+@app.post("/jobs", status_code=201)
+async def create_job(
+    request: Request,
+    file: UploadFile | None = None,
+    projectId: str | None = Form(default=None),
+    documentId: str | None = Form(default=None),
+    pages: str | None = Form(default=None),
+    originalName: str | None = Form(default=None),
+):
+    """Ставит документ в очередь.
+
+    Два способа: multipart с файлом или JSON с путём к уже лежащему PDF
+    (когда сервис стоит рядом с фронтом и видит его uploads/).
+    """
+    if file is not None:
+        if not (file.filename or "").lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Принимаются только PDF")
+        config.ensure_dirs()
+        target = config.UPLOADS_DIR / f"{uuid.uuid4()}.pdf"
+        size = 0
+        with target.open("wb") as sink:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > config.MAX_UPLOAD_BYTES:
+                    sink.close()
+                    target.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Файл больше {config.MAX_UPLOAD_BYTES // (1024 * 1024)} МБ",
+                    )
+                sink.write(chunk)
+        return _create_job(
+            pdf_path=target,
+            original_name=originalName or file.filename or target.name,
+            project_id=projectId,
+            document_id=documentId,
+            pages_spec=pages,
+        ).to_dict()
+
+    body = await request.json()
+    raw_path = body.get("path") or body.get("pdfPath")
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="Нужен файл или поле path")
+    pdf_path = _resolve_pdf_path(str(raw_path))
+    return _create_job(
+        pdf_path=pdf_path,
+        original_name=body.get("originalName") or pdf_path.name,
+        project_id=body.get("projectId"),
+        document_id=body.get("documentId"),
+        pages_spec=body.get("pages"),
+    ).to_dict()
+
+
+@app.get("/jobs")
+def list_jobs(
+    projectId: str | None = None,
+    documentId: str | None = None,
+    status: str | None = None,
+    active: bool = False,
+):
+    """Фильтр documentId нужен фронту: после его перезапуска клиент находит
+    уже идущий прогон по id документа и подхватывает прогресс вместо того,
+    чтобы считать документ заново."""
+    jobs = store.list(projectId)
+    if documentId:
+        jobs = [job for job in jobs if job.documentId == documentId]
+    if status:
+        wanted = {part.strip() for part in status.split(",") if part.strip()}
+        jobs = [job for job in jobs if job.status in wanted]
+    if active:
+        jobs = [job for job in jobs if job.status in ACTIVE_STATUSES]
+    return {"jobs": [job.to_dict() for job in jobs], "currentJobId": worker.current_job_id}
+
+
+@app.get("/jobs/{job_id}")
+def get_job(job_id: str):
+    return _job_or_404(job_id).to_dict()
+
+
+@app.get("/jobs/{job_id}/pages")
+def get_pages(
+    job_id: str,
+    after: int = Query(default=0, ge=0),
+    pages: str | None = None,
+    limit: int = Query(default=200, ge=1, le=2000),
+):
+    """Готовые листы. Фронт тянет дельту: after — наибольший известный ему номер."""
+    job = _job_or_404(job_id)
+    if pages:
+        wanted = _parse_pages(pages, job.pageCount)
+    else:
+        wanted = [n for n in job.pagesDone if n > after]
+    payload = []
+    for number in wanted[:limit]:
+        page = load_page_json(job, number)
+        if page is not None:
+            payload.append(page)
+    return {
+        "job": job.to_dict(),
+        "pages": payload,
+        "hasMore": len(wanted) > len(payload),
+    }
+
+
+@app.get("/jobs/{job_id}/pages/{page_number}")
+def get_page(job_id: str, page_number: int):
+    job = _job_or_404(job_id)
+    page = load_page_json(job, page_number)
+    if page is None:
+        raise HTTPException(status_code=404, detail="Лист ещё не готов")
+    return page
+
+
+@app.get("/jobs/{job_id}/markdown", response_class=PlainTextResponse)
+def get_markdown(job_id: str):
+    """Весь документ одним markdown — собирается на лету из готовых листов."""
+    job = _job_or_404(job_id)
+    chunks = []
+    for number in job.pagesDone:
+        page = load_page_json(job, number)
+        if page:
+            chunks.append(page["markdown"].rstrip())
+    if not chunks:
+        return PlainTextResponse(
+            f"# {job.originalName}\n\nНи один лист ещё не готов.\n",
+            media_type="text/markdown; charset=utf-8",
+        )
+    return PlainTextResponse(
+        "\n\n---\n\n".join(chunks) + "\n",
+        media_type="text/markdown; charset=utf-8",
+    )
+
+
+@app.post("/jobs/{job_id}/cancel")
+def cancel_job(job_id: str):
+    job = _job_or_404(job_id)
+    if job.status not in ACTIVE_STATUSES:
+        return job.to_dict()
+    updated = store.patch(job_id, cancelRequested=True)
+    if updated and updated.status == STATUS_QUEUED:
+        # Задача ещё не в работе — снимаем сразу, воркер её не увидит.
+        updated = store.patch(
+            job_id,
+            status=STATUS_CANCELED,
+            processingStep=None,
+            processingPage=None,
+            finishedAt=now_iso(),
+            errorMessage="Снято из очереди",
+        )
+    return updated.to_dict() if updated else {}
+
+
+@app.post("/jobs/{job_id}/retry")
+def retry_job(job_id: str, reset: bool = False):
+    """Повторяет прогон. По умолчанию досчитывает недостающие листы;
+    reset=true считает документ заново с нуля."""
+    job = _job_or_404(job_id)
+    run_dir = Path(job.runDir)
+    if reset:
+        for sub in ("pages", "frontend", "runs"):
+            shutil.rmtree(run_dir / sub, ignore_errors=True)
+    updated = store.patch(
+        job_id,
+        status=STATUS_QUEUED,
+        processingStep=STATUS_QUEUED,
+        processingPage=None,
+        errorMessage=None,
+        cancelRequested=False,
+        pagesDone=[] if reset else job.pagesDone,
+        pageErrors={},
+        finishedAt=None,
+        elapsedSec=None,
+    )
+    worker.wake()
+    return updated.to_dict() if updated else {}
+
+
+@app.delete("/jobs/{job_id}")
+def delete_job(job_id: str, purge: bool = False):
+    job = _job_or_404(job_id)
+    if job.status in ACTIVE_STATUSES:
+        store.patch(job_id, cancelRequested=True)
+    if purge:
+        shutil.rmtree(Path(job.runDir), ignore_errors=True)
+        pdf_path = Path(job.pdfPath)
+        try:
+            pdf_path.relative_to(config.UPLOADS_DIR)
+            pdf_path.unlink(missing_ok=True)
+        except ValueError:
+            pass  # чужой файл (например, uploads фронта) не трогаем
+    store.delete(job_id)
+    return {"ok": True}
+
+
+@app.exception_handler(PipelineError)
+def pipeline_error_handler(request: Request, error: PipelineError):
+    return JSONResponse(status_code=503, content={"detail": str(error)})

@@ -1,0 +1,201 @@
+"""Обёртка над конвейером. Сам hf_api_bench.py не меняется — он вызывается
+как библиотека.
+
+Ключевое решение: run_vlm() зовётся по одному листу за вызов, а не списком.
+Так мы получаем точный прогресс, возможность прервать прогон между листами и
+возобновление после перезапуска (готовые pages/page_NNNN.md просто не
+пересчитываются — на 1000 страницах это разница между «потеряли сутки» и
+«продолжили с 341-го листа»).
+"""
+from __future__ import annotations
+
+import os
+import time
+from pathlib import Path
+
+import fitz  # PyMuPDF
+
+from service import config
+
+
+class PipelineError(RuntimeError):
+    pass
+
+
+def page_file(run_dir: Path, page_number: int) -> Path:
+    return run_dir / "pages" / f"page_{page_number:04d}.md"
+
+
+def pdf_page_count(pdf_path: Path) -> int:
+    with fitz.open(pdf_path) as doc:
+        return doc.page_count
+
+
+class Pipeline:
+    """Единая точка входа в конвейер. Режим real ходит в модель, mock — нет."""
+
+    def __init__(self, mode: str | None = None) -> None:
+        self.mode = (mode or config.MODE).lower()
+        self._ready = False
+        self._spec = None
+        self._client = None
+        self._provider = None
+        self._defaults: dict = {}
+
+    # --- инициализация ------------------------------------------------------
+    def prepare(self) -> None:
+        if self._ready or self.mode != "real":
+            self._ready = True
+            return
+
+        import hf_api_bench as hb
+
+        hb.load_dotenv()
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
+        if not token or token.startswith("hf_xxx"):
+            raise PipelineError(
+                "Нет HF_TOKEN. Впишите токен в backend/.env "
+                "или запустите сервис с PTO_PIPELINE_MODE=mock."
+            )
+
+        # Тест-сетовые подсказки по номеру страницы губительны на чужих PDF:
+        # они подсказывают модели то, чего на листе нет.
+        hb.USE_ZONE_HINTS = bool(config.ZONE_HINTS)
+
+        self._spec = hb.get_spec(config.MODEL)
+        self._provider = hb.resolve_provider(self._spec, config.PROVIDER, token)
+        self._client = hb.make_client(token, self._provider)
+        defaults = hb.vision_defaults(self._spec)
+        if config.HIGH_DPI:
+            defaults = {**defaults, **hb.HIGH_DPI_DEFAULTS}
+        self._defaults = defaults
+        self._ready = True
+
+    def describe(self) -> dict:
+        info = config.profile_dict()
+        info["provider"] = self._provider or config.PROVIDER
+        if self._spec is not None:
+            info["hfModel"] = self._spec.hf_id
+        return info
+
+    # --- работа -------------------------------------------------------------
+    def run_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> dict:
+        """Считает один лист. Возвращает markdown, usage и время."""
+        self.prepare()
+        started = time.time()
+        if self.mode == "mock":
+            raw = self._mock_page(pdf_path, page_number, run_dir)
+            usage: dict = {}
+        else:
+            raw, usage = self._real_page(pdf_path, page_number, run_dir)
+        return {
+            "markdown": raw,
+            "usage": usage,
+            "elapsed": round(time.time() - started, 1),
+        }
+
+    def _real_page(self, pdf_path: Path, page_number: int, run_dir: Path):
+        import hf_api_bench as hb
+
+        usage = hb.UsageTotals()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        hb.run_vlm(
+            self._client,
+            self._spec,
+            pdf_path,
+            [page_number],
+            page_max=self._defaults["page_max"],
+            tile_max=self._defaults["tile_max"],
+            out_dir=run_dir,
+            fail_fast=False,
+            ocr_prompt="ocr",
+            image_max_px=self._defaults["image_max_px"],
+            jpeg_quality=self._defaults["jpeg_quality"],
+            max_tokens=self._defaults["max_tokens"],
+            max_tiles=int(self._defaults.get("max_tiles", 6)),
+            stamp_crop=config.STAMP_CROP,
+            zone_crop=config.ZONE_CROP,
+            two_pass=config.TWO_PASS,
+            runs=config.RUNS,
+            retries=config.RETRIES,
+            retry_delay=config.RETRY_DELAY,
+            usage=usage,
+            sheet_aware=config.SHEET_AWARE,
+            layer_aware=config.LAYER_AWARE,
+        )
+        target = page_file(run_dir, page_number)
+        if not target.exists():
+            raise PipelineError(f"Конвейер не записал {target.name}")
+        return target.read_text(encoding="utf-8"), usage.as_dict()
+
+    def _mock_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> str:
+        """Имитация листа без обращения к модели.
+
+        Нужна, чтобы проверять склейку с фронтом — очередь, потоковую отдачу
+        страниц, поведение при обновлении страницы — не тратя по две минуты и
+        токены на лист. Вывод помечен, чтобы его нельзя было принять за
+        работу модели.
+        """
+        from service.convert import page_layer_text
+
+        sections = []
+        try:
+            from sheet_aware import build_passport, passport_markdown
+
+            with fitz.open(pdf_path) as doc:
+                passport = build_passport(doc[page_number - 1], page_number)
+            sections.append(
+                "### PASS-0 Паспорт листа\n\n" + passport_markdown(passport)
+            )
+        except Exception as error:  # паспорт не критичен
+            sections.append(f"### PASS-0 Паспорт листа\n\n_недоступен: {error}_")
+
+        time.sleep(max(0.0, config.MOCK_PAGE_SECONDS))
+
+        layer = page_layer_text(pdf_path, page_number)
+        head = "\n".join(layer.splitlines()[:25]) if layer else ""
+        body = (
+            f"Начало текстового слоя листа:\n\n{head}"
+            if head
+            else "У листа нет пригодного текстового слоя — здесь работала бы VLM."
+        )
+        sections.append(
+            "### PASS-A Описание листа\n\n"
+            "**[MOCK] Это не работа модели.** Сервис запущен в режиме "
+            "PTO_PIPELINE_MODE=mock для проверки интеграции с интерфейсом. "
+            "Настоящее описание листа появится в режиме real.\n\n" + body
+        )
+        sections.append(
+            "### PASS-B Тайлы / текст\n\n_[MOCK] фрагменты листа не извлекались._"
+        )
+
+        content = "\n\n".join(sections)
+        pages_dir = run_dir / "pages"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        page_file(run_dir, page_number).write_text(content, encoding="utf-8")
+        return content
+
+
+def rebuild_out_md(run_dir: Path) -> Path | None:
+    """Пересобирает out.md прогона из готовых листов.
+
+    Формат «## Страница N» обязателен: на нём завязаны compare_to_etalon.py,
+    build_ios2_md.py и остальные инструменты бэкенда.
+    """
+    pages_dir = run_dir / "pages"
+    if not pages_dir.exists():
+        return None
+    pages: dict[int, str] = {}
+    for item in sorted(pages_dir.glob("page_*.md")):
+        try:
+            number = int(item.stem.split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        pages[number] = item.read_text(encoding="utf-8")
+    if not pages:
+        return None
+    from hf_api_bench import assemble
+
+    out_path = run_dir / "out.md"
+    out_path.write_text(assemble(pages), encoding="utf-8")
+    return out_path

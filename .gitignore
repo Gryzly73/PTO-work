@@ -27,6 +27,8 @@ env/
 *.docx
 *.xlsx
 *.zip
+*.rar
+*.7z
 ЭТАЛОН*/
 new_files/*
 !new_files/pto_scoring_kit/
@@ -70,6 +72,12 @@ match_viewer*/
 IC_PARK_*
 WORKFLOW_PTO_CHECK.md
 NEXT_PHASE_research.md
+
+# === Состояние HTTP-сервиса (очередь и загруженные PDF) ===
+service/state/
+
+# === Личный запуск (у каждого свой, в репозиторий не входит) ===
+run-local.bat
 
 # === Логи и временное ===
 *.log

@@ -1,0 +1,38 @@
+# В образ едет только код конвейера и сервиса. Всё тяжёлое и приватное —
+# прогоны, PDF заказчика, эталоны, токены — остаётся снаружи.
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Прогоны и их артефакты (сотни мегабайт)
+hf_runs/
+service/state/
+*_viewer/
+quality_viewer_*/
+match_viewer*/
+
+# Документы заказчика и эталоны
+*.pdf
+*.docx
+*.xlsx
+*.zip
+*.rar
+ЭТАЛОН*/
+new_files/
+
+# Секреты: .env подключается через env_file в compose, внутрь образа не кладём
+.env
+.env.*
+!.env.example
+
+# Локальное
+run-local.bat
+*.log
+*.tmp
+*.bak
+.claude/
+.vscode/
+.idea/
