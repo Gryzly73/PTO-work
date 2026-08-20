@@ -63,7 +63,11 @@ def load_page_json(job: Job, page_number: int) -> dict | None:
     cached = page_json_path(Path(job.runDir), page_number)
     if cached.exists():
         try:
-            return json.loads(cached.read_text(encoding="utf-8"))
+            page = json.loads(cached.read_text(encoding="utf-8"))
+            # Кэш, собранный прежней версией конвертера, пересобираем: иначе
+            # на уже посчитанных документах остался бы старый состав страницы.
+            if page.get("schema") == convert.PAGE_SCHEMA:
+                return page
         except (OSError, json.JSONDecodeError):
             pass
     raw = page_file(Path(job.runDir), page_number)

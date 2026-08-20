@@ -332,6 +332,25 @@ def get_page(job_id: str, page_number: int):
     return page
 
 
+@app.get("/jobs/{job_id}/pages/{page_number}/raw", response_class=PlainTextResponse)
+def get_page_raw(job_id: str, page_number: int):
+    """Сырой вывод конвейера по листу: PASS-0 / PASS-A / PASS-B без обработки.
+
+    Нужен, когда важна каждая марка (сверка с ТЗ): в markdown для интерфейса
+    извлечение по фрагментам не попадает из-за объёма.
+    """
+    job = _job_or_404(job_id)
+    from service.pipeline import page_file
+
+    target = page_file(Path(job.runDir), page_number)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Лист ещё не готов")
+    return PlainTextResponse(
+        target.read_text(encoding="utf-8"),
+        media_type="text/markdown; charset=utf-8",
+    )
+
+
 @app.get("/jobs/{job_id}/markdown", response_class=PlainTextResponse)
 def get_markdown(job_id: str):
     """Весь документ одним markdown — собирается на лету из готовых листов."""
