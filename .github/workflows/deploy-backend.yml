@@ -50,7 +50,31 @@ jobs:
       - name: Забрать репозиторий
         uses: actions/checkout@v4
 
+      # Пока секреты не заведены, деплой пропускается, а не падает. Иначе
+      # вкладка Actions краснела бы на каждый коммит и перестала что-либо
+      # значить ещё до первого настоящего деплоя.
+      - name: Проверить, заведены ли доступы
+        id: guard
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+        run: |
+          missing=""
+          [ -z "$DEPLOY_HOST" ] && missing="$missing DEPLOY_HOST"
+          [ -z "$DEPLOY_USER" ] && missing="$missing DEPLOY_USER"
+          [ -z "$DEPLOY_SSH_KEY" ] && missing="$missing DEPLOY_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "skip=yes" >> "$GITHUB_OUTPUT"
+            echo "### Деплой пропущен" >> "$GITHUB_STEP_SUMMARY"
+            echo "Не заведены секреты:$missing" >> "$GITHUB_STEP_SUMMARY"
+            echo "Что и куда добавить — в deploy/README.md, раздел 2." >> "$GITHUB_STEP_SUMMARY"
+            echo "Секреты деплоя не заведены ($missing) — пропускаю. Это не поломка."
+          fi
+          exit 0
+
       - name: Положить ключ и узнать хост
+        if: steps.guard.outputs.skip != 'yes'
         env:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -63,6 +87,7 @@ jobs:
           ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Обновить бэкенд на сервере
+        if: steps.guard.outputs.skip != 'yes'
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
