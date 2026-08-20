@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import secrets
 import shutil
 import uuid
 from html import escape
@@ -67,6 +68,35 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Открыты без токена. /health дёргает healthcheck контейнера, которому секрет
+# передавать некуда; предполётный OPTIONS браузер шлёт без заголовков.
+_OPEN_PATHS = {"/health"}
+
+
+@app.middleware("http")
+async def require_api_token(request: Request, call_next):
+    """Общий секрет на все маршруты, если задан PTO_API_TOKEN.
+
+    По умолчанию токена нет и сервис ведёт себя как раньше — на localhost это
+    нормально. На сервере без этого любой, кто дотянется до порта, поставит
+    документ в очередь и потратит деньги на провайдера.
+    """
+    if config.API_TOKEN and request.method != "OPTIONS":
+        if request.url.path not in _OPEN_PATHS:
+            header = request.headers.get("X-PTO-Token") or ""
+            if not header:
+                auth = request.headers.get("Authorization") or ""
+                if auth.lower().startswith("bearer "):
+                    header = auth[7:].strip()
+            # compare_digest, а не ==, чтобы время ответа не подсказывало,
+            # сколько символов угадано.
+            if not secrets.compare_digest(header, config.API_TOKEN):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Нужен токен: заголовок X-PTO-Token"},
+                )
+    return await call_next(request)
 
 
 # --- вспомогательное --------------------------------------------------------

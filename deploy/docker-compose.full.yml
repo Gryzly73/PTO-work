@@ -1,0 +1,144 @@
+# Обе части ПТО одной командой: бэкенд (этот репозиторий) плюс интерфейс.
+#
+# ЭТОТ ФАЙЛ НАДО ПОЛОЖИТЬ НА УРОВЕНЬ ВЫШЕ. Пути внутри рассчитаны на раскладку
+#
+#     PTO/
+#       docker-compose.yml        <- копия этого файла
+#       backend/                  <- этот репозиторий
+#       frontend/pto-drawings/    <- репозиторий интерфейса
+#
+#     cp backend/deploy/docker-compose.full.yml docker-compose.yml
+#
+# Копия лежит в репозитории потому, что сам PTO/ — не репозиторий, а контейнер
+# для двух независимых частей: иначе файл существует в одном экземпляре на
+# одной машине и теряется при переносе на сервер.
+#
+# Для бэкенда в одиночку он не нужен — берите backend/docker-compose.yml.
+#
+# Обе части ПТО одной командой. Режим прогона — профиль, как в backend/docker-compose.yml.
+#
+#   docker compose --env-file backend/.env --profile mock up --build
+#   docker compose --env-file backend/.env --profile real up --build
+#
+# --env-file нужен, чтобы PTO_API_TOKEN из backend/.env доехал до интерфейса:
+# сам контейнер бэкенда читает этот файл через env_file, а фронту токен надо
+# подставить в переменную, и compose берёт её только из файла интерполяции.
+# Без токена (сервис открыт) можно и просто: docker compose --profile mock up
+#
+# Профиль обязателен: real тратит деньги и отправляет страницы стороннему
+# провайдеру, поэтому режим выбирается осознанно, а не значением по умолчанию.
+#
+# Логика совпадает с backend/run-local.bat:
+#   1) настройки — из backend/.env (единый источник для всех способов запуска);
+#   2) environment перекрывает env_file, как переменные окружения в батнике;
+#   3) пути задаются здесь, потому что в контейнере они свои;
+#   4) фронт стартует после того, как бэкенд ответил на /health;
+#   5) PDF не пересылается — обе части смотрят в один том с uploads.
+#
+# Интерфейс: http://localhost:8080, API: http://localhost:8000
+
+name: pto-full
+
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: ./backend/.env
+      required: false
+  ports:
+    - "8000:8000"
+  restart: unless-stopped
+
+x-backend-env: &backend-env
+  PTO_SERVICE_HOST: 0.0.0.0
+  PTO_SERVICE_PORT: 8000
+  PTO_STATE_DIR: /state
+  PTO_RUNS_DIR: /runs
+  PTO_UPLOADS_DIR: /data/uploads
+  PTO_ALLOWED_PDF_ROOTS: /data/uploads
+
+x-frontend: &frontend
+  build: ./frontend/pto-drawings
+  environment:
+    DATA_ROOT: /data
+    PTO_BACKEND_URL: http://backend:8000
+    # Токен берётся из того же backend/.env, что и всё остальное, но подставить
+    # его сюда compose может только через интерполяцию, поэтому связку поднимают
+    # с --env-file backend/.env (см. шапку). Пусто — бэкенд открыт, заголовок
+    # не шлётся, поведение прежнее.
+    PTO_BACKEND_TOKEN: ${PTO_API_TOKEN:-}
+  ports:
+    - "8080:8080"
+  restart: unless-stopped
+
+services:
+  # --- подготовка общего тома ------------------------------------------------
+  # Named volume создаётся от root, а фронтенд в своём образе работает под
+  # пользователем node (uid 1000) и падает с EACCES на mkdir /data/data.
+  # Правим владельца здесь, а не в чужом Dockerfile: репозиторий фронтенда не
+  # наш. Бэкенд работает от root и читает эти файлы без вопросов.
+  data-init:
+    image: busybox:1.36
+    profiles: ["mock", "real"]
+    command: sh -c "mkdir -p /data/uploads /data/data && chown -R 1000:1000 /data"
+    volumes:
+      - app-data:/data
+
+  # --- проверка связки, без обращения к модели -------------------------------
+  # Отдельные тома под прогоны и очередь: имитация не должна подмешиваться к
+  # настоящим результатам, а документ, «посчитанный» за полторы секунды, —
+  # выглядеть готовым после переключения на real.
+  backend-mock:
+    <<: *backend
+    profiles: ["mock"]
+    environment:
+      <<: *backend-env
+      PTO_PIPELINE_MODE: mock
+    volumes:
+      - app-data:/data        # тот же том, что у фронта: uploads и db.json
+      - runs-mock:/runs
+      - state-mock:/state
+
+  frontend-mock:
+    <<: *frontend
+    profiles: ["mock"]
+    environment:
+      DATA_ROOT: /data
+      PTO_BACKEND_URL: http://backend-mock:8000
+      PTO_BACKEND_TOKEN: ${PTO_API_TOKEN:-}
+    volumes:
+      - app-data:/data
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+      backend-mock:
+        condition: service_healthy
+
+  # --- настоящий прогон через Hugging Face -----------------------------------
+  backend:
+    <<: *backend
+    profiles: ["real"]
+    environment:
+      <<: *backend-env
+      PTO_PIPELINE_MODE: real
+    volumes:
+      - app-data:/data
+      - runs:/runs            # папки прогонов (аналог backend/hf_runs)
+      - state:/state          # очередь задач, переживает пересоздание контейнера
+
+  frontend:
+    <<: *frontend
+    profiles: ["real"]
+    volumes:
+      - app-data:/data
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy
+
+volumes:
+  app-data:
+  runs:
+  state:
+  runs-mock:
+  state-mock:

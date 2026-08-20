@@ -1,8 +1,8 @@
 diff --git a/src/lib/process-document.ts b/src/lib/process-document.ts
-index cc5c06a..e473cc6 100644
+index cc5c06a..abdfda2 100644
 --- a/src/lib/process-document.ts
 +++ b/src/lib/process-document.ts
-@@ -1,14 +1,157 @@
+@@ -1,14 +1,168 @@
 -import { extractPageTexts, pageToMarkdown } from "@/lib/extract";
 -import {
 -  getDocument,
@@ -42,6 +42,10 @@ index cc5c06a..e473cc6 100644
 +  process.env.PTO_BACKEND_URL ?? "http://127.0.0.1:8000"
 +).replace(/\/+$/, "");
 +const POLL_MS = Number(process.env.PTO_POLL_MS ?? 3000);
++// Общий секрет, если бэкенд подняли с PTO_API_TOKEN (на сервере так и надо:
++// иначе очередь открыта всем, кто дотянется до порта). Пусто — заголовок не
++// шлём, поведение прежнее.
++const BACKEND_TOKEN = process.env.PTO_BACKEND_TOKEN ?? "";
 +const PAGES_PER_TICK = 40;
 +// Одна попытка запроса из трёх обычно проходит; сдаёмся только если сервис
 +// молчит подряд столько тиков, что это уже не икота, а падение.
@@ -88,6 +92,12 @@ index cc5c06a..e473cc6 100644
 +      const response = await fetch(`${BACKEND_URL}${pathname}`, {
 +        ...init,
 +        cache: "no-store",
++        headers: BACKEND_TOKEN
++          ? {
++              ...((init?.headers as Record<string, string>) ?? {}),
++              "X-PTO-Token": BACKEND_TOKEN,
++            }
++          : init?.headers,
 +      });
 +
 +      if (response.ok) return (await response.json()) as T;
@@ -96,7 +106,8 @@ index cc5c06a..e473cc6 100644
 +      const message = `Конвейер ответил ${response.status}${
 +        detail ? `: ${detail.slice(0, 200)}` : ""
 +      }`;
-+      // 4xx (кроме 429) — наша ошибка, повтор не поможет.
++      // 4xx (кроме 429) — наша ошибка, повтор не поможет. 401 сюда же:
++      // значит, не задан или неверен PTO_BACKEND_TOKEN.
 +      if (response.status < 500 && response.status !== 429) {
 +        throw new PermanentError(message);
 +      }
@@ -168,7 +179,7 @@ index cc5c06a..e473cc6 100644
  
  export async function processDocument(id: string) {
    if (running.has(id)) return;
-@@ -20,49 +163,97 @@ export async function processDocument(id: string) {
+@@ -20,49 +174,97 @@ export async function processDocument(id: string) {
  
      await updateDocument(id, {
        status: "processing",

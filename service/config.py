@@ -150,6 +150,14 @@ CORS_ORIGINS = [
 
 MAX_UPLOAD_BYTES = _env_int("PTO_MAX_UPLOAD_MB", 400) * 1024 * 1024
 
+# Общий секрет для доступа к API. Пусто (по умолчанию) — сервис открыт, как и
+# был: на localhost это нормально. На сервере с белым IP — нет: любой
+# прохожий поставит документ в очередь и потратит токен провайдера. Задайте
+# PTO_API_TOKEN, и все маршруты, кроме /health, потребуют его в заголовке
+# X-PTO-Token (или Authorization: Bearer). /health оставлен открытым: его
+# дёргает healthcheck контейнера, которому секрет передавать некуда.
+API_TOKEN = _env_str("PTO_API_TOKEN", "") or ""
+
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)

@@ -29,6 +29,10 @@ const BACKEND_URL = (
   process.env.PTO_BACKEND_URL ?? "http://127.0.0.1:8000"
 ).replace(/\/+$/, "");
 const POLL_MS = Number(process.env.PTO_POLL_MS ?? 3000);
+// Общий секрет, если бэкенд подняли с PTO_API_TOKEN (на сервере так и надо:
+// иначе очередь открыта всем, кто дотянется до порта). Пусто — заголовок не
+// шлём, поведение прежнее.
+const BACKEND_TOKEN = process.env.PTO_BACKEND_TOKEN ?? "";
 const PAGES_PER_TICK = 40;
 // Одна попытка запроса из трёх обычно проходит; сдаёмся только если сервис
 // молчит подряд столько тиков, что это уже не икота, а падение.
@@ -75,6 +79,12 @@ async function api<T>(pathname: string, init?: RequestInit): Promise<T> {
       const response = await fetch(`${BACKEND_URL}${pathname}`, {
         ...init,
         cache: "no-store",
+        headers: BACKEND_TOKEN
+          ? {
+              ...((init?.headers as Record<string, string>) ?? {}),
+              "X-PTO-Token": BACKEND_TOKEN,
+            }
+          : init?.headers,
       });
 
       if (response.ok) return (await response.json()) as T;
@@ -83,7 +93,8 @@ async function api<T>(pathname: string, init?: RequestInit): Promise<T> {
       const message = `Конвейер ответил ${response.status}${
         detail ? `: ${detail.slice(0, 200)}` : ""
       }`;
-      // 4xx (кроме 429) — наша ошибка, повтор не поможет.
+      // 4xx (кроме 429) — наша ошибка, повтор не поможет. 401 сюда же:
+      // значит, не задан или неверен PTO_BACKEND_TOKEN.
       if (response.status < 500 && response.status !== 429) {
         throw new PermanentError(message);
       }

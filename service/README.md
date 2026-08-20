@@ -68,6 +68,7 @@ docker compose --profile mock up --build
 | `PTO_MODEL` | `qwen3vl-32b` | id из каталога `python hf_api_bench.py --list` |
 | `PTO_PROVIDER` | — | провайдер HF; `auto` не использовать |
 | `PTO_SERVICE_HOST` / `PTO_SERVICE_PORT` | `127.0.0.1` / `8000` | адрес сервиса |
+| `PTO_API_TOKEN` | — | общий секрет; пусто — сервис открыт. Задан — все маршруты кроме `/health` требуют `X-PTO-Token` |
 | `PTO_STATE_DIR` | `service/state` | очередь (`jobs.json`) и загруженные PDF |
 | `PTO_RUNS_DIR` | `../hf_runs` | папки прогонов |
 | `PTO_UPLOADS_DIR` | `<state>/uploads` | куда класть файлы, пришедшие по multipart |
