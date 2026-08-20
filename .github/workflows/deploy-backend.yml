@@ -1,0 +1,85 @@
+# Автодеплой бэкенда ПТО на сервер.
+#
+# Что делает: заходит по SSH и запускает deploy/deploy.sh, который забирает
+# свежий код, пересобирает образ и пересоздаёт контейнер. Вся специфика
+# проекта — в скрипте, здесь только доставка.
+#
+# Секреты репозитория (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST      адрес сервера
+#   DEPLOY_USER      пользователь для деплоя (НЕ root)
+#   DEPLOY_SSH_KEY   приватный ключ этого пользователя, целиком, с заголовками
+#   DEPLOY_PORT      порт SSH, если не 22            (переменная, не секрет)
+#   DEPLOY_PATH      путь до клона на сервере         (переменная, не секрет)
+#
+# Правки в *.md службу не перезапускают: прогон документа идёт часами, ронять
+# его ради опечатки в README незачем.
+
+name: Деплой бэкенда
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+      - ".dockerignore"
+      - "deploy/docker-compose.full.yml"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Профиль compose: real (рабочий) или mock (имитация)"
+        type: choice
+        options: [real, mock]
+        default: real
+      wait_for_idle:
+        description: "Сколько секунд ждать окончания идущего прогона (0 — не ждать)"
+        type: string
+        default: "0"
+
+# Два деплоя подряд не должны пересобирать образ одновременно на одной машине.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Забрать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Положить ключ и узнать хост
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+        run: |
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          # Без known_hosts ssh спросит подтверждение и повиснет.
+          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Обновить бэкенд на сервере
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ vars.DEPLOY_PORT || '22' }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/pto/backend' }}
+          PROFILE: ${{ inputs.profile || 'real' }}
+          WAIT_FOR_IDLE: ${{ inputs.wait_for_idle || '0' }}
+        run: |
+          ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" \
+              -o BatchMode=yes -o ServerAliveInterval=30 \
+              "$DEPLOY_USER@$DEPLOY_HOST" \
+              "PTO_BACKEND_DIR='$DEPLOY_PATH' \
+               PTO_PROFILE='$PROFILE' \
+               PTO_DEPLOY_REF='origin/${{ github.ref_name }}' \
+               PTO_DEPLOY_WAIT='$WAIT_FOR_IDLE' \
+               bash -s" < deploy/deploy.sh
+
+      - name: Убрать ключ
+        if: always()
+        run: rm -f ~/.ssh/id_deploy

@@ -9,7 +9,9 @@ venv/
 
 # Прогоны и их артефакты (сотни мегабайт)
 hf_runs/
+hf_runs_mock/
 service/state/
+service/state-mock/
 *_viewer/
 quality_viewer_*/
 match_viewer*/
