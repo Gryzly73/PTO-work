@@ -23,9 +23,19 @@ python -m service
 run-local.bat mock all
 run-local.bat stop
 
-# 3. Обе части в контейнерах (из корня PTO)
-docker compose up --build
+# 3. Только бэкенд в контейнере (из backend/). Режим — профиль:
+docker compose --profile mock up --build   # имитация, без модели и денег
+docker compose --profile real up --build   # настоящий прогон через HF
+
+# 4. Обе части в контейнерах (из корня PTO), те же профили
+docker compose --profile mock up --build
 ```
+
+Профиль обязателен. Без него compose скажет «no service selected»: `real`
+тратит деньги и отправляет страницы стороннему провайдеру, поэтому режим
+выбирается осознанно. У `mock` свои тома под прогоны и очередь — имитация не
+подмешивается к настоящим результатам, и документ, «посчитанный» за полторы
+секунды, не выглядит готовым после переключения на `real`.
 
 Проверка: <http://127.0.0.1:8000/health>, интерактивная документация — `/docs`.
 
@@ -62,7 +72,8 @@ docker compose up --build
 | `PTO_RUNS_DIR` | `../hf_runs` | папки прогонов |
 | `PTO_UPLOADS_DIR` | `<state>/uploads` | куда класть файлы, пришедшие по multipart |
 | `PTO_ALLOWED_PDF_ROOTS` | `<uploads>` | каталоги, из которых можно брать PDF по пути (разделитель `;`) |
-| `PTO_PAGE_CONCURRENCY` | `1` | сколько листов считать одновременно |
+| `PTO_PAGE_CONCURRENCY` | `1` | листов одновременно; 3 замерено (вдвое быстрее), но теряется порядок листов |
+| `PTO_INCLUDE_FRAGMENTS` | `0` | выводить ли PASS-B в markdown интерфейса |
 | `PTO_SHEET_AWARE` / `PTO_TWO_PASS` / `PTO_LAYER_AWARE` | `1` | флаги качества |
 | `PTO_ZONE_HINTS` | `0` | тест-сетовые подсказки по номеру страницы — на чужих PDF вредны |
 | `PTO_MAX_UPLOAD_MB` | `400` | лимит загрузки |
@@ -79,6 +90,7 @@ docker compose up --build
 | `GET` | `/jobs/{id}` | статус, текущий лист, `pagesDone`, `usage` |
 | `GET` | `/jobs/{id}/pages` | готовые листы; `after=N` — дельта, `pages=1,5,7` — выборочно |
 | `GET` | `/jobs/{id}/pages/{n}` | один лист |
+| `GET` | `/jobs/{id}/pages/{n}/raw` | сырой вывод конвейера по листу (PASS-0/A/B) |
 | `GET` | `/jobs/{id}/markdown` | весь документ одним markdown |
 | `POST` | `/jobs/{id}/cancel` | остановить (сработает после текущего листа) |
 | `POST` | `/jobs/{id}/retry` | досчитать недостающие листы; `?reset=true` — с нуля |

@@ -115,6 +115,8 @@ async function findExistingJob(documentId: string): Promise<BackendJob | null> {
 }
 
 async function createJob(document: DocumentRecord): Promise<BackendJob> {
+  // Файл не пересылается: бэкенд стоит рядом и читает его из той же папки
+  // uploads по пути. Поэтому сервису нужен PTO_ALLOWED_PDF_ROOTS на неё.
   return api<BackendJob>("/jobs", {
     method: "POST",
     headers: { "Content-Type": "application/json" },

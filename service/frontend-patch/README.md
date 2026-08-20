@@ -22,13 +22,25 @@
 
 ## Применение
 
+Способ для форка — `git apply`, правка ложится обычным коммитом:
+
+```bash
+cd <форк pto-drawings>
+git checkout -b pto-backend-integration
+git apply ../backend/service/frontend-patch/process-document.patch
+git commit -am "Брать разбор PDF из конвейера ПТО вместо текстового слоя"
+```
+
+Способ без git, для быстрой локальной проверки:
+
 ```powershell
 cd <корень проекта>\frontend\pto-drawings
 copy src\lib\process-document.ts src\lib\process-document.unpdf.ts.bak
 copy ..\..\backend\service\frontend-patch\process-document.ts src\lib\process-document.ts
 ```
 
-Откатиться — вернуть `.bak` на место.
+Откатиться — `git checkout src/lib/process-document.ts` либо вернуть `.bak`
+на место.
 
 ## Запуск связки
 
