@@ -15,7 +15,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt service/requirements.txt ./deps/
+# Два файла копируются по отдельности не для красоты: COPY с несколькими
+# источниками кладёт их в каталог назначения ПЛОСКО, и service/requirements.txt
+# затирает корневой — сборка падала на «No such file: deps/service/requirements.txt».
+COPY requirements.txt ./deps/requirements.txt
+COPY service/requirements.txt ./deps/service/requirements.txt
 RUN pip install --no-cache-dir -r deps/requirements.txt \
     && pip install --no-cache-dir -r deps/service/requirements.txt
 

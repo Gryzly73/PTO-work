@@ -1,0 +1,82 @@
+# Бэкенд ПТО в контейнере. Два режима — два профиля.
+#
+#   docker compose --profile mock up --build    # имитация: без модели и денег
+#   docker compose --profile real up --build    # настоящий прогон через Hugging Face
+#
+# Профиль обязателен. Без него compose скажет «no service selected» — это не
+# поломка, а защита: режим прогона должен выбираться осознанно, потому что
+# real тратит деньги и отправляет страницы стороннему провайдеру.
+#
+# Порядок первого запуска на сервере:
+#   1) cp .env.example .env  и вписать HF_TOKEN (для real);
+#   2) --profile mock up  → убедиться, что образ собрался, порт свободен,
+#      очередь работает, интерфейс видит листы. Лист считается ~1,5 секунды;
+#   3) --profile real up  → тот же сервис, но с моделью.
+#
+# API: http://localhost:8000 (страница статуса), /docs — интерактивная
+# документация, /health — проверка живости.
+#
+# Требуется Docker Compose 2.24+ (длинный синтаксис env_file с required).
+#
+# Если поднимаете вместе с интерфейсом — берите docker-compose.yml из корня
+# проекта: он добавляет к этому сервису фронтенд и общий том uploads.
+
+# Имя проекта, иначе compose возьмёт имя папки («backend»).
+name: pto
+
+x-backend: &backend
+  build: .
+  # Единственный источник настроек — backend/.env, тот же файл читает
+  # локальный запуск. Значения из environment ниже его перекрывают, как и
+  # переменные окружения при запуске без докера.
+  env_file:
+    - path: .env
+      required: false
+  ports:
+    - "${PTO_HOST_PORT:-8000}:8000"
+  restart: unless-stopped
+
+x-backend-env: &backend-env
+  PTO_SERVICE_HOST: 0.0.0.0
+  PTO_SERVICE_PORT: 8000
+  PTO_STATE_DIR: /state
+  PTO_RUNS_DIR: /runs
+  # Куда класть PDF, пришедшие по multipart, и откуда разрешено брать их по
+  # пути. Обе переменные смотрят в одну папку: фронт кладёт файл в свою
+  # uploads/, сервис читает оттуда, копирования не происходит.
+  PTO_UPLOADS_DIR: /data/uploads
+  PTO_ALLOWED_PDF_ROOTS: /data/uploads
+
+services:
+  # --- проверка связки, без обращения к модели -------------------------------
+  # У mock своя папка прогонов и своя очередь. Иначе имитация подмешалась бы к
+  # настоящим результатам, а после переключения на real документ, «посчитанный»
+  # за полторы секунды, выглядел бы готовым и не пересчитывался.
+  backend-mock:
+    <<: *backend
+    profiles: ["mock"]
+    container_name: pto-backend-mock
+    environment:
+      <<: *backend-env
+      PTO_PIPELINE_MODE: mock
+    volumes:
+      - ${PTO_UPLOADS_HOST_DIR:-./service/state/uploads}:/data/uploads
+      - ./hf_runs_mock:/runs
+      - ./service/state-mock:/state
+
+  # --- настоящий прогон через Hugging Face -----------------------------------
+  # Нужен HF_TOKEN в .env. Лист — от 2 до 16 минут в зависимости от того,
+  # читается ли текстовый слой PDF.
+  backend:
+    <<: *backend
+    profiles: ["real"]
+    container_name: pto-backend
+    environment:
+      <<: *backend-env
+      PTO_PIPELINE_MODE: real
+    volumes:
+      # Прогоны и очередь лежат на хосте: результат видно из CLI-инструментов
+      # (compare_to_etalon.py, build_ios2_md.py) без захода в контейнер.
+      - ${PTO_UPLOADS_HOST_DIR:-./service/state/uploads}:/data/uploads
+      - ./hf_runs:/runs
+      - ./service/state:/state

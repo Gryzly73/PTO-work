@@ -38,6 +38,7 @@ new_files/pto_scoring_kit/*
 
 # === Результаты прогонов (регенерируется запуском раннера) ===
 hf_runs/
+hf_runs_mock/
 bench_*.md
 bench_*.md.meta.json
 bench_*.md.pages/
@@ -75,6 +76,7 @@ NEXT_PHASE_research.md
 
 # === Состояние HTTP-сервиса (очередь и загруженные PDF) ===
 service/state/
+service/state-mock/
 
 # === Личный запуск (у каждого свой, в репозиторий не входит) ===
 run-local.bat
