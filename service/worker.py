@@ -14,7 +14,7 @@ import json
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from service import config, convert
@@ -180,29 +180,50 @@ class Worker(threading.Thread):
     def _run_pages_parallel(
         self, job: Job, pdf_path: Path, run_dir: Path, pending: list[int]
     ) -> bool:
+        remaining = list(pending)
+        in_flight: dict = {}
         with ThreadPoolExecutor(max_workers=config.PAGE_CONCURRENCY) as pool:
-            futures = []
-            for page_number in pending:
+            while remaining or in_flight:
                 if self._cancel_requested(job.id):
+                    for future in list(in_flight):
+                        future.cancel()
+                    for future in list(in_flight):
+                        try:
+                            future.result()
+                        except Exception:
+                            pass
                     return True
-                futures.append(
-                    pool.submit(
+
+                while remaining and len(in_flight) < config.PAGE_CONCURRENCY:
+                    page_number = remaining.pop(0)
+                    future = pool.submit(
                         self._run_single_page, job, pdf_path, run_dir, page_number
                     )
-                )
-            for future in futures:
-                future.result()
+                    in_flight[future] = page_number
+
+                if not in_flight:
+                    break
+
+                done, _ = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                for future in done:
+                    in_flight.pop(future, None)
+                    future.result()
+
         return self._cancel_requested(job.id)
 
     def _run_single_page(
         self, job: Job, pdf_path: Path, run_dir: Path, page_number: int
     ) -> None:
+        if self._cancel_requested(job.id):
+            return
         kind = convert.kind_from_page(pdf_path, page_number)
         self._store.patch(
             job.id,
             processingPage=page_number,
             processingStep=STEP_BY_KIND.get(kind, "text"),
         )
+        if self._cancel_requested(job.id):
+            return
         try:
             result = self._pipeline.run_page(pdf_path, page_number, run_dir)
         except Exception as error:  # keep-going: лист падает, документ живёт
@@ -214,6 +235,10 @@ class Worker(threading.Thread):
 
             self._store.update(job.id, mark_error)
             return
+
+        if self._cancel_requested(job.id):
+            # Лист уже посчитан — сохраняем, но дальше цикл остановится.
+            pass
 
         store_page_json(job, page_number, result["markdown"])
 
