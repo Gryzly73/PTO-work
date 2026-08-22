@@ -73,6 +73,10 @@ match_viewer*/
 IC_PARK_*
 WORKFLOW_PTO_CHECK.md
 NEXT_PHASE_research.md
+ТЕРМИНОЛОГИЯ.md
+README_ЛОКАЛЬНЫЙ.md
+УСЛОВНЫЕ_ОБОЗНАЧЕНИЯ_В_ИДЕАЛ.md
+ОБЗОР_ИОС2_FINAL_READABLE.md
 
 # === Состояние HTTP-сервиса (очередь и загруженные PDF) ===
 service/state/
