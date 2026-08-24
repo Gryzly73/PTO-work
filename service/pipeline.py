@@ -126,7 +126,15 @@ class Pipeline:
         )
         target = page_file(run_dir, page_number)
         if not target.exists():
-            raise PipelineError(f"Конвейер не записал {target.name}")
+            # Конвейер сознательно не пишет лист, на котором не удался ни один
+            # вызов модели (обрыв провайдера, 413 и т. п.). Файла нет — значит
+            # лист не считается готовым: воркер пометит его ошибкой, и при
+            # следующем запуске он будет пересчитан, а не пропущен.
+            raise PipelineError(
+                f"Лист {page_number}: ни один вызов модели не удался "
+                f"(вызовов {usage.calls}, неудачных фрагментов "
+                f"{usage.failed_tiles}). Лист не сохранён и будет пересчитан."
+            )
         return target.read_text(encoding="utf-8"), usage.as_dict()
 
     def _mock_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> str:

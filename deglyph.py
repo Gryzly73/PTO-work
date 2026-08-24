@@ -51,6 +51,25 @@ def is_broken_char(ch: str) -> bool:
     return True
 
 
+def is_broken_glyph(ch: str) -> bool:
+    r"""Небуквенный подменённый глиф: управляющий код или приватная область.
+
+    Буквы ловит `is_broken_char()`, но порча ими не ограничена: у того же
+    шрифта смещены и цифры с пунктуацией, а они приходят кодами вроде `\x14`
+    или `\uf02d`. Для человека это невидимый мусор, для конвейера — потерянная
+    отметка «112.25» и шифр «28 ХСА 1 25 ИОС2» вместо «28-ХСА-1/25-ИОС2».
+    """
+    if ch in (chr(9), chr(10), chr(13)):
+        return False
+    o = ord(ch)
+    return o < 0x20 or 0xF000 <= o <= 0xF0FF
+
+
+def is_broken_any(ch: str) -> bool:
+    """Любой подменённый символ — буква или цифра с пунктуацией."""
+    return is_broken_char(ch) or is_broken_glyph(ch)
+
+
 def _vocab_from_clean_pages(doc: fitz.Document, extra_text: str = "") -> Counter:
     """Слова со страниц, где слой исправен (+ необязательный текст VLM)."""
     vocab: Counter = Counter()
@@ -87,13 +106,18 @@ def _garbled_words(doc: fitz.Document) -> Counter:
 
 
 def build_mapping(doc: fitz.Document, extra_text: str = "") -> dict[str, str]:
-    """Подбирает «чужой глиф → буква», решая кроссворд по словарю документа."""
+    """Подбирает «чужой глиф → символ», решая кроссворд по словарю документа.
+
+    Две ступени: буквы — кроссвордом по словам, цифры и пунктуация — сдвигом
+    кодовой таблицы шрифта (`detect_glyph_shifts`). Вторая работает и там, где
+    первой делать нечего: буквы листа целы, а отметки и шифр — нет.
+    """
     vocab = _vocab_from_clean_pages(doc, extra_text)
     if len(vocab) < MIN_VOCAB:
         return {}
     words = _garbled_words(doc)
     if not words:
-        return {}
+        return detect_glyph_shifts(doc, {})
 
     by_len: dict[int, list[str]] = defaultdict(list)
     for w in vocab:
@@ -139,7 +163,12 @@ def build_mapping(doc: fitz.Document, extra_text: str = "") -> dict[str, str]:
             new += 1
         if not new:
             break
-    return extend_by_shifts(mapping, detect_shifts(words, vocab))
+    mapping = extend_by_shifts(mapping, detect_shifts(words, vocab))
+    # Цифры и пунктуация — отдельной ступенью и поверх готовых букв: сдвиг
+    # проверяется совпадением с исправно набранными токенами документа, а их
+    # надо сперва починить, иначе сверять не с чем.
+    mapping.update(detect_glyph_shifts(doc, mapping))
+    return mapping
 
 
 # Кириллица, в которую имеет смысл раскодировать: буквы + Ё/ё.
@@ -228,6 +257,142 @@ def extend_by_shifts(
                 extended[ch] = chr(target)
     return extended
 
+# ── Цифры и пунктуация: сдвиг кодовой таблицы по шрифтам ────────────────────
+#
+# Буквы чинит кроссворд по словарю: у слова есть форма, по которой его узнают.
+# У «2.2» и «112.25» формы нет — в таблице экспликации они стоят поодиночке,
+# слова-ключа для них в документе не существует, и кроссворд их не берёт.
+#
+# Опора у них другая — шрифт. Подменённые коды одного шрифта лежат непрерывным
+# блоком и смещены относительно настоящих на одну величину: на ИОС2
+# Arial-ItalicMT смещён на +29 (`\x14` → «1», `\x03` → пробел), ISOCPEUR — на
+# +31 (`\x0e` → «-», `\x10` → «/»). Величину перебираем и проверяем
+# результатом: верный сдвиг превращает битые токены в числа и в токены,
+# которые в этом же документе уже набраны исправно. Неверный не даёт ни того,
+# ни другого — разрыв в счёте получается кратный, а не на проценты.
+
+_ASCII_LO, _ASCII_HI = 0x20, 0x7E
+
+# Токен целиком из цифр с разделителями: отметка, площадь, номер позиции.
+_NUMERIC_TOKEN_RE = re.compile(r"^[0-9]+(?:[.,][0-9]+)*$")
+
+# Вес свидетельств. Совпадение с исправно набранным токеном того же документа
+# сильнее, чем «получилось похоже на число»: чисел много и случайный сдвиг
+# наберёт их тоже, а попасть в готовый токен ему нечем.
+_W_VOCAB, _W_NUMERIC = 3, 1
+
+# Меньше этого веса — свидетельств мало, шрифт не трогаем.
+MIN_SHIFT_SCORE = 12
+
+# Во столько раз лучший сдвиг должен обойти второй. Без запаса берём соседний
+# сдвиг, который тоже даёт «числа», но не те.
+SHIFT_MARGIN = 2.0
+
+
+def _font_tokens(
+    doc: fitz.Document, letter_map: dict[str, str]
+) -> tuple[dict[str, Counter], Counter]:
+    """Битые токены по шрифтам и словарь исправно набранных токенов.
+
+    Разбор по шрифтам обязателен: на одном листе их несколько, сдвиги у них
+    разные, и общая таблица без такого разделения смешала бы «-» одного
+    шрифта с «/» другого.
+    """
+    garbled: dict[str, Counter] = defaultdict(Counter)
+    clean: Counter = Counter()
+    for i in range(doc.page_count):
+        for block in doc[i].get_text("dict").get("blocks", ()):
+            for line in block.get("lines", ()):
+                for span in line.get("spans", ()):
+                    # Буквы к этому моменту уже починены — сравнивать со
+                    # словарём нужно то, что реально попадёт в вывод.
+                    text = decode(span.get("text", ""), letter_map)
+                    for tok in text.split():
+                        if any(is_broken_glyph(c) for c in tok):
+                            garbled[span.get("font", "?")][tok] += 1
+                        elif len(tok) >= 2 and not any(is_broken_char(c) for c in tok):
+                            clean[tok] += 1
+    return garbled, clean
+
+
+def _apply_shift(token: str, shift: int) -> str:
+    return "".join(
+        chr(ord(c) + shift) if is_broken_glyph(c) else c for c in token
+    )
+
+
+def _token_weight(decoded: str, clean: Counter) -> tuple[int, int]:
+    """Вес свидетельства: (словарное, числовое).
+
+    Разделены нарочно. «Похоже на число» даёт и соседний сдвиг — цифры лежат
+    подряд, и промах на единицу превращает одни цифры в другие. А попасть в
+    токен, который в этом же документе уже набран исправно, соседний сдвиг не
+    может: там участвует пунктуация, и она смещается вместе с цифрами.
+    """
+    parts = decoded.split()
+    if len(parts) > 1:
+        # Подменённый пробел: токен распадается на слова, и каждое из них в
+        # документе встречается набранным правильно.
+        return (_W_VOCAB, 0) if all(p in clean for p in parts) else (0, 0)
+    if decoded in clean:
+        return (_W_VOCAB, 0)
+    if _NUMERIC_TOKEN_RE.match(decoded):
+        return (0, _W_NUMERIC)
+    return (0, 0)
+
+
+def detect_glyph_shifts(
+    doc: fitz.Document, letter_map: dict[str, str]
+) -> dict[str, str]:
+    r"""Подстановка для цифр и пунктуации: {подменённый глиф: символ}.
+
+    Считается по шрифтам, но применяется одной таблицей — `decode()` работает
+    посимвольно и о шрифте не знает. Когда два шрифта claim'ят один код с
+    разными символами, побеждает тот вариант, за который больше подтверждённых
+    словарём вхождений: на ИОС2 так решается спор за `\x10` между «/» шифра и
+    «-» слова «хозяйственно-бытового».
+    """
+    garbled, clean = _font_tokens(doc, letter_map)
+    if not clean or not garbled:
+        return {}
+
+    # глиф → символ → накопленный вес свидетельств
+    claims: dict[str, Counter] = defaultdict(Counter)
+    for tokens in garbled.values():
+        codes = sorted({ord(c) for tok in tokens for c in tok if is_broken_glyph(c)})
+        if not codes:
+            continue
+        # Сдвиг обязан уложить ВЕСЬ блок шрифта в печатаемый ASCII: это и есть
+        # проверка на то, что блок действительно непрерывный и один.
+        lo, hi = codes[0], codes[-1]
+        if hi - lo > _ASCII_HI - _ASCII_LO:
+            continue
+        scored = []
+        for s in range(_ASCII_LO - lo, _ASCII_HI - hi + 1):
+            vocab_hits = numeric_hits = 0
+            for tok, freq in tokens.items():
+                v, n = _token_weight(_apply_shift(tok, s), clean)
+                vocab_hits += freq * v
+                numeric_hits += freq * n
+            scored.append((vocab_hits, numeric_hits, s))
+        if not scored:
+            continue
+        scored.sort(reverse=True)
+        best_vocab, _, shift = scored[0]
+        runner_up = scored[1][0] if len(scored) > 1 else 0
+        # Гейт — по словарной части: она одна отличает верный сдвиг от соседа.
+        if best_vocab < MIN_SHIFT_SCORE or best_vocab < SHIFT_MARGIN * max(runner_up, 1):
+            continue
+        for tok, freq in tokens.items():
+            v, n = _token_weight(_apply_shift(tok, shift), clean)
+            weight = freq * max(v + n, 1)
+            for ch in tok:
+                if is_broken_glyph(ch):
+                    claims[ch][chr(ord(ch) + shift)] += weight
+
+    return {glyph: cnt.most_common(1)[0][0] for glyph, cnt in claims.items()}
+
+
 def verify(doc: fitz.Document, mapping: dict[str, str], extra_text: str = "") -> dict:
     """Доля раскодированных слов, которые нашлись в словаре документа.
 
@@ -277,10 +442,22 @@ def decode(text: str, mapping: dict[str, str]) -> str:
 
 
 def coverage(doc: fitz.Document, mapping: dict[str, str]) -> dict:
-    """Насколько полно отображение чинит документ (для отчётов и гейтов)."""
+    """Насколько полно отображение чинит документ (для отчётов и гейтов).
+
+    `pct` считается только по буквам и только по страницам, признанным
+    кракозябрами, — на нём стоят гейты, и трогать его шкалу нельзя. Цифры с
+    пунктуацией идут отдельными ключами (`glyph_*`): они встречаются и на
+    листах, которые в остальном читаются, поэтому в ту же долю не сводятся.
+    """
     total = fixed = 0
+    glyph_total = glyph_fixed = 0
     for i in range(doc.page_count):
         t = doc[i].get_text("text")
+        for c in t:
+            if is_broken_glyph(c):
+                glyph_total += 1
+                if c in mapping:
+                    glyph_fixed += 1
         if not is_garbled_pdf_text(t):
             continue
         for c in t:
@@ -293,6 +470,11 @@ def coverage(doc: fitz.Document, mapping: dict[str, str]) -> dict:
         "recovered": fixed,
         "pct": round(100.0 * fixed / total, 1) if total else None,
         "glyphs": len(mapping),
+        "glyph_chars": glyph_total,
+        "glyph_recovered": glyph_fixed,
+        "glyph_pct": (
+            round(100.0 * glyph_fixed / glyph_total, 1) if glyph_total else None
+        ),
     }
 
 
@@ -348,7 +530,11 @@ def map_for_doc(doc: fitz.Document, *, quiet: bool = False) -> dict[str, str]:
     try:
         mapping = build_mapping(doc)
         if mapping:
-            pct = coverage(doc, mapping).get("pct", 0.0)
+            cov = coverage(doc, mapping)
+            # pct=None — букв чинить не пришлось (подстановка только по цифрам
+            # и пунктуации). Отклонять такую нечего: у неё свой гейт по весу
+            # свидетельств внутри detect_glyph_shifts().
+            pct = cov["pct"] if cov["pct"] is not None else 100.0
             if pct < MIN_COVERAGE_PCT:
                 if not quiet:
                     print(
@@ -372,6 +558,29 @@ def map_for_doc(doc: fitz.Document, *, quiet: bool = False) -> dict[str, str]:
     return mapping
 
 
+def page_raw_text(page) -> str:
+    """Текст листа в порядке чтения, без потери подменённых глифов.
+
+    Порядок чтения по координатам, а не по внутреннему потоку файла, нужен
+    обязательно: без него страница пояснительной записки начинается со штампа
+    («Изм. Кол.уч, №док., Митрофанов…»), а текст документа идёт после него.
+
+    Но `get_text("text", sort=True)` заодно выбрасывает управляющие коды — а
+    это и есть подменённые цифры с пунктуацией, ради которых слой чинится: на
+    титуле из «28-ХСА-1/25-ИОС2» так пропадали все три разделителя, и починке
+    было уже нечего исправлять. Блоки с той же сортировкой их сохраняют, а
+    вдобавок не склеивают соседние ячейки таблицы в «131313».
+    """
+    try:
+        blocks = page.get_text("blocks", sort=True)
+    except Exception:
+        blocks = None
+    if not blocks:
+        return page.get_text("text", sort=True) or ""
+    # b[6] — тип блока: 0 текст, 1 картинка. У картинки в b[4] лежат байты.
+    return "".join(b[4] for b in blocks if b[6] == 0 and isinstance(b[4], str))
+
+
 def page_text_fixed(page, *, quiet: bool = False) -> str:
     """Текстовый слой листа с починкой сломанного ToUnicode.
 
@@ -379,15 +588,10 @@ def page_text_fixed(page, *, quiet: bool = False) -> str:
     подстановка нашлась и оказалась надёжной. Иначе возвращается исходный
     текст, и решение о нём принимает вызывающий код.
     """
-    # sort=True — порядок чтения по координатам, а не по внутреннему потоку
-    # файла. Без него страница пояснительной записки начинается со штампа
-    # («Изм. Кол.уч, №док., Митрофанов…»), а текст документа идёт после него:
-    # для инженера это нечитаемо, а раньше было незаметно, потому что слой
-    # никто не показывал целиком.
-    raw = page.get_text("text", sort=True) or ""
+    raw = page_raw_text(page)
     if not raw.strip():
         return raw
-    broken = sum(1 for ch in raw if is_broken_char(ch))
+    broken = sum(1 for ch in raw if is_broken_any(ch))
     if not broken:
         return raw
     # Чиним по наличию битых символов, а не по вердикту «вся страница битая».
@@ -398,5 +602,5 @@ def page_text_fixed(page, *, quiet: bool = False) -> str:
     if not mapping:
         return raw
     fixed = decode(raw, mapping)
-    left = sum(1 for ch in fixed if is_broken_char(ch))
+    left = sum(1 for ch in fixed if is_broken_any(ch))
     return fixed if left < broken else raw

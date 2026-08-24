@@ -967,6 +967,8 @@ class UsageTotals:
     calls: int = 0
     retries: int = 0
     failed_tiles: int = 0
+    # Листы, которые не удалось прочитать вовсе, — их файл не записан.
+    failed_pages: int = 0
 
     def add(self, usage: dict | None) -> None:
         if not usage:
@@ -984,6 +986,7 @@ class UsageTotals:
             "calls": self.calls,
             "retries": self.retries,
             "failed_tiles": self.failed_tiles,
+            "failed_pages": self.failed_pages,
         }
 
 
@@ -1712,6 +1715,48 @@ def assemble(pages: dict[int, str]) -> str:
     )
 
 
+# Текст, который конвейер вписывает вместо ответа модели, когда вызов упал.
+_ERROR_STUB_RE = re.compile(r"\(ошибк[аи][^)]*\)")
+
+# Служебные строки листа: заголовки проходов, подписи фрагментов, курсивные
+# пометки конвейера. Они есть всегда, моделью не прочитаны.
+_SERVICE_LINE_RE = re.compile(r"^(?:#{1,6}\s|-{2,}\s|_[^_]*_\s*$)")
+
+# Секции, которые конвейер пишет сам и без модели: паспорт листа (геометрия
+# PDF) и пометка о пропущенном проходе. Содержимого листа в них нет, и считать
+# их за прочитанный текст нельзя — иначе лист, где модель не ответила ни разу,
+# выглядит наполненным.
+_CONVEYOR_SECTION_RE = re.compile(r"^### PASS-0\b|^### PASS-\S* пропущен")
+
+# Меньше стольких значащих символов вне служебных секций — читать нечего.
+MIN_PAGE_CONTENT_CHARS = 40
+
+
+def page_is_all_errors(content: str) -> bool:
+    """Лист, от которого не осталось ничего, кроме паспорта и текстов ошибок.
+
+    Зачем. При обрыве провайдера все вызовы листа падают, а лист всё равно
+    записывался в `pages/page_NNNN.md` — с одним лишь «(ошибка тайла: …)»
+    внутри. Дальше и CLI, и сервис считают готовым любой существующий файл
+    листа (`service/worker.py`: `page_file(...).exists()`), поэтому такой лист
+    не пересчитывался уже никогда: обрыв сети превращался в тихую дыру в
+    документе. Прогон 20260823_192351 — ровно этот случай: failed_tiles=43,
+    две страницы из трёх состоят из текста ошибки.
+
+    Паспорт (PASS-0) в расчёт не идёт: он строится по геометрии PDF локально и
+    есть даже там, где модель не ответила ни разу.
+    """
+    sections = re.split(r"(?m)^(?=### )", content)
+    tail = "".join(s for s in sections if not _CONVEYOR_SECTION_RE.match(s))
+    meaningful = 0
+    for line in tail.splitlines():
+        line = _ERROR_STUB_RE.sub("", line).strip()
+        if not line or _SERVICE_LINE_RE.match(line):
+            continue
+        meaningful += sum(1 for ch in line if ch.isalnum())
+    return meaningful < MIN_PAGE_CONTENT_CHARS
+
+
 def union_texts(variants: list[str]) -> str:
     """Объединяет N прогонов одной страницы: уникальные строки (первое вхождение),
     борьба с nondeterminism ростом recall.
@@ -2398,6 +2443,19 @@ def run_vlm(
                 print(f"  p{num}: RUN {ri + 1}/{runs}", flush=True)
             variants.append(_extract_page(num))
         content = union_texts(variants)
+        if page_is_all_errors(content):
+            # Файл НЕ пишем сознательно: и CLI, и сервис считают лист готовым
+            # по факту существования `pages/page_NNNN.md`. Записанный лист из
+            # одних ошибок навсегда остался бы дырой в документе, а
+            # отсутствующий пересчитается при следующем запуске.
+            usage.failed_pages += 1
+            print(
+                f"  p{num}: НЕ ЗАПИСАН — ни один вызов модели не удался "
+                f"({len(content)} симв. служебного текста); "
+                "лист пересчитается при следующем прогоне",
+                flush=True,
+            )
+            continue
         (out_dir / "pages").mkdir(exist_ok=True)
         pages_dir = out_dir / "pages"
         pages_dir.mkdir(exist_ok=True)

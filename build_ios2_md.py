@@ -259,18 +259,37 @@ def build(
     if main_code:
         print(f"шифр документа из штампов: {main_code} ({doc_codes[main_code]} листов)")
 
+    # Импорт локальный: deglyph сам импортирует этот модуль (is_garbled_pdf_text),
+    # на уровне модуля вышел бы цикл.
+    try:
+        from deglyph import is_broken_any, page_raw_text
+    except Exception:  # pragma: no cover — без deglyph работаем как раньше
+        from deglyph import is_broken_char as is_broken_any  # type: ignore
+
+        def page_raw_text(page):
+            return page.get_text("text")
+
     skipped_garbled = 0
     for n in range(1, total + 1):
         body = run_pages.get(n, "")
         pass_0, pass_a, pass_b = extract_pass(body)
         page = doc[n - 1]
-        raw_text = page.get_text("text")
+        raw_text = page_raw_text(page)
         garbled = is_garbled_pdf_text(raw_text)
         repaired = False
-        if garbled and glyph_map:
+        if glyph_map:
             fixed = "".join(glyph_map.get(c, c) for c in raw_text)
-            if not is_garbled_pdf_text(fixed):
-                raw_text, garbled, repaired = fixed, False, True
+            # Чиним по наличию подменённых символов, а не по вердикту «весь
+            # лист кракозябры». На плане штамп и подписи набраны разными
+            # шрифтами: доля порчи мала, лист проходит как читаемый — и
+            # отметки «112.25» так и остаются управляющими кодами, которые
+            # normalize_pdf_text молча выбросит.
+            before = sum(1 for c in raw_text if is_broken_any(c))
+            after = sum(1 for c in fixed if is_broken_any(c))
+            better = after < before and (not garbled or not is_garbled_pdf_text(fixed))
+            if better:
+                raw_text, repaired = fixed, True
+                garbled = is_garbled_pdf_text(raw_text)
         pdf_text = normalize_pdf_text(raw_text)
         drawing = is_drawing_page(page)
         use_tiles = (
