@@ -36,6 +36,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +78,37 @@ class Sheet:
     paper_height: float
     scales: list[float] = field(default_factory=list)
     texts: list[TextItem] = field(default_factory=list)
+    # Прямоугольники модели, которые лист показывает: окна вьюпортов или сама
+    # рамка. По ним лист и разбирается — что на нём есть и где именно.
+    # (x0, y0, x1, y1, масштаб) — окна вьюпортов или сама рамка.
+    windows: list[tuple[float, float, float, float, float]] = field(default_factory=list)
+
+    def extent(self) -> tuple[float, float, float, float] | None:
+        """Общий охват листа в координатах модели."""
+        if not self.windows:
+            return None
+        return (
+            min(w[0] for w in self.windows),
+            min(w[1] for w in self.windows),
+            max(w[2] for w in self.windows),
+            max(w[3] for w in self.windows),
+        )
+
+    def main_window(self) -> tuple[float, float, float, float, float] | None:
+        """Самое большое окно — основной вид листа."""
+        if not self.windows:
+            return None
+        return max(self.windows, key=lambda w: (w[2] - w[0]) * (w[3] - w[1]))
+
+    def scale(self) -> float:
+        """Масштаб ОСНОВНОГО вида. 0 — неизвестен.
+
+        Не «самый частый»: врезок на листе обычно больше, чем основных видов,
+        и по частоте масштаб получался от врезки. У листа 22 комплекта КР1 это
+        давало 1:20 вместо настоящего 1:40.
+        """
+        main = self.main_window()
+        return main[4] if main else 0.0
 
     @property
     def title(self) -> str:
@@ -422,6 +454,7 @@ def _sheets_from_frames(msp, model_texts: list[TextItem]) -> list[Sheet]:
             paper_height=_ISO_SIZES.get(fmt, (0, 0))[1],
             scales=[scale] if scale else [],
             texts=inside,
+            windows=[(x0, y0, x1, y1, scale)],
         )
         sheets.append(sheet)
     return sheets
@@ -462,6 +495,7 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
                 continue
             x0, y0, x1, y1, scale = window
             sheet.scales.append(round(scale, 2))
+            sheet.windows.append((x0, y0, x1, y1, round(scale, 2)))
             for item in model_texts:
                 if x0 <= item.x <= x1 and y0 <= item.y <= y1:
                     key = (round(item.x, 2), round(item.y, 2), item.text)
@@ -508,13 +542,172 @@ def reading_order(texts: list[TextItem]) -> list[str]:
     return out
 
 
-def sheet_markdown(sheet: Sheet, file_name: str) -> str:
+# Код единиц чертежа ($INSUNITS) → сколько это метров. Спрашиваем у файла, а
+# не выводим по размеру рамки: комплект «Жуковский» вычерчен в миллиметрах, а
+# стройгенплан ПОС из того же комплекта — в метрах, и длины отличались бы в
+# тысячу раз.
+_UNIT_TO_M = {1: 0.0254, 2: 0.3048, 4: 0.001, 5: 0.01, 6: 1.0, 9: 1e-6, 14: 0.1, 15: 10.0, 16: 1000.0}
+
+# Слой, покрывающий столько от листа по обеим осям, описываем как «по всему
+# листу»: точнее сказать нечего, а перечислять все стороны света бессмысленно.
+_WHOLE_SHEET = 0.7
+
+# Автоматические имена блоков AutoCAD: «*U258», «A$C0df934f8». Инженеру они не
+# говорят ничего, в сводку оборудования не идут.
+_ANON_BLOCK_RE = re.compile(r"^(?:\*[A-Za-z]\d+|A\$C[0-9A-Fa-f]+)$")
+
+
+@dataclass
+class LayerStat:
+    """Что даёт один слой листа: сколько объектов, какой длины, где лежит."""
+
+    name: str
+    entities: int
+    length_m: float
+    zone: str
+
+
+def _points_of(e) -> list[tuple[float, float]]:
+    """Опорные точки объекта — для длины и габаритов."""
+    kind = e.dxftype()
+    try:
+        if kind == "LINE":
+            return [(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]
+        if kind == "LWPOLYLINE":
+            return [(p[0], p[1]) for p in e.get_points()]
+        if kind == "POLYLINE":
+            return [(v.dxf.location.x, v.dxf.location.y) for v in e.vertices]
+        if kind in ("CIRCLE", "ARC"):
+            c, r = e.dxf.center, float(e.dxf.radius)
+            return [(c.x - r, c.y - r), (c.x + r, c.y + r)]
+        if kind in ("TEXT", "MTEXT", "INSERT", "ATTRIB"):
+            p = e.dxf.insert
+            return [(p.x, p.y)]
+    except Exception:
+        return []
+    return []
+
+
+def _length_of(e) -> float:
+    """Длина объекта в единицах чертежа. Не линия — ноль."""
+    kind = e.dxftype()
+    try:
+        if kind == "CIRCLE":
+            return 2 * 3.141592653589793 * float(e.dxf.radius)
+        if kind == "ARC":
+            start, end = float(e.dxf.start_angle), float(e.dxf.end_angle)
+            sweep = (end - start) % 360
+            return 3.141592653589793 * float(e.dxf.radius) * sweep / 180
+        pts = _points_of(e) if kind in ("LINE", "LWPOLYLINE", "POLYLINE") else []
+        return sum(
+            ((pts[i + 1][0] - pts[i][0]) ** 2 + (pts[i + 1][1] - pts[i][1]) ** 2) ** 0.5
+            for i in range(len(pts) - 1)
+        )
+    except Exception:
+        return 0.0
+
+
+def _zone(box: tuple[float, float, float, float], window: tuple) -> str:
+    """Где объект лежит на листе, словами. Тот же словарь, что у описаний VLM."""
+    wx0, wy0, wx1, wy1 = window[:4]
+    ww, wh = max(wx1 - wx0, 1e-9), max(wy1 - wy0, 1e-9)
+    if (box[2] - box[0]) / ww >= _WHOLE_SHEET and (box[3] - box[1]) / wh >= _WHOLE_SHEET:
+        return "по всему листу"
+    cx = ((box[0] + box[2]) / 2 - wx0) / ww
+    cy = ((box[1] + box[3]) / 2 - wy0) / wh
+    vertical = "юг" if cy < 1 / 3 else ("север" if cy > 2 / 3 else "")
+    horizontal = "запад" if cx < 1 / 3 else ("восток" if cx > 2 / 3 else "")
+    if vertical and horizontal:
+        return f"{vertical}о-{horizontal}" if vertical == "север" else f"{vertical}о-{horizontal}"
+    return vertical or horizontal or "центр"
+
+
+def _geometry_entities(space, depth: int = 0):
+    """Объекты пространства с развёрнутыми блоками.
+
+    Без разворота считается только верхний уровень, а у чертежа половина
+    геометрии лежит внутри вставок: арматура, узлы, оборудование. На листе 22
+    комплекта КР1 это давало 40 объектов слоя ARMATURA вместо сотен.
+    """
+    for e in space:
+        yield e
+        if e.dxftype() == "INSERT" and depth < 2:
+            try:
+                yield from _geometry_entities(e.virtual_entities(), depth + 1)
+            except Exception:
+                continue
+
+
+def _texts_box(sheet: Sheet) -> tuple[float, float, float, float] | None:
+    """Габариты подписей листа — запасное окно, когда вьюпорт его не дал."""
+    if not sheet.texts:
+        return None
+    xs = [t.x for t in sheet.texts]
+    ys = [t.y for t in sheet.texts]
+    pad = max(max(xs) - min(xs), max(ys) - min(ys)) * 0.05 + 1.0
+    return (min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad)
+
+
+def analyse_sheet(msp, sheet: Sheet, unit_m: float) -> tuple[list[LayerStat], Counter]:
+    """Разбирает геометрию листа: слои с длинами и вставленное оборудование."""
+    # Сначала окно основного вида. Если в нём не нашлось ничего — габариты
+    # подписей: у стройгенплана ПОС вьюпорт указывает мимо (чертёж вычерчен в
+    # метрах, а окно посчитано как для миллиметров), и по нему лист пуст.
+    main = sheet.main_window()
+    boxes = [b for b in (main[:4] if main else None, _texts_box(sheet)) if b]
+    for attempt, box in enumerate(boxes):
+        stats, blocks = _analyse_box(msp, box, unit_m)
+        if stats:
+            return stats, blocks
+    return [], Counter()
+
+
+def _analyse_box(msp, box, unit_m: float) -> tuple[list[LayerStat], Counter]:
+    """Разбор геометрии в заданном прямоугольнике модели."""
+    x0, y0, x1, y1 = box
+    window = (x0, y0, x1, y1, 0.0)
+    per_layer: dict[str, list] = {}
+    blocks: Counter = Counter()
+    for e in _geometry_entities(msp):
+        pts = _points_of(e)
+        if not pts:
+            continue
+        bx0 = min(p[0] for p in pts)
+        bx1 = max(p[0] for p in pts)
+        by0 = min(p[1] for p in pts)
+        by1 = max(p[1] for p in pts)
+        # объект относится к листу, если его центр в окне
+        if not (x0 <= (bx0 + bx1) / 2 <= x1 and y0 <= (by0 + by1) / 2 <= y1):
+            continue
+        if e.dxftype() == "INSERT":
+            name = str(e.dxf.name)
+            if not _ANON_BLOCK_RE.match(name):
+                blocks[name] += 1
+        layer = str(getattr(e.dxf, "layer", "0"))
+        slot = per_layer.setdefault(layer, [0, 0.0, [1e18, 1e18, -1e18, -1e18]])
+        slot[0] += 1
+        slot[1] += _length_of(e)
+        box = slot[2]
+        box[0], box[1] = min(box[0], bx0), min(box[1], by0)
+        box[2], box[3] = max(box[2], bx1), max(box[3], by1)
+
+    stats = [
+        LayerStat(name, cnt, round(length * unit_m, 1), _zone(tuple(box), window))
+        for name, (cnt, length, box) in per_layer.items()
+    ]
+    stats.sort(key=lambda s: (-s.length_m, -s.entities))
+    return stats, blocks
+
+
+def sheet_markdown(
+    sheet: Sheet,
+    file_name: str,
+    layers: list[LayerStat] | None = None,
+    blocks: Counter | None = None,
+) -> str:
     """Лист в том же контракте, что и страница PDF: ## Страница N / ### PASS-*."""
     number = sheet.number if sheet.number is not None else 0
-    scale = ""
-    if sheet.scales:
-        main = max(set(sheet.scales), key=sheet.scales.count)
-        scale = f"1:{main:g}"
+    scale = f"1:{sheet.scale():g}" if sheet.scale() else ""
     parts = [
         f"## Страница {number}",
         "",
@@ -531,7 +724,26 @@ def sheet_markdown(sheet: Sheet, file_name: str) -> str:
         f"- масштаб: {scale or '—'}",
         f"- текстовых объектов: {len(sheet.texts)}",
         "",
-        "### PASS-A Текст листа (из DWG)",
+    ]
+    if layers:
+        parts += [
+            "### PASS-A Состав листа (из геометрии)",
+            "",
+            "_Собрано из данных чертежа: принадлежность линий к слоям, их "
+            "длины и габариты. Модель не вызывалась._",
+            "",
+            "| Слой | Объектов | Длина, м | Где на листе |",
+            "|---|---:|---:|---|",
+        ]
+        for st in layers[:20]:
+            shown = f"{st.length_m:g}" if st.length_m >= 0.1 else "—"
+            parts.append(f"| {st.name} | {st.entities} | {shown} | {st.zone} |")
+        parts.append("")
+    if blocks:
+        named = ", ".join(f"{n} ×{c}" for n, c in blocks.most_common(15))
+        parts += ["**Вставленные элементы:** " + named, ""]
+    parts += [
+        "### PASS-B Текст листа (из DWG)",
         "",
         "_Текст взят из чертежа как данные: модель не вызывалась._",
         "",
@@ -540,12 +752,24 @@ def sheet_markdown(sheet: Sheet, file_name: str) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
-def build_markdown(path: Path, sheets: list[Sheet]) -> str:
+def build_markdown(path: Path, sheets: list[Sheet], dxf_path: Path) -> str:
+    import ezdxf
+
+    doc = ezdxf.readfile(str(dxf_path))
+    msp = doc.modelspace()
+    unit_code = int(doc.header.get("$INSUNITS", 0) or 0)
+    unit_m = _UNIT_TO_M.get(unit_code, 0.001)
+    unit_name = "м" if unit_m == 1.0 else ("мм" if unit_m == 0.001 else str(unit_m))
     head = (
         f"# {path.stem}\n\n"
-        f"Источник — DWG (векторные данные, не отрисовка). Листов: {len(sheets)}.\n"
+        f"Источник — DWG (векторные данные, не отрисовка). Листов: {len(sheets)}. "
+        f"Единицы чертежа: {unit_name}.\n"
     )
-    return head + "\n" + "\n\n".join(sheet_markdown(s, path.name) for s in sheets)
+    chunks = []
+    for sheet in sheets:
+        layers, blocks = analyse_sheet(msp, sheet, unit_m)
+        chunks.append(sheet_markdown(sheet, path.name, layers, blocks))
+    return head + "\n" + "\n\n".join(chunks)
 
 
 def main() -> int:
@@ -568,13 +792,13 @@ def main() -> int:
             return 1
 
     if args.out:
-        Path(args.out).write_text(build_markdown(src, sheets), encoding="utf-8")
+        Path(args.out).write_text(build_markdown(src, sheets, dxf), encoding="utf-8")
         print(f"записано: {args.out} ({len(sheets)} листов)")
         return 0
 
     print(f"{src.name}: листов {len(sheets)}")
     for s in sheets:
-        scale = f"1:{max(set(s.scales), key=s.scales.count):g}" if s.scales else "—"
+        scale = f"1:{s.scale():g}" if s.scale() else "—"
         print(
             f"  {str(s.number or '?'):>3}  {s.title[:44]:<44} "
             f"{s.paper_width:g}×{s.paper_height:g} мм  {scale:>7}  "
