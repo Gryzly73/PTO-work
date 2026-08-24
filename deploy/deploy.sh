@@ -86,8 +86,21 @@ fi
 # --- 2. Забрать код ----------------------------------------------------------
 say "Обновляю код в $BACKEND_DIR до $REF"
 cd "$BACKEND_DIR"
-git fetch --prune origin
-git reset --hard "$REF"
+# origin обычно git@github.com:…, а Deploy key в репо часто ещё не добавлен.
+# Actions передаёт короткий GITHUB_TOKEN на один прогон (PTO_GITHUB_TOKEN) —
+# на диск его не пишем, remote не меняем.
+if [ -n "${PTO_GITHUB_TOKEN:-}" ]; then
+  https_url="$(git remote get-url origin | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##').git"
+  branch="${REF#origin/}"
+  basic="$(printf 'x-access-token:%s' "$PTO_GITHUB_TOKEN" | base64 | tr -d '\n')"
+  git -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${basic}" \
+      fetch --prune "$https_url" "+refs/heads/${branch}:refs/remotes/origin/${branch}"
+  unset basic
+  git reset --hard "origin/${branch}"
+else
+  git fetch --prune origin
+  git reset --hard "$REF"
+fi
 git log --oneline -1
 # .env не отслеживается git — reset его не трогает, настройки сервера целы.
 [ -f .env ] || { echo "НЕТ .env на сервере: без него не будет ни HF_TOKEN, ни PTO_API_TOKEN"; exit 1; }
