@@ -68,11 +68,18 @@ def _vocab_from_clean_pages(doc: fitz.Document, extra_text: str = "") -> Counter
 
 
 def _garbled_words(doc: fitz.Document) -> Counter:
+    """Слова с подменёнными глифами — со ВСЕХ страниц документа.
+
+    Раньше брались только страницы, целиком похожие на кракозябры. Но на
+    чертеже штамп и основной текст набраны разными шрифтами: доля порчи мала,
+    страница проходит как исправная, и её глифы («ǨКСПЛИКАЦИǪ ǒДАНИǔ» —
+    заглавные Э, Я, З, Й) в подстановку не попадали вовсе. Кандидатов лишними
+    словами не испортить: подбор всё равно требует единственного совпадения по
+    словарю и двух независимых свидетелей.
+    """
     out: Counter = Counter()
     for i in range(doc.page_count):
         t = doc[i].get_text("text")
-        if not is_garbled_pdf_text(t):
-            continue
         for w in WORD_RE.findall(t):
             if any(is_broken_char(c) for c in w):
                 out[w] += 1
@@ -132,8 +139,94 @@ def build_mapping(doc: fitz.Document, extra_text: str = "") -> dict[str, str]:
             new += 1
         if not new:
             break
-    return mapping
+    return extend_by_shifts(mapping, detect_shifts(words, vocab))
 
+
+# Кириллица, в которую имеет смысл раскодировать: буквы + Ё/ё.
+_CYR_RANGE = set(range(0x0410, 0x0450)) | {0x0401, 0x0451}
+
+# Меньше стольких слов-свидетелей — совпадение сдвига может быть случайным.
+MIN_VOTES_FOR_SHIFT = 3
+
+# Насколько за пределы кодов своих свидетелей распространяется сдвиг. Шрифт
+# занимает непрерывный блок, но свидетели покрывают не весь алфавит: запас
+# нужен, чтобы достать редкие буквы (Ъ, Ё, заглавные).
+SHIFT_SPAN_MARGIN = 96
+
+
+def detect_shifts(
+    words: Counter, vocab: Counter | set
+) -> list[tuple[int, int, int]]:
+    """Ищет сдвиги кодовой таблицы: [(сдвиг, минимальный код, максимальный код)].
+
+    Порча ToUnicode в CAD-PDF обычно смещает весь кириллический блок шрифта на
+    постоянную величину. Шрифтов на листе бывает несколько, и сдвиги у них
+    разные: на ИОС2 основной текст смещён на 581, а заголовки вроде
+    «Ʉɚɧɚɥɢɡɚɰɢɨɧɧɵɟ ɨɱɢɫɬɧɵɟ ɫɨɨɪɭɠɟɧɢɹ» — на 470.
+
+    Ищем так же, как словарный подбор: битое слово сопоставляем словам той же
+    длины из словаря документа. Но здесь не требуем единственного кандидата —
+    достаточно, чтобы все подменённые позиции дали ОДНУ дельту. Правильный
+    сдвиг наберёт голоса многих независимых слов, случайный — один-два.
+    """
+    by_len: dict[int, list[str]] = defaultdict(list)
+    for word in vocab:
+        by_len[len(word)].append(word)
+
+    votes: Counter = Counter()
+    span: dict[int, list[int]] = {}
+    for gw in words:
+        for cand in by_len.get(len(gw), ()):
+            deltas = set()
+            codes: list[int] = []
+            fits = True
+            for g, t in zip(gw, cand):
+                if is_broken_char(g):
+                    deltas.add(ord(t) - ord(g))
+                    codes.append(ord(g))
+                elif g != t:
+                    fits = False
+                    break
+            if not fits or len(deltas) != 1:
+                continue
+            shift = deltas.pop()
+            votes[shift] += 1
+            lo, hi = span.get(shift, (min(codes), max(codes)))
+            span[shift] = (min(lo, *codes), max(hi, *codes))
+
+    return [
+        (shift, span[shift][0], span[shift][1])
+        for shift, n in votes.most_common()
+        if n >= MIN_VOTES_FOR_SHIFT
+    ]
+
+
+def extend_by_shifts(
+    mapping: dict[str, str], shifts: list[tuple[int, int, int]]
+) -> dict[str, str]:
+    """Достраивает подстановку найденными сдвигами.
+
+    Словарный подбор открывает только буквы, для которых в документе нашлось
+    слово-ключ. Редкие заглавные так и остаются нерасшифрованными:
+    «ǨКСПЛИКАЦИǪ ǒДАНИǔ» вместо «ЭКСПЛИКАЦИЯ ЗДАНИЙ» — а это заголовок таблицы,
+    ради которой лист и читают. Сдвиг закрывает алфавит целиком.
+
+    Каждый сдвиг действует только рядом с кодами своих свидетелей: шрифты
+    занимают разные блоки, и пускать сдвиг одного шрифта на глифы другого
+    нельзя. Уже подобранные словарём пары не переписываются — они надёжнее.
+    """
+    if not shifts:
+        return mapping
+    extended = dict(mapping)
+    for shift, lo, hi in shifts:
+        for code in range(lo - SHIFT_SPAN_MARGIN, hi + SHIFT_SPAN_MARGIN + 1):
+            ch = chr(code)
+            if ch in extended or not is_broken_char(ch):
+                continue
+            target = code + shift
+            if target in _CYR_RANGE:
+                extended[ch] = chr(target)
+    return extended
 
 def verify(doc: fitz.Document, mapping: dict[str, str], extra_text: str = "") -> dict:
     """Доля раскодированных слов, которые нашлись в словаре документа.
@@ -155,10 +248,26 @@ def verify(doc: fitz.Document, mapping: dict[str, str], extra_text: str = "") ->
             if len(bad_examples) < 12:
                 bad_examples.append(f"{gw}→{dec}")
     tot = hit + miss
+    # Вторая, независимая мера: доля битых слов, в которых после починки не
+    # осталось подменённых глифов. Словарная доля (`pct`) занижена там, где
+    # подстановка достроена сдвигом: она открывает редкие заглавные термины
+    # («ХОЛДИНГ», «АЛЬЯНС», «ЭКСПЛИКАЦИЯ»), которых в словаре документа нет по
+    # природе — они встречаются только в шапках и штампах.
+    total_words = sum(words.values())
+    decoded_clean = sum(
+        freq
+        for gw, freq in words.items()
+        if not any(is_broken_char(c) for c in decode(gw, mapping))
+    )
     return {
         "checked": tot,
         "in_vocab": hit,
         "pct": round(100.0 * hit / tot, 1) if tot else None,
+        "decoded": decoded_clean,
+        "words": total_words,
+        "pct_clean": (
+            round(100.0 * decoded_clean / total_words, 1) if total_words else None
+        ),
         "examples_out_of_vocab": bad_examples,
     }
 
@@ -214,3 +323,80 @@ if __name__ == "__main__":
         print("было:  ", " ".join(raw.split())[:200])
         print("стало: ", " ".join(decode(raw, m).split())[:200])
     d.close()
+
+# ── Готовое применение: текст листа с уже починенным слоем ──────────────────
+#
+# Подстановка выводится по всему документу и нужна на каждом листе, а конвейер
+# в сервисе считает по листу за вызов и открывает PDF заново. Без кэша таблица
+# пересобиралась бы тысячу раз на документ.
+
+_MAPS: dict[str, dict[str, str]] = {}
+
+# Ниже этой доли восстановленных символов подстановке не доверяем: лучше
+# оставить кракозябры и отдать лист модели, чем подсунуть выдуманный текст.
+MIN_COVERAGE_PCT = 60.0
+
+
+def map_for_doc(doc: fitz.Document, *, quiet: bool = False) -> dict[str, str]:
+    """Подстановка для документа, с кэшем на процесс. {} — чинить нечем."""
+    key = getattr(doc, "name", "") or f"id{id(doc)}"
+    cached = _MAPS.get(key)
+    if cached is not None:
+        return cached
+
+    mapping: dict[str, str] = {}
+    try:
+        mapping = build_mapping(doc)
+        if mapping:
+            pct = coverage(doc, mapping).get("pct", 0.0)
+            if pct < MIN_COVERAGE_PCT:
+                if not quiet:
+                    print(
+                        f"    deglyph: подстановка ненадёжна ({pct:.0f}% символов) — "
+                        "текстовый слой оставлен как есть",
+                        flush=True,
+                    )
+                mapping = {}
+            elif not quiet:
+                print(
+                    f"    deglyph: чиню текстовый слой, {len(mapping)} глифов, "
+                    f"{pct:.0f}% символов",
+                    flush=True,
+                )
+    except Exception as e:  # порча бывает не только этой природы
+        if not quiet:
+            print(f"    deglyph skip: {e}", flush=True)
+        mapping = {}
+
+    _MAPS[key] = mapping
+    return mapping
+
+
+def page_text_fixed(page, *, quiet: bool = False) -> str:
+    """Текстовый слой листа с починкой сломанного ToUnicode.
+
+    Исправный слой возвращается как есть; неисправный — раскодированным, если
+    подстановка нашлась и оказалась надёжной. Иначе возвращается исходный
+    текст, и решение о нём принимает вызывающий код.
+    """
+    # sort=True — порядок чтения по координатам, а не по внутреннему потоку
+    # файла. Без него страница пояснительной записки начинается со штампа
+    # («Изм. Кол.уч, №док., Митрофанов…»), а текст документа идёт после него:
+    # для инженера это нечитаемо, а раньше было незаметно, потому что слой
+    # никто не показывал целиком.
+    raw = page.get_text("text", sort=True) or ""
+    if not raw.strip():
+        return raw
+    broken = sum(1 for ch in raw if is_broken_char(ch))
+    if not broken:
+        return raw
+    # Чиним по наличию битых символов, а не по вердикту «вся страница битая».
+    # На чертеже штамп и основной текст часто набраны разными шрифтами: доля
+    # порчи мала, страница проходит как исправная, а из слоя вываливается
+    # «ǨКСПЛИКАЦИǪ ǒДАНИǔ» — то есть ровно то слово, ради которого лист и читают.
+    mapping = map_for_doc(page.parent, quiet=quiet)
+    if not mapping:
+        return raw
+    fixed = decode(raw, mapping)
+    left = sum(1 for ch in fixed if is_broken_char(ch))
+    return fixed if left < broken else raw

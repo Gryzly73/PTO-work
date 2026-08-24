@@ -38,7 +38,7 @@ KIND_TITLE = {
 
 # Версия формата страницы. Растёт, когда меняется состав markdown — по ней
 # сервис понимает, что кэш листа собран старым кодом, и пересобирает его.
-PAGE_SCHEMA = 2
+PAGE_SCHEMA = 4
 
 # Выводить ли PASS-B в markdown интерфейса. По умолчанию нет: на чертеже это
 # до 100 тыс. символов на лист. Данные остаются в поле fragments и в файле
@@ -65,6 +65,12 @@ def _plural(count: int, one: str, few: str, many: str) -> str:
 
 # Паспорт печатается двумя способами: passport_markdown() даёт «- kind: `plan`»,
 # context_pack() внутри промпта — «Тип листа (эвристика): plan».
+# Заголовок, которым конвейер помечает лист, чей текст взят из PDF, а не
+# прочитан моделью (hf_api_bench: текстовый лист с исправным слоем).
+_LAYER_SOURCE_RE = re.compile(
+    r"^###\s*PASS-A\s+Текст листа \(из текстового слоя PDF\)", re.M
+)
+
 _PASSPORT_KIND_RE = re.compile(
     r"^\s*[-*]?\s*kind:\s*`?([a-z]+)`?|Тип листа \(эвристика\):\s*([a-z]+)",
     re.I | re.M,
@@ -93,14 +99,28 @@ def kind_from_page(pdf_path: Path, page_number: int) -> str:
 
 
 def page_layer_text(pdf_path: Path, page_number: int) -> str:
-    """Текстовый слой листа. У CAD-PDF он часто битый (сломанный ToUnicode) —
-    такой слой инженеру и модели вреден, отдаём пустую строку."""
+    """Текстовый слой листа, с починкой сломанного ToUnicode.
+
+    У CAD-PDF слой часто отдаёт кракозябры («ǜодерǱаǸие» вместо «Содержание»).
+    Раньше такие листы считались нечитаемыми и текст терялся совсем; конвейер
+    умеет снимать эту порчу подстановкой, выведенной по самому документу
+    (deglyph) — на ИОС2 это 95% символов и семь листов из сорока девяти.
+    Если починить не удалось, отдаём пустую строку, как и раньше: битый слой
+    инженеру и модели вреден.
+    """
     try:
+        from hf_api_bench import layer_text_for_markdown
+
         with fitz.open(pdf_path) as doc:
-            raw = doc[page_number - 1].get_text() or ""
+            text = layer_text_for_markdown(doc[page_number - 1])
     except Exception:
-        return ""
-    text = normalize_pdf_text(raw)
+        try:
+            with fitz.open(pdf_path) as doc:
+                text = normalize_pdf_text(
+                    doc[page_number - 1].get_text(sort=True) or ""
+                )
+        except Exception:
+            return ""
     if not text.strip() or is_garbled_pdf_text(text):
         return ""
     return text.strip()
@@ -156,6 +176,7 @@ def build_page_markdown(
     layer_text: str = "",
     note: str = "",
     fragments_summary: str = "",
+    layer_is_source: bool = False,
 ) -> str:
     parts = [
         f"# Лист {page_number}",
@@ -181,10 +202,13 @@ def build_page_markdown(
         parts += [clean_b, ""]
     elif fragments_summary:
         parts += ["## Извлечение по фрагментам", "", fragments_summary, ""]
-    if layer_text.strip():
-        parts += ["## Текст листа (из PDF)", "", layer_text.strip(), ""]
-    if pass_0.strip():
-        parts += ["## Паспорт листа", "", pass_0.strip(), ""]
+    # Текст из PDF не печатаем, когда описание листа само собрано из него:
+    # иначе один и тот же текст идёт на экран двумя блоками подряд.
+    if layer_text.strip() and not layer_is_source:
+        parts += ["## Текст с листа (из PDF, дословно)", "", layer_text.strip(), ""]
+    # Паспорт (kind, размер листа, причины классификации) — служебная
+    # диагностика конвейера. Инженеру она не нужна и читается как третий
+    # пересказ тех же меток, поэтому уходит отдельным полем, а не в markdown.
     if not any(s.strip() for s in (pass_a, pass_b, layer_text)):
         parts += ["_С листа пока ничего не извлечено._", ""]
     return "\n".join(parts).rstrip() + "\n"
@@ -208,6 +232,7 @@ def page_to_frontend(
     отдаются маршрутом /jobs/{id}/pages/{n}/raw.
     """
     pass_0, pass_a, pass_b = extract_pass(raw_page_md)
+    layer_is_source = bool(_LAYER_SOURCE_RE.search(raw_page_md))
     kind = (
         kind_hint
         or kind_from_passport_md(pass_0)
@@ -238,12 +263,18 @@ def page_to_frontend(
         pass_b=fragments if include_fragments else "",
         layer_text=layer_text,
         fragments_summary=summary,
+        layer_is_source=layer_is_source,
     )
     return {
         "pageNumber": page_number,
         "kind": kind,
         "markdown": markdown,
         "extractedText": layer_text,
+        # Паспорт листа: служебная классификация конвейера. Полем, а не в
+        # markdown — на экране он был третьим пересказом тех же меток.
+        "passport": pass_0.strip(),
+        # Текст листа взят из PDF дословно, модель его не читала.
+        "textFromLayer": layer_is_source,
         # Полное извлечение по фрагментам — для клиентов, которым нужна
         # каждая марка (сверка с ТЗ), а не читаемость.
         "fragments": fragments,

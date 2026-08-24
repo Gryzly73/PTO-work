@@ -122,6 +122,7 @@ class Pipeline:
             usage=usage,
             sheet_aware=config.SHEET_AWARE,
             layer_aware=config.LAYER_AWARE,
+            lean=config.LEAN,
         )
         target = page_file(run_dir, page_number)
         if not target.exists():

@@ -241,7 +241,11 @@ def main() -> int:
             _m = build_mapping(doc)
             if _m:
                 _c, _v = coverage(doc, _m), verify(doc, _m)
-                if (_c["pct"] or 0) >= 90 and (_v["pct"] or 0) >= 80:
+                # см. build_ios2_md: словарная доля занижена там, где
+                # подстановка достроена сдвигом, поэтому гейт — по доле
+                # полностью раскодированных слов.
+                _clean = _v.get("pct_clean", _v.get("pct")) or 0
+                if (_c["pct"] or 0) >= 90 and _clean >= 90:
                     glyph_map = _m
                     if not args.quiet:
                         print(

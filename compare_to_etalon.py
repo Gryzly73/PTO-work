@@ -211,6 +211,18 @@ def score(ref: str, hyp: str) -> dict:
     }
 
 
+def safe_print(line: str) -> None:
+    """Печать, которая не роняет замер об кодировку консоли.
+
+    В примерах попаданий и промахов встречаются греческие буквы и типографика
+    из чертежей, а консоль Windows по умолчанию cp1251. Прежний вариант
+    перекодировал через utf-8 и всё равно падал на самом print: замер из трёх
+    листов обрывался на последней строке, уже посчитав всё, что нужно.
+    """
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    print(line.encode(encoding, "replace").decode(encoding, "replace"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("hypothesis", type=Path)
@@ -255,14 +267,9 @@ def main() -> int:
             f"tok {s['overlap_tokens']}/{s['ref_tokens']}"
         )
         if s["sample_hits"]:
-            hits = ", ".join(s["sample_hits"][:6])
-            print(f"  hits: {hits}".encode("utf-8", "replace").decode("utf-8", "replace"))
+            safe_print(f"  hits: {', '.join(s['sample_hits'][:6])}")
         if s["sample_misses"]:
-            misses = ", ".join(s["sample_misses"][:6])
-            try:
-                print(f"  misses: {misses}")
-            except UnicodeEncodeError:
-                print(f"  misses: {misses.encode(sys.stdout.encoding or 'utf-8', 'replace').decode(sys.stdout.encoding or 'utf-8', 'replace')}")
+            safe_print(f"  misses: {', '.join(s['sample_misses'][:6])}")
         print()
 
     if rows:

@@ -111,6 +111,10 @@ MODEL = _env_str("PTO_MODEL", "qwen3vl-32b")
 PROVIDER = _env_str("PTO_PROVIDER")  # None → resolve_provider подставит preferred
 
 SHEET_AWARE = _env_bool("PTO_SHEET_AWARE", True)
+# Разделение ролей проходов: PASS-A описывает лист один раз, PASS-B только
+# вычитывает текст. Без него каждый проход пересказывает лист целиком — один
+# факт приходит по четыре раза, разными словами и с разными ошибками.
+LEAN = _env_bool("PTO_LEAN", True)
 TWO_PASS = _env_bool("PTO_TWO_PASS", True)
 LAYER_AWARE = _env_bool("PTO_LAYER_AWARE", True)
 HIGH_DPI = _env_bool("PTO_HIGH_DPI", False)
@@ -172,6 +176,7 @@ def profile_dict() -> dict:
         "model": MODEL,
         "provider": PROVIDER,
         "sheetAware": SHEET_AWARE,
+        "lean": LEAN,
         "twoPass": TWO_PASS,
         "layerAware": LAYER_AWARE,
         "highDpi": HIGH_DPI,
