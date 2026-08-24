@@ -212,6 +212,25 @@ def frame_signatures(doc: fitz.Document) -> set[tuple]:
     }
 
 
+# Отпечатки рамки считаются по всему документу, а сервис работает по листу за
+# вызов и открывает PDF заново. Без кэша проход по 49 листам повторялся бы на
+# каждом листе. Тот же приём, что в deglyph.map_for_doc.
+_FRAMES: dict[str, set[tuple]] = {}
+
+
+def frames_for_doc(doc: fitz.Document) -> set[tuple]:
+    """Отпечатки рамки документа, с кэшем на процесс."""
+    key = getattr(doc, "name", "") or f"id{id(doc)}"
+    cached = _FRAMES.get(key)
+    if cached is None:
+        try:
+            cached = frame_signatures(doc)
+        except Exception:
+            cached = set()
+        _FRAMES[key] = cached
+    return cached
+
+
 def page_tables_md(
     page: fitz.Page,
     glyph_map: dict[str, str] | None = None,

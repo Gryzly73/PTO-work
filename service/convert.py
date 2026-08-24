@@ -38,7 +38,7 @@ KIND_TITLE = {
 
 # Версия формата страницы. Растёт, когда меняется состав markdown — по ней
 # сервис понимает, что кэш листа собран старым кодом, и пересобирает его.
-PAGE_SCHEMA = 4
+PAGE_SCHEMA = 5
 
 # Выводить ли PASS-B в markdown интерфейса. По умолчанию нет: на чертеже это
 # до 100 тыс. символов на лист. Данные остаются в поле fragments и в файле
@@ -165,6 +165,33 @@ def dedupe_fragment_lines(text: str, *, min_len: int = 8) -> tuple[str, int]:
     return result, removed
 
 
+def page_tables(pdf_path: Path, page_number: int) -> list[str]:
+    """Таблицы листа как GFM, собранные из текстового слоя PDF без модели.
+
+    Зачем отдельно от «Текста с листа». В потоке слов таблица нечитаема: у
+    инженера на экране оказывается лента значений, в которой не видно, к какой
+    строке относится «0.389». Сетку и координаты слов PDF знает точно, поэтому
+    таблица собирается детерминированно, в том же виде, что в документе, и без
+    единого шанса на выдумку. Модель на таблицы больше не нужна.
+
+    На сканах и там, где сетки нет, возвращается пустой список — секции просто
+    не будет.
+    """
+    try:
+        import fitz
+
+        from deglyph import map_for_doc
+        from pdf_tables import frames_for_doc, page_tables_md
+
+        with fitz.open(pdf_path) as doc:
+            page = doc[page_number - 1]
+            return page_tables_md(page, map_for_doc(doc, quiet=True), frames_for_doc(doc))
+    except Exception:
+        # Таблицы — добавка к листу, а не его содержимое: если сборка упала,
+        # лист всё равно должен доехать до фронтенда.
+        return []
+
+
 def build_page_markdown(
     *,
     page_number: int,
@@ -177,6 +204,7 @@ def build_page_markdown(
     note: str = "",
     fragments_summary: str = "",
     layer_is_source: bool = False,
+    tables: list[str] | None = None,
 ) -> str:
     parts = [
         f"# Лист {page_number}",
@@ -202,6 +230,14 @@ def build_page_markdown(
         parts += [clean_b, ""]
     elif fragments_summary:
         parts += ["## Извлечение по фрагментам", "", fragments_summary, ""]
+    # Таблицы идут ПЕРЕД сырым текстом: инженеру нужна структура, а не поток
+    # слов, и в потоке та же таблица уже развалена на отдельные значения.
+    if tables:
+        parts += ["## Таблицы листа (из PDF)", ""]
+        for i, table_md in enumerate(tables, start=1):
+            if len(tables) > 1:
+                parts += [f"**Таблица {i}**", ""]
+            parts += [table_md, ""]
     # Текст из PDF не печатаем, когда описание листа само собрано из него:
     # иначе один и тот же текст идёт на экран двумя блоками подряд.
     if layer_text.strip() and not layer_is_source:
@@ -209,7 +245,7 @@ def build_page_markdown(
     # Паспорт (kind, размер листа, причины классификации) — служебная
     # диагностика конвейера. Инженеру она не нужна и читается как третий
     # пересказ тех же меток, поэтому уходит отдельным полем, а не в markdown.
-    if not any(s.strip() for s in (pass_a, pass_b, layer_text)):
+    if not any(s.strip() for s in (pass_a, pass_b, layer_text)) and not tables:
         parts += ["_С листа пока ничего не извлечено._", ""]
     return "\n".join(parts).rstrip() + "\n"
 
@@ -239,6 +275,7 @@ def page_to_frontend(
         or kind_from_page(pdf_path, page_number)
     )
     layer_text = page_layer_text(pdf_path, page_number)
+    tables = page_tables(pdf_path, page_number)
 
     fragments, removed = ("", 0)
     if pass_b.strip():
@@ -264,6 +301,7 @@ def page_to_frontend(
         layer_text=layer_text,
         fragments_summary=summary,
         layer_is_source=layer_is_source,
+        tables=tables,
     )
     return {
         "pageNumber": page_number,
@@ -275,6 +313,9 @@ def page_to_frontend(
         "passport": pass_0.strip(),
         # Текст листа взят из PDF дословно, модель его не читала.
         "textFromLayer": layer_is_source,
+        # Таблицы листа отдельным полем: клиенту может понадобиться отрисовать
+        # их самому, а не искать в готовом markdown.
+        "tables": tables,
         # Полное извлечение по фрагментам — для клиентов, которым нужна
         # каждая марка (сверка с ТЗ), а не читаемость.
         "fragments": fragments,
