@@ -104,8 +104,8 @@ Qwen3.6 — thinking-гибриды: без `enable_thinking: false` (`NO_THINK_
 вместо реальной организации), латинизируют шифры. `glm-46v-flash` — искажает фразы.
 `qwen2.5-vl-72b` — тотальная латинизация кириллицы (В1 → B1, ИГЭ → IGE).
 `llama4-scout` — выдумывает марки оборудования. `deepseek-ocr` через HF API — уходит
-в петли и греческий мусор. Полная история отбора — [`HF_MODEL_CANDIDATES.md`](HF_MODEL_CANDIDATES.md),
-журнал отрицательных результатов — [`LOOP_LEDGER.md`](LOOP_LEDGER.md).
+в петли и греческий мусор. История отбора моделей и журнал отрицательных результатов
+ведутся локально и в репозиторий не входят.
 
 ### Не-нейросетевые компоненты
 
@@ -159,9 +159,6 @@ python hf_api_bench.py --model qwen3vl-32b --pages 2,4 --high-dpi --zone-crop --
 
 # сборка читаемого итогового Markdown по прогону
 python build_ios2_md.py --run hf_runs/<run_dir> --pdf "документ.pdf" -o итог.md
-
-# постраничная сверка выгрузки с исходником (что потеряно / что выдумано)
-python build_match_viewer.py --md итог.md --pdf "документ.pdf" --pages 1-33
 
 # бесплатный скоринг против текстового слоя PDF (--vlm-only обязателен:
 # иначе метрика меряет сама себя на секциях, собранных из слоя)
@@ -449,8 +446,8 @@ python -m service.smoke_test --url http://сервер:8000 --token СЕКРЕТ
 Все скрипты режут markdown по `## Страница N`, внутри страницы — по
 `### PASS-0 / ### PASS-A / ### PASS-B`. Это API между инструментами: на заголовки
 завязаны `compare_to_etalon.py`, `build_ios2_md.py`, `merge_vlm_ocr.py`,
-`build_best_of.py`, `build_quality_viewer.py`, `build_match_viewer.py`,
-`patch_page_into_run.py`, `build_model_union.py`.
+`build_best_of.py`, `build_quality_viewer.py`, `patch_page_into_run.py`,
+`build_model_union.py`.
 
 ---
 
@@ -465,7 +462,7 @@ python -m service.smoke_test --url http://сервер:8000 --token СЕКРЕТ
 Цифры разных шкал несравнимы — в отчётах всегда указывать, какая именно.
 `score_real_testset.py --self-check` должен давать ~100%, иначе сломан матчер.
 
-**Дисциплина измерений** (выведена болью, подробности в `LOOP_LEDGER.md`):
+**Дисциплина измерений** (выведена болью):
 
 - модели недетерминированны, на сложных страницах разброс между прогонами доходил
   до **55 пунктов** — вывод только по медиане из ≥4 прогонов, отчитываться медианой
@@ -563,10 +560,8 @@ python -m service.smoke_test --url http://сервер:8000 --token СЕКРЕТ
 |---|---|
 | `score_vs_pdftext.py` | скоринг против текстового слоя (полнота + точность чисел) |
 | `compare_to_etalon.py` | rough recall / key-phrase против ручного эталона (`page_map.json`) |
-| `build_match_viewer.py` | постраничная сверка с исходником, потокенная подсветка расхождений |
 | `build_quality_viewer.py` | вьюер «страница PDF слева / Markdown справа» |
-| `build_compare_html.py`, `compare_sheet_aware.py` | сравнение прогонов между собой |
-| `build_report_0815.py` + `report_render.py` + `report_template.html` | сборка HTML-отчёта по прогонам (данные — из `hf_runs/`, журнал изменений — `report_log.json`) |
+| `measure_output.py` | раздутость и достоверность вывода: объём, символов на факт, домыслы |
 | `new_files/pto_scoring_kit/score_real_testset.py` | исторический чек-лист-скоринг |
 
 **Документация**
@@ -574,18 +569,13 @@ python -m service.smoke_test --url http://сервер:8000 --token СЕКРЕТ
 | Файл | Содержание |
 |---|---|
 | `КАК_ЭТО_РАБОТАЕТ.md` | объяснение конвейера простыми словами, без кода |
-| `CLAUDE.md` | инструкции для работы с репозиторием через Claude Code |
-| `HF_MODEL_CANDIDATES.md` | история отбора моделей, замеры волн, цены |
-| `LOOP_LEDGER.md` | журнал итераций и **отрицательных** результатов — читать до того, как предложить идею оттуда повторно |
 | `SERVER_HARDWARE.md` | целевой сервер 4×A16 для локального развёртывания |
 
 **Справочно, в текущем конвейере не используется**
 
-`pdf_to_markdown.py` — исходный Gemini-движок с авто-тайлингом и verification-pass,
-источник идей. `pdf_to_md_ollama.py` — локальный путь через Ollama на RTX 4060 8GB
-(вывод: 8B-модель на целом чертеже залипает в thinking, работает только на кропах
-512–640 px). `pdfplumber_pdf_to_markdown.py`, `test_local_vlm_candidates.py`,
-`loop_bench.py` — инструменты прошлых фаз.
+`pdf_to_md_ollama.py` — локальный путь через Ollama на RTX 4060 8GB (вывод: 8B-модель
+на целом чертеже залипает в thinking, работает только на кропах 512–640 px). Нужен
+`merge_vlm_ocr.py`, который берёт из него чистку текста.
 
 ---
 
