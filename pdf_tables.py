@@ -27,6 +27,14 @@ import fitz
 MIN_ROWS = 2
 MIN_COLS = 2
 MIN_FILL = 0.05  # доля непустых ячеек — грубый отсев пустых сеток
+# Меньше стольких непустых ячеек — это не таблица, а рамочка на чертеже:
+# выноска, штучное обозначение, ярлык у оборудования. На листе 41 таких
+# сеток 2x2 с двумя значениями было десять штук, и каждая шла как таблица.
+MIN_FILLED_CELLS = 6
+# Ячейка, в которой лежит такая доля текста листа, — не ячейка, а рамка.
+SWALLOW_SHARE = 0.35
+# На листах, где текста почти нет, доля скачет от одного слова — не судим.
+SWALLOW_MIN_CHARS = 200
 MIN_MULTI_ROWS = 0.15  # доля строк, где заполнено ≥2 ячеек
 LINE_TOL = 2.0  # px: слова с близким центром по Y — один ярус
 FRAME_SHARE = 0.3  # доля листов, на которых повторяется сетка рамки
@@ -132,17 +140,45 @@ def _to_gfm(rows: list[list[str]]) -> str:
 
 
 def _table_sig(page: fitz.Page, tab) -> tuple:
-    """Отпечаток сетки: размер плюс положение на листе с грубым округлением."""
+    """Отпечаток сетки: положение и размер на листе с грубым округлением.
+
+    Числа строк и колонок в отпечатке НЕТ намеренно. Рамка листа — одна и та
+    же по геометрии, но MuPDF режет её на разное число ячеек: линии чертежа
+    подходят к рамке вплотную и достраивают ей столбцы. На ИОС2 одна и та же
+    рамка выходила как 8x10 на текстовых листах, 18x19 на листе 34, 18x18 на
+    41, 13x11 на 35 — и с номерами в отпечатке совпадала сама с собой только
+    на A4. Из-за этого на планах рамка проходила как содержательная таблица и
+    забирала в одну ячейку весь текст листа.
+    """
     r = fitz.Rect(tab.bbox)
     pr = page.rect
     return (
-        tab.row_count,
-        tab.col_count,
         round(r.x0 / max(pr.width, 1), 1),
         round(r.y0 / max(pr.height, 1), 1),
         round(r.width / max(pr.width, 1), 1),
         round(r.height / max(pr.height, 1), 1),
     )
+
+
+def _swallowed_page(page: fitz.Page, raw: list) -> bool:
+    """В одной ячейке лежит весь лист — значит это рамка, а не таблица.
+
+    Геометрия для такого отсева не годится: MuPDF на A4 склеивает рамку и
+    настоящую таблицу в ОДНУ сетку во весь лист, и правило «во весь лист —
+    рамка» выбрасывало содержимое вместе с ней (лист 44, таблица на 76 строк).
+
+    Работает признак содержания. У рамки вокруг чертежа или прозы внутренних
+    линий нет, поэтому весь свободный текст листа ссыпается в одну ячейку. На
+    ИОС2 разделение полное: у настоящих таблиц самая большая ячейка держит
+    1–20% текста листа, у рамок — 51–97%. Порог посередине, между 20% и 51%.
+    """
+    total = len("".join(page.get_text("text").split()))
+    if total < SWALLOW_MIN_CHARS:
+        return False
+    biggest = max(
+        (len("".join((c or "").split())) for row in raw for c in row), default=0
+    )
+    return biggest >= SWALLOW_SHARE * total
 
 
 def frame_signatures(doc: fitz.Document) -> set[tuple]:
@@ -172,7 +208,7 @@ def frame_signatures(doc: fitz.Document) -> set[tuple]:
     return {
         s
         for s, c in counts.items()
-        if c >= FRAME_SHARE * pages and s[4] >= FRAME_COVER and s[5] >= FRAME_COVER
+        if c >= FRAME_SHARE * pages and s[2] >= FRAME_COVER and s[3] >= FRAME_COVER
     }
 
 
@@ -206,12 +242,16 @@ def page_tables_md(
             continue
         if not raw or len(raw) < MIN_ROWS or len(raw[0]) < MIN_COLS:
             continue
+        if _swallowed_page(page, raw):
+            continue  # рамка листа, в которую ссыпался весь свободный текст
         if glyph_map:  # оценки заполненности считаем уже по починенному тексту
             raw = [
                 ["".join(glyph_map.get(ch, ch) for ch in (c or "")) for c in r]
                 for r in raw
             ]
         filled = sum(1 for r in raw for c in r if (c or "").strip())
+        if filled < MIN_FILLED_CELLS:
+            continue
         if filled / max(1, sum(len(r) for r in raw)) < MIN_FILL:
             continue
         # Штамп/рамка листа тоже распознаётся как «сетка», но у неё почти
