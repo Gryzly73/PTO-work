@@ -3,3 +3,6 @@
 fastapi>=0.115
 uvicorn[standard]>=0.30
 python-multipart>=0.0.9
+# Ходить к Whisper по HTTP (service/transcribe.py). Сам Whisper — отдельная
+# служба на сервере, в зависимости бэкенда не входит.
+httpx>=0.27

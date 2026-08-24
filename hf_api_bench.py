@@ -528,6 +528,180 @@ DEEPSEEK_OCR_PROMPTS = {
 # (штамп/рамка) и на него не опираемся — страница всё равно идёт через тайлы.
 LAYER_MIN_CHARS = 400
 
+# Починка битого ToUnicode живёт в deglyph.py — там же, где выводится
+# подстановка. Здесь только тонкие обёртки, чтобы конвейер не зависел от
+# деталей: слой у листа либо пригоден, либо нет.
+
+
+def glyph_map_for(doc) -> dict[str, str]:
+    """Подстановка «битый глиф → буква» для документа (кэш на процесс)."""
+    from deglyph import map_for_doc
+
+    return map_for_doc(doc)
+
+
+def page_layer_text_fixed(page) -> str:
+    """Текстовый слой листа с починкой сломанного ToUnicode.
+
+    У CAD-PDF слой часто отдаёт кракозябры («ǜодерǱаǸие» вместо «Содержание»),
+    хотя структура текста цела. Порча — посимвольная подстановка, поэтому её
+    снимает таблица, выведенная по самому документу. Так листы, которые раньше
+    считались нечитаемыми и уходили к модели целиком, отдают свой текст точно
+    и бесплатно.
+    """
+    try:
+        from deglyph import page_text_fixed
+
+        return page_text_fixed(page)
+    except Exception:
+        return page.get_text("text") or ""
+
+
+# Сколько текста листа не жалко положить в промпт. Входные токены дешевле
+# выходных, но плотный CAD-лист даёт 11 тыс. символов, и класть их целиком
+# незачем: имена повторяются, а размер промпта бьёт по скорости.
+LAYER_ANCHOR_MAX_CHARS = 6000
+
+
+def layer_anchor_block(page) -> str:
+    """Текст листа из PDF в виде справочника имён для промпта PASS-A.
+
+    Порядок сохраняем (он совпадает с чтением листа), повторы схлопываем:
+    одна метка «В1» стоит на каждом сегменте трубы и в сыром слое встречается
+    сотни раз. Обрезаем по объёму, а не по числу строк — длина строк на
+    чертеже разная.
+    """
+    try:
+        from build_ios2_md import normalize_pdf_text
+
+        text = normalize_pdf_text(page_layer_text_fixed(page))
+    except Exception:
+        return ""
+
+    seen: set[str] = set()
+    kept: list[str] = []
+    size = 0
+    for line in text.splitlines():
+        item = line.strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        if size + len(item) + 1 > LAYER_ANCHOR_MAX_CHARS:
+            kept.append("… (список обрезан)")
+            break
+        kept.append(item)
+        size += len(item) + 1
+    return "\n".join(kept)
+
+
+# На чертеже требования к слою выше, чем на A4 с текстом. Рамка со штампом
+# сама по себе даёт 400+ символов, и по прежнему порогу лист «Ǳ План сетей»
+# считался бы покрытым текстом, хотя в слое только штамп. Пропуск вычитки —
+# решение дорогое в обе стороны, поэтому на графике планка втрое выше.
+LAYER_MIN_CHARS_DRAWING = 1500
+LAYER_MIN_WORDS_DRAWING = 200
+
+# Признаки того, что лист — действительно только текст и модели там делать
+# нечего. Пороги намеренно осторожные: лишний вызов модели стоит минуты,
+# потерянная схема — доверия к системе.
+TEXT_ONLY_MAX_VECTORS = 200  # линии таблиц и подчёркивания — норма
+TEXT_ONLY_MAX_IMAGE_COVER = 0.06  # логотип и рамка занимают ~4% листа
+TEXT_ONLY_BIG_BLOCK_SHARE = 0.05  # блок крупнее — уже рисунок, а не рамка
+TEXT_ONLY_MIN_CHARS = 600
+
+
+def layer_text_for_markdown(page) -> str:
+    """Текст листа из PDF, готовый к показу инженеру.
+
+    Три вещи, без которых слой нельзя выводить как markdown:
+      - починка сломанного ToUnicode (иначе кракозябры);
+      - схлопывание спама одинаковых меток (одна метка на каждом сегменте
+        трубы даёт сотни повторов подряд);
+      - снятие отступов. PyMuPDF при сортировке по координатам сохраняет
+        положение текста пробелами, а строка с четырьмя пробелами в начале —
+        это в markdown блок кода: страница уехала бы в моноширинную рамку.
+    """
+    from build_ios2_md import normalize_pdf_text
+
+    text = normalize_pdf_text(page_layer_text_fixed(page))
+    lines = [line.strip() for line in text.splitlines()]
+    out: list[str] = []
+    for line in lines:
+        if not line and out and not out[-1]:
+            continue  # не больше одной пустой строки подряд
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def page_layer_is_usable(page, num: int | None = None, kind: str | None = None) -> bool:
+    """Можно ли опереться на текстовый слой листа вместо вычитки картинки.
+
+    На графических листах требуем не только читаемости, но и объёма: если в
+    слое лежит один штамп, вычитку тайлами отменять нельзя — подписи с чертежа
+    иначе не попадут никуда.
+    """
+    from build_ios2_md import is_garbled_pdf_text
+
+    try:
+        text = page_layer_text_fixed(page)
+    except Exception as e:
+        print(f"    layer-aware: проверка слоя не удалась ({e})", flush=True)
+        return False
+    text = text.strip()
+    if is_garbled_pdf_text(text):
+        return False
+    if kind in ("plan", "scheme", "mixed", "table"):
+        return (
+            len(text) >= LAYER_MIN_CHARS_DRAWING
+            and len(text.split()) >= LAYER_MIN_WORDS_DRAWING
+        )
+    return len(text) >= LAYER_MIN_CHARS
+
+
+def page_is_text_only(page) -> tuple[bool, str]:
+    """Лист состоит из одного текста — графики, которую надо описывать, нет.
+
+    Проверка нужна там, где мы собираемся вообще не звать модель. Классификация
+    по геометрии этого не даёт: аксонометрическая схема ввода нарисована на
+    обычном A4 и попадает в тип «text», а её текстовый слой читается прекрасно —
+    и лист молча остался бы без описания графики.
+
+    Смотрим на саму отрисовку листа: крупные векторные блоки, общее количество
+    векторов и площадь под растровыми вставками. Сомнение трактуем в пользу
+    модели. Возвращает (да/нет, причина) — причина идёт в лог, чтобы решение
+    было видно в прогоне.
+    """
+    try:
+        area = page.rect.width * page.rect.height
+        if area <= 0:
+            return False, "нулевая площадь листа"
+
+        drawings = page.get_drawings()
+        big = [
+            d
+            for d in drawings
+            if d["rect"].width * d["rect"].height > area * TEXT_ONLY_BIG_BLOCK_SHARE
+        ]
+        if big:
+            return False, f"крупных векторных блоков: {len(big)}"
+        if len(drawings) > TEXT_ONLY_MAX_VECTORS:
+            return False, f"векторов на листе: {len(drawings)}"
+
+        covered = 0.0
+        for img in page.get_images(full=True):
+            for rect in page.get_image_rects(img[0]):
+                covered += rect.width * rect.height
+        if covered > area * TEXT_ONLY_MAX_IMAGE_COVER:
+            return False, f"картинки закрывают {100 * covered / area:.0f}% листа"
+
+        text = page_layer_text_fixed(page).strip()
+        if len(text) < TEXT_ONLY_MIN_CHARS:
+            return False, f"текста мало ({len(text)} симв.)"
+        return True, f"только текст ({len(text)} симв., векторов {len(drawings)})"
+    except Exception as e:
+        # Не смогли посмотреть — значит не знаем, значит зовём модель.
+        return False, f"проверка не удалась: {e}"
+
 # PASS-T: лист-таблица → один вызов «перенеси таблицу как в исходнике».
 # Тайлы таблицу разрывают (шапка в одном фрагменте, строки в другом);
 # после авторотации целый лист в высоком разрешении работает лучше —
@@ -793,6 +967,8 @@ class UsageTotals:
     calls: int = 0
     retries: int = 0
     failed_tiles: int = 0
+    # Листы, которые не удалось прочитать вовсе, — их файл не записан.
+    failed_pages: int = 0
 
     def add(self, usage: dict | None) -> None:
         if not usage:
@@ -810,6 +986,7 @@ class UsageTotals:
             "calls": self.calls,
             "retries": self.retries,
             "failed_tiles": self.failed_tiles,
+            "failed_pages": self.failed_pages,
         }
 
 
@@ -1538,6 +1715,48 @@ def assemble(pages: dict[int, str]) -> str:
     )
 
 
+# Текст, который конвейер вписывает вместо ответа модели, когда вызов упал.
+_ERROR_STUB_RE = re.compile(r"\(ошибк[аи][^)]*\)")
+
+# Служебные строки листа: заголовки проходов, подписи фрагментов, курсивные
+# пометки конвейера. Они есть всегда, моделью не прочитаны.
+_SERVICE_LINE_RE = re.compile(r"^(?:#{1,6}\s|-{2,}\s|_[^_]*_\s*$)")
+
+# Секции, которые конвейер пишет сам и без модели: паспорт листа (геометрия
+# PDF) и пометка о пропущенном проходе. Содержимого листа в них нет, и считать
+# их за прочитанный текст нельзя — иначе лист, где модель не ответила ни разу,
+# выглядит наполненным.
+_CONVEYOR_SECTION_RE = re.compile(r"^### PASS-0\b|^### PASS-\S* пропущен")
+
+# Меньше стольких значащих символов вне служебных секций — читать нечего.
+MIN_PAGE_CONTENT_CHARS = 40
+
+
+def page_is_all_errors(content: str) -> bool:
+    """Лист, от которого не осталось ничего, кроме паспорта и текстов ошибок.
+
+    Зачем. При обрыве провайдера все вызовы листа падают, а лист всё равно
+    записывался в `pages/page_NNNN.md` — с одним лишь «(ошибка тайла: …)»
+    внутри. Дальше и CLI, и сервис считают готовым любой существующий файл
+    листа (`service/worker.py`: `page_file(...).exists()`), поэтому такой лист
+    не пересчитывался уже никогда: обрыв сети превращался в тихую дыру в
+    документе. Прогон 20260823_192351 — ровно этот случай: failed_tiles=43,
+    две страницы из трёх состоят из текста ошибки.
+
+    Паспорт (PASS-0) в расчёт не идёт: он строится по геометрии PDF локально и
+    есть даже там, где модель не ответила ни разу.
+    """
+    sections = re.split(r"(?m)^(?=### )", content)
+    tail = "".join(s for s in sections if not _CONVEYOR_SECTION_RE.match(s))
+    meaningful = 0
+    for line in tail.splitlines():
+        line = _ERROR_STUB_RE.sub("", line).strip()
+        if not line or _SERVICE_LINE_RE.match(line):
+            continue
+        meaningful += sum(1 for ch in line if ch.isalnum())
+    return meaningful < MIN_PAGE_CONTENT_CHARS
+
+
 def union_texts(variants: list[str]) -> str:
     """Объединяет N прогонов одной страницы: уникальные строки (первое вхождение),
     борьба с nondeterminism ростом recall.
@@ -1589,6 +1808,8 @@ def run_vlm(
     sheet_aware: bool = False,
     table_pages: set[int] | None = None,
     layer_aware: bool = False,
+    lean: bool = False,
+    layer_anchors: bool = False,
 ) -> Path:
     usage = usage or UsageTotals()
     doc = fitz.open(pdf)
@@ -1615,6 +1836,16 @@ def run_vlm(
             render_budget(passport.kind, page_max) if passport is not None else None
         )
 
+        # Проверку текстового слоя делаем ДО PASS-A: от неё зависит, будет ли
+        # вообще вычитка тайлами, а значит — нужен ли зональный retry описания
+        # (в lean-режиме вычитка и описание больше не дублируют друг друга,
+        # поэтому подменять одно другим нельзя).
+        layer_ok = False
+        if layer_aware:
+            layer_ok = page_layer_is_usable(
+                page, num, passport.kind if passport is not None else None
+            )
+
         local_page_max = page_max
         local_tile_max = tile_max
         local_max_tiles = max_tiles
@@ -1639,7 +1870,7 @@ def run_vlm(
         w, h = im.size
         base_tile_prompt = tile_prompt_for(spec, ocr_prompt, page_num=num)
         prompt = (
-            prompt_tile_for(passport.kind, base_tile_prompt)
+            prompt_tile_for(passport.kind, base_tile_prompt, lean)
             if passport is not None
             else base_tile_prompt
         )
@@ -1655,18 +1886,77 @@ def run_vlm(
                 flush=True,
             )
 
+        # ── Текстовый лист с исправным слоем: модель не нужна ────────────
+        # На таком листе (пояснительная записка, содержание, титул) вся
+        # информация — текст, и в PDF он лежит точнее, чем его вычитает VLM:
+        # без латинизации, без выдуманных номеров пунктов. Раньше сюда уходило
+        # ~8 тыс. токенов вывода на лист, а в комплекте на 1000 страниц таких
+        # листов сотни. Решение принимается по качеству слоя, а не по номеру
+        # страницы, поэтому на скане или битом ToUnicode всё работает как раньше.
+        # Пропускаем модель только там, где на листе действительно нечего
+        # описывать. Одной классификации мало: схема ввода нарисована на A4 и
+        # тоже попадает в тип «text», поэтому решает разбор самой отрисовки.
+        text_from_layer = False
+        if lean and layer_ok and passport is not None and passport.kind == "text":
+            text_from_layer, why_text = page_is_text_only(page)
+            if not text_from_layer:
+                print(
+                    f"  p{num}: лист похож на текстовый, но {why_text} — "
+                    "считаем моделью",
+                    flush=True,
+                )
+        if text_from_layer:
+            layer_md = layer_text_for_markdown(page)
+            print(
+                f"  p{num}: текстовый лист, слой исправен "
+                f"({len(layer_md)} симв.) — модель не вызывается",
+                flush=True,
+            )
+            sections.append(
+                "### PASS-A Текст листа (из текстового слоя PDF)\n\n"
+                "_Лист текстовый, слой PDF исправен: текст взят из файла "
+                "дословно, модель не вызывалась._\n\n" + layer_md
+            )
+            return "\n\n".join(sections)
+
         # ── Pass A: целое изображение → описание ─────────────────────────
         if use_two_pass:
             desc_max = min(local_desc_max, max(im.size))
             desc_url = image_to_data_url(im, max_px=desc_max, quality=jpeg_quality)
-            sys_desc = system_for(passport.kind) if passport is not None else SYSTEM_DESC
+            sys_desc = (
+                system_for(passport.kind, lean)
+                if passport is not None
+                else SYSTEM_DESC
+            )
+            # Есть ли точный текст листа, который не надо вычитывать заново:
+            # тогда PASS-A отвечает только за графику, ход систем и связи.
+            over_layer = bool(lean and layer_anchors and layer_ok)
             user_desc = (
-                prompt_desc_for(passport.kind, passport)
+                prompt_desc_for(passport.kind, passport, lean, over_layer)
                 if passport is not None
                 else PROMPT_DESC
             )
+            # Якоря из слоя PDF: у CAD-чертежа все подписи лежат в файле точно —
+            # с диаметрами, марками и штампом. Модели остаётся графика и связи,
+            # а имена она берёт готовыми и не латинизирует их («В1» вместо «B1»).
+            anchors_used = 0
+            if layer_anchors and layer_ok:
+                anchors = layer_anchor_block(page)
+                if anchors:
+                    anchors_used = len(anchors)
+                    user_desc += (
+                        "\n\n### Текст этого листа из PDF (дословно, это точные "
+                        "данные)\n"
+                        "Это ПОЛНЫЙ извлечённый текст листа, он уже есть у "
+                        "инженера — переписывать его в ответ запрещено. Бери "
+                        "отсюда написание имён, марок, диаметров и шифров, а "
+                        "отвечай на то, чего в тексте нет: как идут системы, "
+                        "что где расположено, что означают знаки легенды.\n\n"
+                        + anchors
+                    )
             print(
-                f"  p{num}: PASS-A describe {w}x{h}→{desc_max}px model={spec.hf_id}",
+                f"  p{num}: PASS-A describe {w}x{h}→{desc_max}px model={spec.hf_id}"
+                + (f" +якоря из PDF ({anchors_used} симв.)" if anchors_used else ""),
                 flush=True,
             )
             t0 = time.time()
@@ -1696,14 +1986,65 @@ def run_vlm(
                 desc = f"(ошибка описания: {e})"
 
             if passport is not None:
-                ok, qreasons = pass_a_quality_ok(desc, passport)
+                ok, qreasons = pass_a_quality_ok(desc, passport, lean, over_layer)
                 print(
                     f"    PASS-A quality={'OK' if ok else 'FAIL'} "
                     f"{qreasons or []} {len(desc)} chars "
                     f"tok={local_pass_a_tokens} {time.time()-t0:.1f}s",
                     flush=True,
                 )
-                if not ok:
+                if not ok and lean:
+                    # Вне lean недобор описания добирали зонами: каждая четверть
+                    # листа описывалась заново и приклеивалась к PASS-A. Это и
+                    # давало три расходящиеся версии одного места.
+                    # В lean вычитка — работа PASS-B, поэтому зоны здесь не
+                    # нужны. Если же вычитки не будет (текст берётся из слоя
+                    # PDF), даём описанию ровно одну вторую попытку с указанием,
+                    # чего в нём не хватило.
+                    if layer_ok:
+                        hint = (
+                            "\n\nПредыдущий ответ забракован контролем качества: "
+                            + ", ".join(qreasons)
+                            + ". Сделай разбор заново, целиком, с теми же "
+                            "разделами и без повторов."
+                        )
+                        try:
+                            retry_desc = clean_vlm_text(
+                                call_with_retries(
+                                    lambda: chat_vision(
+                                        client,
+                                        spec.hf_id,
+                                        sys_desc,
+                                        user_desc + hint,
+                                        desc_url,
+                                        max_tokens=local_pass_a_tokens,
+                                        prompt_style=spec.prompt_style,
+                                        usage=usage,
+                                    ),
+                                    retries=retries,
+                                    base_delay=retry_delay,
+                                    usage=usage,
+                                )
+                            )
+                            ok2, _ = pass_a_quality_ok(retry_desc, passport, lean, over_layer)
+                            # Держим лучший: вторая попытка бывает и хуже первой.
+                            if ok2 or len(retry_desc) > len(desc):
+                                desc = retry_desc
+                            print(
+                                f"    PASS-A lean retry: {len(retry_desc)} chars "
+                                f"quality={'OK' if ok2 else 'FAIL'}",
+                                flush=True,
+                            )
+                        except Exception as e:
+                            usage.failed_tiles += 1
+                            print(f"    PASS-A lean retry FAIL {e}", flush=True)
+                    else:
+                        print(
+                            "    PASS-A retry пропущен (lean): текст листа "
+                            "вычитает PASS-B",
+                            flush=True,
+                        )
+                elif not ok:
                     zone_bits: list[str] = []
                     z_im = render_page(page, max(local_page_max, 3600))
                     for zlabel, zcrop, zprompt in generic_describe_zones(
@@ -1862,21 +2203,10 @@ def run_vlm(
         # страницы; при битом ToUnicode или его отсутствии всё работает как
         # раньше.
         if layer_aware:
-            try:
-                from build_ios2_md import is_garbled_pdf_text
-
-                raw_layer = page.get_text("text")
-                layer_ok = (
-                    len(raw_layer.strip()) >= LAYER_MIN_CHARS
-                    and not is_garbled_pdf_text(raw_layer)
-                )
-            except Exception as e:
-                print(f"    layer-aware: проверка слоя не удалась ({e})", flush=True)
-                layer_ok = False
             if layer_ok:
                 print(
-                    f"  p{num}: layer-aware — текстовый слой исправен "
-                    f"({len(raw_layer.strip())} симв.), PASS-B пропущен",
+                    f"  p{num}: layer-aware — текстовый слой исправен, "
+                    "PASS-B пропущен",
                     flush=True,
                 )
                 sections.append(
@@ -2113,6 +2443,19 @@ def run_vlm(
                 print(f"  p{num}: RUN {ri + 1}/{runs}", flush=True)
             variants.append(_extract_page(num))
         content = union_texts(variants)
+        if page_is_all_errors(content):
+            # Файл НЕ пишем сознательно: и CLI, и сервис считают лист готовым
+            # по факту существования `pages/page_NNNN.md`. Записанный лист из
+            # одних ошибок навсегда остался бы дырой в документе, а
+            # отсутствующий пересчитается при следующем запуске.
+            usage.failed_pages += 1
+            print(
+                f"  p{num}: НЕ ЗАПИСАН — ни один вызов модели не удался "
+                f"({len(content)} симв. служебного текста); "
+                "лист пересчитается при следующем прогоне",
+                flush=True,
+            )
+            continue
         (out_dir / "pages").mkdir(exist_ok=True)
         pages_dir = out_dir / "pages"
         pages_dir.mkdir(exist_ok=True)
@@ -2294,6 +2637,20 @@ def main() -> int:
         "(тайлы): текст и таблицы берутся из слоя точно и бесплатно",
     )
     ap.add_argument(
+        "--lean",
+        action="store_true",
+        help="разделить роли проходов: PASS-A — смысл листа один раз, PASS-B — "
+        "только вычитка текста. Без него каждый проход описывает лист заново, "
+        "и один факт приходит по четыре раза (см. measure_output.py)",
+    )
+    ap.add_argument(
+        "--layer-anchors",
+        action="store_true",
+        help="класть текст листа из PDF в промпт PASS-A как справочник имён "
+        "(работает вместе с --lean --layer-aware): модель берёт марки и "
+        "диаметры готовыми, а не вычитывает их с картинки",
+    )
+    ap.add_argument(
         "--zone-crop",
         action="store_true",
         help="Зональные кропы экспликации/легенды/таблиц (ОДИ/КР).",
@@ -2435,6 +2792,10 @@ def main() -> int:
         tag = "twopass"
     else:
         tag = role
+    if args.lean:
+        # Прогоны с разделёнными ролями проходов должны быть различимы в
+        # hf_runs без чтения meta.json: их сравнивают с обычными бок о бок.
+        tag = f"{tag}-lean"
     out_dir = ROOT / "hf_runs" / f"{stamp}_{spec.id}_{tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2448,6 +2809,8 @@ def main() -> int:
         "two_pass": bool(args.two_pass),
         "sheet_aware": bool(args.sheet_aware),
         "layer_aware": bool(args.layer_aware),
+        "lean": bool(args.lean),
+        "layer_anchors": bool(args.layer_anchors),
         "runs": args.runs,
         "synth": args.synth,
         "provider": provider,
@@ -2515,6 +2878,8 @@ def main() -> int:
                 ),
                 sheet_aware=args.sheet_aware,
                 layer_aware=args.layer_aware,
+                lean=args.lean,
+                layer_anchors=args.layer_anchors,
             )
             if args.pipeline:
                 if not ocr_dir or not Path(ocr_dir).exists():

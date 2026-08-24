@@ -111,6 +111,10 @@ MODEL = _env_str("PTO_MODEL", "qwen3vl-32b")
 PROVIDER = _env_str("PTO_PROVIDER")  # None → resolve_provider подставит preferred
 
 SHEET_AWARE = _env_bool("PTO_SHEET_AWARE", True)
+# Разделение ролей проходов: PASS-A описывает лист один раз, PASS-B только
+# вычитывает текст. Без него каждый проход пересказывает лист целиком — один
+# факт приходит по четыре раза, разными словами и с разными ошибками.
+LEAN = _env_bool("PTO_LEAN", True)
 TWO_PASS = _env_bool("PTO_TWO_PASS", True)
 LAYER_AWARE = _env_bool("PTO_LAYER_AWARE", True)
 HIGH_DPI = _env_bool("PTO_HIGH_DPI", False)
@@ -158,6 +162,19 @@ MAX_UPLOAD_BYTES = _env_int("PTO_MAX_UPLOAD_MB", 400) * 1024 * 1024
 # дёргает healthcheck контейнера, которому секрет передавать некуда.
 API_TOKEN = _env_str("PTO_API_TOKEN", "") or ""
 
+# ── Расшифровка голосовых замечаний (Whisper) ─────────────────────────────
+# Сам Whisper живёт отдельно, бэкенд к нему только ходит. Способ выбирается
+# автоматически: задан URL — идём по HTTP, стоит faster-whisper — считаем в
+# процессе, режим mock — отдаём заглушку. Подробности — service/transcribe.py.
+WHISPER_MODE = (_env_str("PTO_WHISPER_MODE", "auto") or "auto").lower()
+# Эндпоинт, совместимый с OpenAI Audio API, целиком:
+# http://127.0.0.1:9000/v1/audio/transcriptions
+WHISPER_URL = _env_str("PTO_WHISPER_URL", "") or ""
+WHISPER_TOKEN = _env_str("PTO_WHISPER_TOKEN", "") or ""
+WHISPER_MODEL = _env_str("PTO_WHISPER_MODEL", "whisper-1") or "whisper-1"
+# Проектная документация русская — язык не угадываем, а задаём.
+WHISPER_LANGUAGE = _env_str("PTO_WHISPER_LANGUAGE", "ru") or "ru"
+
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -172,6 +189,7 @@ def profile_dict() -> dict:
         "model": MODEL,
         "provider": PROVIDER,
         "sheetAware": SHEET_AWARE,
+        "lean": LEAN,
         "twoPass": TWO_PASS,
         "layerAware": LAYER_AWARE,
         "highDpi": HIGH_DPI,

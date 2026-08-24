@@ -208,16 +208,24 @@ def build(
             _cov = coverage(doc, _m)
             _ver = verify(doc, _m, _vlm_text)
             glyph_stats = {"cov": _cov, "ver": _ver}
-            if (_cov["pct"] or 0) >= 90 and (_ver["pct"] or 0) >= 85:
+            # Гейт по прямому результату: доля битых слов, в которых после
+            # починки не осталось подменённых глифов. Словарная доля
+            # (`ver["pct"]`) для этого не годится — подстановка достраивается
+            # сдвигом кодовой таблицы и открывает редкие заглавные термины
+            # («ХОЛДИНГ», «ЭКСПЛИКАЦИЯ»), которых в словаре документа нет по
+            # природе: чем лучше работает починка, тем ниже была бы оценка.
+            _clean = _ver.get("pct_clean", _ver.get("pct")) or 0
+            if (_cov["pct"] or 0) >= 90 and _clean >= 90:
                 glyph_map = _m
                 print(
                     f"текстовый слой починен: {_cov['glyphs']} глифов, "
-                    f"{_cov['pct']}% символов, слов в словаре {_ver['pct']}%"
+                    f"{_cov['pct']}% символов, слов раскодировано {_clean}% "
+                    f"(из них в словаре {_ver['pct']}%)"
                 )
             else:
                 print(
                     f"починка слоя отклонена гейтом: символов {_cov['pct']}%, "
-                    f"слов {_ver['pct']}% (нужно 90% и 85%)"
+                    f"слов раскодировано {_clean}% (нужно 90% и 90%)"
                 )
     except Exception as e:
         print(f"починка слоя пропущена: {e}")
@@ -251,18 +259,37 @@ def build(
     if main_code:
         print(f"шифр документа из штампов: {main_code} ({doc_codes[main_code]} листов)")
 
+    # Импорт локальный: deglyph сам импортирует этот модуль (is_garbled_pdf_text),
+    # на уровне модуля вышел бы цикл.
+    try:
+        from deglyph import is_broken_any, page_raw_text
+    except Exception:  # pragma: no cover — без deglyph работаем как раньше
+        from deglyph import is_broken_char as is_broken_any  # type: ignore
+
+        def page_raw_text(page):
+            return page.get_text("text")
+
     skipped_garbled = 0
     for n in range(1, total + 1):
         body = run_pages.get(n, "")
         pass_0, pass_a, pass_b = extract_pass(body)
         page = doc[n - 1]
-        raw_text = page.get_text("text")
+        raw_text = page_raw_text(page)
         garbled = is_garbled_pdf_text(raw_text)
         repaired = False
-        if garbled and glyph_map:
+        if glyph_map:
             fixed = "".join(glyph_map.get(c, c) for c in raw_text)
-            if not is_garbled_pdf_text(fixed):
-                raw_text, garbled, repaired = fixed, False, True
+            # Чиним по наличию подменённых символов, а не по вердикту «весь
+            # лист кракозябры». На плане штамп и подписи набраны разными
+            # шрифтами: доля порчи мала, лист проходит как читаемый — и
+            # отметки «112.25» так и остаются управляющими кодами, которые
+            # normalize_pdf_text молча выбросит.
+            before = sum(1 for c in raw_text if is_broken_any(c))
+            after = sum(1 for c in fixed if is_broken_any(c))
+            better = after < before and (not garbled or not is_garbled_pdf_text(fixed))
+            if better:
+                raw_text, repaired = fixed, True
+                garbled = is_garbled_pdf_text(raw_text)
         pdf_text = normalize_pdf_text(raw_text)
         drawing = is_drawing_page(page)
         use_tiles = (

@@ -25,10 +25,19 @@ env/
 # === Документы заказчика и тестовые данные ===
 *.pdf
 *.docx
+*.doc
 *.xlsx
 *.zip
 *.rar
 *.7z
+# Исходники в AutoCAD: комплект стадии П — 214 МБ, 94 чертежа. В репозиторий
+# не кладём по той же причине, что и PDF заказчика.
+*.dwg
+*.dwl
+*.dwl2
+*.dst
+*.bak
+1. Стадия П DWG/
 ЭТАЛОН*/
 new_files/*
 !new_files/pto_scoring_kit/
@@ -39,6 +48,8 @@ new_files/pto_scoring_kit/*
 # === Результаты прогонов (регенерируется запуском раннера) ===
 hf_runs/
 hf_runs_mock/
+# Логи и отчёты замеров качества вывода (measure_output.py)
+bench_lean/
 bench_*.md
 bench_*.md.meta.json
 bench_*.md.pages/
@@ -73,10 +84,27 @@ match_viewer*/
 IC_PARK_*
 WORKFLOW_PTO_CHECK.md
 NEXT_PHASE_research.md
-ТЕРМИНОЛОГИЯ.md
-README_ЛОКАЛЬНЫЙ.md
-УСЛОВНЫЕ_ОБОЗНАЧЕНИЯ_В_ИДЕАЛ.md
-ОБЗОР_ИОС2_FINAL_READABLE.md
+# Инструкции для Claude Code и журналы исследования: ведутся для себя, живут
+# локально. В продукт не входят, команде не нужны, а в diff'ах только шумят.
+CLAUDE.md
+LOOP_LEDGER.md
+HF_MODEL_CANDIDATES.md
+
+# === Инструменты прошлых фаз (в конвейере не используются) ===
+# Сняты с репозитория, но оставлены на диске: в истории git они есть, а из
+# рабочей копии выбрасывать жалко — оттуда брались идеи.
+pdf_to_markdown.py
+pdfplumber_pdf_to_markdown.py
+loop_bench.py
+test_local_vlm_candidates.py
+compare_sheet_aware.py
+build_compare_html.py
+build_match_viewer.py
+# Одноразовый HTML-отчёт от 15.08 (данные всё равно из hf_runs/)
+build_report_0815.py
+report_render.py
+report_template.html
+report_log.json
 
 # === Состояние HTTP-сервиса (очередь и загруженные PDF) ===
 service/state/

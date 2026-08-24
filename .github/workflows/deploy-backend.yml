@@ -45,6 +45,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Нужен, чтобы передать короткий GITHUB_TOKEN на сервер для git fetch
+    # по HTTPS — без Deploy key на стороне GitHub.
+    permissions:
+      contents: read
 
     steps:
       - name: Забрать репозиторий
@@ -95,15 +99,21 @@ jobs:
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH || '/opt/pto/backend' }}
           PROFILE: ${{ inputs.profile || 'real' }}
           WAIT_FOR_IDLE: ${{ inputs.wait_for_idle || '0' }}
+          # Токен не кладём в argv ssh (видно в ps) — первой строкой в stdin.
+          PTO_GITHUB_TOKEN: ${{ github.token }}
         run: |
-          ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" \
+          {
+            printf '%s\n' "$PTO_GITHUB_TOKEN"
+            cat deploy/deploy.sh
+          } | ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" \
               -o BatchMode=yes -o ServerAliveInterval=30 \
               "$DEPLOY_USER@$DEPLOY_HOST" \
-              "PTO_BACKEND_DIR='$DEPLOY_PATH' \
-               PTO_PROFILE='$PROFILE' \
-               PTO_DEPLOY_REF='origin/${{ github.ref_name }}' \
-               PTO_DEPLOY_WAIT='$WAIT_FOR_IDLE' \
-               bash -s" < deploy/deploy.sh
+              "read -r PTO_GITHUB_TOKEN; export PTO_GITHUB_TOKEN; \
+               export PTO_BACKEND_DIR='$DEPLOY_PATH' \
+                      PTO_PROFILE='$PROFILE' \
+                      PTO_DEPLOY_REF='origin/${{ github.ref_name }}' \
+                      PTO_DEPLOY_WAIT='$WAIT_FOR_IDLE'; \
+               bash -s"
 
       - name: Убрать ключ
         if: always()
