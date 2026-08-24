@@ -34,7 +34,12 @@ from service.jobs import (
     JobStore,
     now_iso,
 )
-from service.pipeline import Pipeline, PipelineError, pdf_page_count
+from service.pipeline import (
+    Pipeline,
+    PipelineError,
+    document_sheets,
+    is_vector,
+)
 from service.transcribe import TranscribeError, transcribe
 from service.transcribe import describe as whisper_describe
 from service.worker import Worker, load_page_json
@@ -166,7 +171,7 @@ def _create_job(
     pages_spec: str | None,
 ):
     try:
-        total = pdf_page_count(pdf_path)
+        total = document_sheets(pdf_path)
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Не удалось прочитать PDF: {error}")
     if total == 0:
@@ -301,10 +306,18 @@ async def create_job(
     (когда сервис стоит рядом с фронтом и видит его uploads/).
     """
     if file is not None:
-        if not (file.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Принимаются только PDF")
+        name = (file.filename or "").lower()
+        # DWG и DXF принимаем наравне с PDF: у чертежа текст, слои и размеры
+        # лежат данными, и лист читается точнее, чем из отрисованной страницы.
+        suffix = next(
+            (s for s in (".pdf", ".dwg", ".dxf") if name.endswith(s)), ""
+        )
+        if not suffix:
+            raise HTTPException(
+                status_code=400, detail="Принимаются PDF, DWG и DXF"
+            )
         config.ensure_dirs()
-        target = config.UPLOADS_DIR / f"{uuid.uuid4()}.pdf"
+        target = config.UPLOADS_DIR / f"{uuid.uuid4()}{suffix}"
         size = 0
         with target.open("wb") as sink:
             while chunk := await file.read(1024 * 1024):

@@ -26,9 +26,28 @@ def page_file(run_dir: Path, page_number: int) -> Path:
     return run_dir / "pages" / f"page_{page_number:04d}.md"
 
 
+# Чертежи AutoCAD. Для них конвейер работает иначе: текст, слои и размеры
+# лежат в файле данными, поэтому модель не вызывается вовсе — ни в режиме
+# real, ни в mock. Подробности — dwg_sheets.py.
+VECTOR_SUFFIXES = {".dwg", ".dxf"}
+
+
+def is_vector(path: Path) -> bool:
+    return path.suffix.lower() in VECTOR_SUFFIXES
+
+
 def pdf_page_count(pdf_path: Path) -> int:
     with fitz.open(pdf_path) as doc:
         return doc.page_count
+
+
+def document_sheets(path: Path) -> int:
+    """Сколько листов в документе: страницы PDF или листы чертежа."""
+    if is_vector(path):
+        from dwg_sheets import sheet_count
+
+        return sheet_count(path)
+    return pdf_page_count(path)
 
 
 class Pipeline:
@@ -81,8 +100,17 @@ class Pipeline:
     # --- работа -------------------------------------------------------------
     def run_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> dict:
         """Считает один лист. Возвращает markdown, usage и время."""
-        self.prepare()
         started = time.time()
+        if is_vector(pdf_path):
+            # Чертёж читается как данные: ни токена, ни модели не нужно,
+            # поэтому и prepare() здесь не к месту — он требует HF_TOKEN.
+            raw = self._vector_page(pdf_path, page_number, run_dir)
+            return {
+                "markdown": raw,
+                "usage": {},
+                "elapsed": round(time.time() - started, 1),
+            }
+        self.prepare()
         if self.mode == "mock":
             raw = self._mock_page(pdf_path, page_number, run_dir)
             usage: dict = {}
@@ -93,6 +121,30 @@ class Pipeline:
             "usage": usage,
             "elapsed": round(time.time() - started, 1),
         }
+
+    def _vector_page(self, path: Path, page_number: int, run_dir: Path) -> str:
+        """Лист чертежа. Модель не вызывается: всё нужное лежит в файле."""
+        from dwg_sheets import page_markdown
+
+        try:
+            body, kind = page_markdown(path, page_number)
+        except IndexError as e:
+            raise PipelineError(str(e)) from e
+        except Exception as e:
+            raise PipelineError(
+                f"Не удалось прочитать чертёж: {e}. Для DWG нужен конвертер "
+                "dwg2dxf или ODA File Converter (путь в PTO_DWG2DXF); DXF "
+                "читается без него."
+            ) from e
+        # Тип листа кладём в паспорт: конвертер PDF берёт его из PASS-0, и
+        # тем же способом он доедет до интерфейса.
+        nl = chr(10)
+        head = f"### PASS-0 kind{nl}{nl}- kind: `{kind}`{nl}{nl}"
+        body = head + body
+        target = page_file(run_dir, page_number)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        return body
 
     def _real_page(self, pdf_path: Path, page_number: int, run_dir: Path):
         import hf_api_bench as hb

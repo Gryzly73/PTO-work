@@ -231,6 +231,7 @@ def build_page_markdown(
     fragments_summary: str = "",
     layer_is_source: bool = False,
     tables: list[str] | None = None,
+    text_title: str = "Текст с листа (из PDF, дословно)",
 ) -> str:
     parts = [
         f"# Лист {page_number}",
@@ -267,7 +268,7 @@ def build_page_markdown(
     # Текст из PDF не печатаем, когда описание листа само собрано из него:
     # иначе один и тот же текст идёт на экран двумя блоками подряд.
     if layer_text.strip() and not layer_is_source:
-        parts += ["## Текст с листа (из PDF, дословно)", "", layer_text.strip(), ""]
+        parts += [f"## {text_title}", "", layer_text.strip(), ""]
     # Паспорт (kind, размер листа, причины классификации) — служебная
     # диагностика конвейера. Инженеру она не нужна и читается как третий
     # пересказ тех же меток, поэтому уходит отдельным полем, а не в markdown.
@@ -295,19 +296,30 @@ def page_to_frontend(
     """
     pass_0, pass_a, pass_b = extract_pass(raw_page_md)
     layer_is_source = bool(_LAYER_SOURCE_RE.search(raw_page_md))
-    kind = (
-        kind_hint
-        or kind_from_passport_md(pass_0)
-        or kind_from_page(pdf_path, page_number)
-    )
-    # Сначала подстановка — с выводом модели как словарём-подсказкой. Иначе на
-    # одностраничном файле и слой, и таблицы приедут кракозябрами.
-    prime_glyph_map(pdf_path, raw_page_md)
-    layer_text = page_layer_text(pdf_path, page_number)
-    tables = page_tables(pdf_path, page_number)
+    # У чертежа ни текстового слоя PDF, ни сеток MuPDF нет и быть не может:
+    # его лист уже разобран конвейером в данные.
+    vector = pdf_path.suffix.lower() in (".dwg", ".dxf")
+    kind = kind_hint or kind_from_passport_md(pass_0)
+    if not kind and not vector:
+        kind = kind_from_page(pdf_path, page_number)
+    kind = kind or "mixed"
+    # Всё PDF-специфичное для чертежа пропускаем.
+    if vector:
+        layer_text, tables = "", []
+    else:
+        # Сначала подстановка — с выводом модели как словарём-подсказкой. Иначе
+        # на одностраничном файле и слой, и таблицы приедут кракозябрами.
+        prime_glyph_map(pdf_path, raw_page_md)
+        layer_text = page_layer_text(pdf_path, page_number)
+        tables = page_tables(pdf_path, page_number)
 
     fragments, removed = ("", 0)
-    if pass_b.strip():
+    # У чертежа PASS-B — не описания тайлов, а точный текст листа: пара
+    # килобайт, ради которых векторный путь и затевался. Прятать его за
+    # «не выводится из-за объёма» бессмысленно, он идёт на экран целиком.
+    if vector:
+        layer_text = pass_b.strip()
+    elif pass_b.strip():
         fragments, removed = dedupe_fragment_lines(pass_b)
 
     summary = ""
@@ -331,6 +343,11 @@ def page_to_frontend(
         fragments_summary=summary,
         layer_is_source=layer_is_source,
         tables=tables,
+        text_title=(
+            "Текст листа (из чертежа, дословно)"
+            if vector
+            else "Текст с листа (из PDF, дословно)"
+        ),
     )
     return {
         "pageNumber": page_number,

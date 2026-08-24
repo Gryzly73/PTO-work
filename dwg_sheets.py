@@ -772,6 +772,57 @@ def build_markdown(path: Path, sheets: list[Sheet], dxf_path: Path) -> str:
     return head + "\n" + "\n\n".join(chunks)
 
 
+# ── Готовое применение: лист чертежа для сервиса ────────────────────────────
+#
+# Сервис считает по листу за вызов и открывает файл заново. Конвертация DWG и
+# разбор DXF на 17 МБ стоят секунды, поэтому результат запоминаем на документ —
+# тем же приёмом, что deglyph.map_for_doc и pdf_tables.frames_for_doc.
+
+_DOC_CACHE: dict[tuple[str, float], tuple[Path, list]] = {}
+
+
+def sheets_for(path: Path) -> tuple[Path, list]:
+    """(путь к DXF, листы) для документа, с кэшем на процесс."""
+    key = (str(path.resolve()), path.stat().st_mtime)
+    cached = _DOC_CACHE.get(key)
+    if cached is None:
+        dxf = to_dxf(path)
+        cached = (dxf, read_sheets(dxf))
+        _DOC_CACHE[key] = cached
+    return cached
+
+
+def sheet_count(path: Path) -> int:
+    """Сколько листов в чертеже — аналог числа страниц у PDF."""
+    return len(sheets_for(path)[1])
+
+
+def page_markdown(path: Path, page_number: int) -> tuple[str, str]:
+    """Лист по порядковому номеру: (markdown, тип листа).
+
+    Нумерация СКВОЗНАЯ по файлу, как страницы PDF: интерфейс листает 1..N.
+    Собственный номер листа в комплекте («22 Фундамент Ф-1») не теряется — он
+    уходит в паспорт, потому что именно на него ссылаются в замечаниях.
+    """
+    import ezdxf
+
+    dxf, sheets = sheets_for(path)
+    if not 1 <= page_number <= len(sheets):
+        raise IndexError(f"в чертеже {len(sheets)} листов, запрошен {page_number}")
+    sheet = sheets[page_number - 1]
+    doc = ezdxf.readfile(str(dxf))
+    unit_code = int(doc.header.get("$INSUNITS", 0) or 0)
+    unit_m = _UNIT_TO_M.get(unit_code, 0.001)
+    layers, blocks = analyse_sheet(doc.modelspace(), sheet, unit_m)
+    body = sheet_markdown(sheet, path.name, layers, blocks)
+    # Сервис нумерует листы сам, поэтому свой заголовок убираем.
+    head, sep, rest = body.partition(chr(10))
+    if head.startswith("## Страница"):
+        body = rest.lstrip()
+    kind = "plan" if any(st.length_m > 0 for st in layers) else "text"
+    return body, kind
+
+
 def main() -> int:
     import argparse
 
