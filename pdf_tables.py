@@ -85,6 +85,48 @@ def _cell_lines(words: list, rect: fitz.Rect) -> list[str]:
     return out
 
 
+def _words_with_glyphs(page: fitz.Page, glyph_map: dict[str, str] | None) -> list:
+    """Слова с координатами, не теряя подменённых глифов.
+
+    `page.get_text("words")` выбрасывает управляющие коды во всех режимах — а
+    это и есть подменённые дефисы и косые сломанного ToUnicode. Из-за этого
+    шифр «28-ХСА-1/25-ИОС2.С» приезжал в ячейку как «28-ХСА-1/25 ИОС2.С»:
+    MuPDF терял символ, а `_cell_lines` видел на его месте зазор и ставил
+    пробел. Для сверки с ТЗ это уже другой шифр, поэтому слова собираем сами
+    из посимвольного разбора, где глиф на месте и его можно починить.
+    """
+    out: list = []
+
+    def flush(chars: list) -> None:
+        if not chars:
+            return
+        x0 = min(b[0] for b, _ in chars)
+        y0 = min(b[1] for b, _ in chars)
+        x1 = max(b[2] for b, _ in chars)
+        y1 = max(b[3] for b, _ in chars)
+        out.append((x0, y0, x1, y1, "".join(c for _, c in chars)))
+
+    try:
+        data = page.get_text("rawdict")
+    except Exception:
+        return list(page.get_text("words"))
+    for block in data.get("blocks", ()):
+        for line in block.get("lines", ()):
+            for span in line.get("spans", ()):
+                chars: list = []
+                for ch in span.get("chars", ()):
+                    c = ch.get("c", "")
+                    if glyph_map:
+                        c = glyph_map.get(c, c)
+                    if not c or c.isspace():
+                        flush(chars)
+                        chars = []
+                        continue
+                    chars.append((ch.get("bbox"), c))
+                flush(chars)
+    return out
+
+
 def _md_escape(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ").strip()
 
@@ -117,6 +159,70 @@ def _drop_empty_columns(rows: list[list[str]]) -> list[list[str]]:
     if not keep or len(keep) == width:
         return rows
     return [[r[i] for i in keep] for r in rows]
+
+
+# Слова основной надписи по ГОСТ 21.101. Набор универсален для российской
+# проектной документации: штамп есть на каждом листе любого комплекта, и ни к
+# какому конкретному документу эти слова не привязаны.
+_STAMP_WORDS = (
+    "изм.", "кол.уч", "кол. уч", "№док", "№ док", "подп.", "инв. № подл",
+    "взам. инв", "взаим. инв", "стадия", "листов", "разраб", "провер",
+    "н.контр", "гип", "согласовано", "формат", "копировал",
+)
+
+# Столько разных слов штампа должно найтись, чтобы признать хвост сетки
+# основной надписью. Одного «Лист» или «Дата» мало — они бывают и в таблице.
+STAMP_WORDS_NEEDED = 3
+
+# Колонку с одним-единственным значением на всю таблицу выбрасываем только у
+# широких сеток: там это разлиновка рамки. У узкой таблицы одно значение в
+# колонке — это данные.
+WIDE_GRID_COLS = 6
+
+
+def _stamp_start(rows: list[list[str]]) -> int | None:
+    """С какой строки начинается штамп. None — штампа в сетке нет.
+
+    Зачем. MuPDF часто отдаёт рамку и таблицу ОДНОЙ сеткой: линии таблицы
+    примыкают к рамке и образуют с ней единую разлиновку. Тогда рамку нельзя
+    ни выбросить (уйдёт таблица), ни оставить (в вывод попадают «Изм.»,
+    «Кол.уч», «Инв. № подл.» и десяток пустых колонок). Режем по штампу: он
+    всегда внизу листа, а над ним — содержимое.
+    """
+    half = len(rows) // 2
+    for start in range(half, len(rows)):
+        found = set()
+        for row in rows[start:]:
+            joined = " ".join(c.lower() for c in row if c)
+            for word in _STAMP_WORDS:
+                if word in joined:
+                    found.add(word)
+        if len(found) >= STAMP_WORDS_NEEDED:
+            return start
+    return None
+
+
+def _drop_sparse_columns(rows: list[list[str]]) -> list[list[str]]:
+    """Колонки, в которых нет данных, — это разлиновка рамки, а не таблица."""
+    if not rows:
+        return rows
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    need = 2 if width > WIDE_GRID_COLS else 1
+    keep = [i for i in range(width) if sum(1 for r in rows if r[i].strip()) >= need]
+    if not keep or len(keep) == width:
+        return rows
+    return [[r[i] for i in keep] for r in rows]
+
+
+def _trim_frame(rows: list[list[str]]) -> list[list[str]]:
+    """Убирает из сетки то, что принадлежит рамке листа, а не таблице."""
+    cut = _stamp_start(rows)
+    if cut is not None:
+        rows = rows[:cut]
+    rows = _drop_sparse_columns(rows)
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    return rows
 
 
 def _to_gfm(rows: list[list[str]]) -> str:
@@ -245,12 +351,8 @@ def page_tables_md(
         finder = page.find_tables()
     except Exception:
         return []
-    words = page.get_text("words")  # один раз на страницу, не на ячейку
-    if glyph_map:
-        words = [
-            (w[0], w[1], w[2], w[3], "".join(glyph_map.get(c, c) for c in w[4]), *w[5:])
-            for w in words
-        ]
+    # один раз на страницу, не на ячейку
+    words = _words_with_glyphs(page, glyph_map)
     out: list[str] = []
     for tab in finder.tables:
         if frames and _table_sig(page, tab) in frames:
@@ -295,7 +397,10 @@ def page_tables_md(
         if not grid or len(grid) != len(raw):
             # запасной путь: значения из extract() без расслоения ярусов
             grid = [[[(c or "").strip()] if (c or "").strip() else [] for c in r] for r in raw]
-        out.append(_to_gfm(_destack(grid)))
+        trimmed = _trim_frame(_destack(grid))
+        if len(trimmed) < MIN_ROWS or max((len(r) for r in trimmed), default=0) < MIN_COLS:
+            continue  # после обрезки рамки не осталось таблицы
+        out.append(_to_gfm(trimmed))
     return out
 
 

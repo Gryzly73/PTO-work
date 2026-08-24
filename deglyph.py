@@ -117,7 +117,7 @@ def build_mapping(doc: fitz.Document, extra_text: str = "") -> dict[str, str]:
         return {}
     words = _garbled_words(doc)
     if not words:
-        return detect_glyph_shifts(doc, {})
+        return detect_glyph_shifts(doc, {}, extra_text)
 
     by_len: dict[int, list[str]] = defaultdict(list)
     for w in vocab:
@@ -167,7 +167,7 @@ def build_mapping(doc: fitz.Document, extra_text: str = "") -> dict[str, str]:
     # Цифры и пунктуация — отдельной ступенью и поверх готовых букв: сдвиг
     # проверяется совпадением с исправно набранными токенами документа, а их
     # надо сперва починить, иначе сверять не с чем.
-    mapping.update(detect_glyph_shifts(doc, mapping))
+    mapping.update(detect_glyph_shifts(doc, mapping, extra_text))
     return mapping
 
 
@@ -281,8 +281,13 @@ _NUMERIC_TOKEN_RE = re.compile(r"^[0-9]+(?:[.,][0-9]+)*$")
 # наберёт их тоже, а попасть в готовый токен ему нечем.
 _W_VOCAB, _W_NUMERIC = 3, 1
 
-# Меньше этого веса — свидетельств мало, шрифт не трогаем.
-MIN_SHIFT_SCORE = 12
+# Столько РАЗНЫХ токенов должны подтвердить сдвиг попаданием в словарь. Тот
+# же стандарт, что у буквенного кроссворда: два независимых свидетеля либо
+# один длинный, где случайность исключена. Считать общий вес нельзя — он
+# зависит от объёма документа, и порог, выверенный на 49 листах, отвергал
+# верный сдвиг на выгруженной странице, где битых токенов всего шесть.
+MIN_SHIFT_WITNESSES = 2
+LONG_WITNESS_CHARS = 12
 
 # Во столько раз лучший сдвиг должен обойти второй. Без запаса берём соседний
 # сдвиг, который тоже даёт «числа», но не те.
@@ -290,7 +295,7 @@ SHIFT_MARGIN = 2.0
 
 
 def _font_tokens(
-    doc: fitz.Document, letter_map: dict[str, str]
+    doc: fitz.Document, letter_map: dict[str, str], extra_text: str = ""
 ) -> tuple[dict[str, Counter], Counter]:
     """Битые токены по шрифтам и словарь исправно набранных токенов.
 
@@ -312,6 +317,13 @@ def _font_tokens(
                             garbled[span.get("font", "?")][tok] += 1
                         elif len(tok) >= 2 and not any(is_broken_char(c) for c in tok):
                             clean[tok] += 1
+    # Свидетелем годится и сторонний текст по этому же листу (вывод VLM): в
+    # документе из одного битого листа исправно набранных токенов нет вовсе,
+    # и сдвигу не с чем сверяться — «Содержание (начало)» так и остаётся
+    # «Содержание начало», а шифр теряет дефисы.
+    for tok in extra_text.split():
+        if len(tok) >= 2 and not any(is_broken_any(c) for c in tok):
+            clean[tok] += 1
     return garbled, clean
 
 
@@ -342,7 +354,7 @@ def _token_weight(decoded: str, clean: Counter) -> tuple[int, int]:
 
 
 def detect_glyph_shifts(
-    doc: fitz.Document, letter_map: dict[str, str]
+    doc: fitz.Document, letter_map: dict[str, str], extra_text: str = ""
 ) -> dict[str, str]:
     r"""Подстановка для цифр и пунктуации: {подменённый глиф: символ}.
 
@@ -352,7 +364,7 @@ def detect_glyph_shifts(
     словарём вхождений: на ИОС2 так решается спор за `\x10` между «/» шифра и
     «-» слова «хозяйственно-бытового».
     """
-    garbled, clean = _font_tokens(doc, letter_map)
+    garbled, clean = _font_tokens(doc, letter_map, extra_text)
     if not clean or not garbled:
         return {}
 
@@ -370,18 +382,26 @@ def detect_glyph_shifts(
         scored = []
         for s in range(_ASCII_LO - lo, _ASCII_HI - hi + 1):
             vocab_hits = numeric_hits = 0
+            witnesses: list[str] = []
             for tok, freq in tokens.items():
-                v, n = _token_weight(_apply_shift(tok, s), clean)
+                decoded = _apply_shift(tok, s)
+                v, n = _token_weight(decoded, clean)
                 vocab_hits += freq * v
                 numeric_hits += freq * n
-            scored.append((vocab_hits, numeric_hits, s))
+                if v:
+                    witnesses.append(decoded)
+            scored.append((vocab_hits, numeric_hits, s, witnesses))
         if not scored:
             continue
-        scored.sort(reverse=True)
-        best_vocab, _, shift = scored[0]
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_vocab, _, shift, witnesses = scored[0]
         runner_up = scored[1][0] if len(scored) > 1 else 0
+        strong = len(witnesses) >= MIN_SHIFT_WITNESSES or any(
+            len(w) >= LONG_WITNESS_CHARS for w in witnesses
+        )
         # Гейт — по словарной части: она одна отличает верный сдвиг от соседа.
-        if best_vocab < MIN_SHIFT_SCORE or best_vocab < SHIFT_MARGIN * max(runner_up, 1):
+        # «Похоже на число» даёт и промах на единицу, в счёт не идёт.
+        if not strong or best_vocab < SHIFT_MARGIN * max(runner_up, 1):
             continue
         for tok, freq in tokens.items():
             v, n = _token_weight(_apply_shift(tok, shift), clean)
@@ -519,16 +539,31 @@ _MAPS: dict[str, dict[str, str]] = {}
 MIN_COVERAGE_PCT = 60.0
 
 
-def map_for_doc(doc: fitz.Document, *, quiet: bool = False) -> dict[str, str]:
-    """Подстановка для документа, с кэшем на процесс. {} — чинить нечем."""
+def map_for_doc(
+    doc: fitz.Document, *, quiet: bool = False, extra_text: str = ""
+) -> dict[str, str]:
+    """Подстановка для документа, с кэшем на процесс. {} — чинить нечем.
+
+    extra_text — сторонний текст на том же языке и по той же теме (вывод VLM
+    по этому листу). Кроссворд подбирает буквы по словарю ЧИТАЕМЫХ листов
+    документа, а их может не быть вовсе: инженер открывает выгруженную
+    страницу отдельным файлом, и весь документ — один битый лист. Тогда
+    словаря нет, подстановка пустая и текст остаётся кракозябрами. Текст
+    модели в этой роли работает: слова те же, а его читаемость обеспечена
+    тем, что модель смотрела на картинку, а не на слой.
+    """
     key = getattr(doc, "name", "") or f"id{id(doc)}"
     cached = _MAPS.get(key)
-    if cached is not None:
+    # Пустой результат перепроверяем, если появился словарь-подсказка: первый
+    # вызов мог прийти до того, как модель отработала лист.
+    if cached:
         return cached
+    if cached is not None and not extra_text:
+        return cached  # уже пробовали, подсказки нет — второй раз не считаем
 
     mapping: dict[str, str] = {}
     try:
-        mapping = build_mapping(doc)
+        mapping = build_mapping(doc, extra_text)
         if mapping:
             cov = coverage(doc, mapping)
             # pct=None — букв чинить не пришлось (подстановка только по цифрам
@@ -581,7 +616,7 @@ def page_raw_text(page) -> str:
     return "".join(b[4] for b in blocks if b[6] == 0 and isinstance(b[4], str))
 
 
-def page_text_fixed(page, *, quiet: bool = False) -> str:
+def page_text_fixed(page, *, quiet: bool = False, extra_text: str = "") -> str:
     """Текстовый слой листа с починкой сломанного ToUnicode.
 
     Исправный слой возвращается как есть; неисправный — раскодированным, если
@@ -598,7 +633,7 @@ def page_text_fixed(page, *, quiet: bool = False) -> str:
     # На чертеже штамп и основной текст часто набраны разными шрифтами: доля
     # порчи мала, страница проходит как исправная, а из слоя вываливается
     # «ǨКСПЛИКАЦИǪ ǒДАНИǔ» — то есть ровно то слово, ради которого лист и читают.
-    mapping = map_for_doc(page.parent, quiet=quiet)
+    mapping = map_for_doc(page.parent, quiet=quiet, extra_text=extra_text)
     if not mapping:
         return raw
     fixed = decode(raw, mapping)

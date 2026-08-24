@@ -165,6 +165,32 @@ def dedupe_fragment_lines(text: str, *, min_len: int = 8) -> tuple[str, int]:
     return result, removed
 
 
+def prime_glyph_map(pdf_path: Path, vlm_text: str) -> None:
+    """Готовит подстановку глифов, подсказав ей словарь выводом модели.
+
+    Кроссворд подбирает буквы по словарю ЧИТАЕМЫХ листов документа. Когда
+    инженер открывает одну выгруженную страницу отдельным файлом, читаемых
+    листов нет вовсе: словаря нет, подстановка пустая, и текст остаётся
+    кракозябрами — «ǜодерǱаǸие» вместо «Содержание». Текст модели по этому же
+    листу в роли словаря работает: слова те же, а читаемость обеспечена тем,
+    что модель смотрела на картинку, а не на слой.
+
+    Вызывать ДО чтения слоя и сборки таблиц: подстановка кэшируется на
+    документ, и оба потом берут уже готовую.
+    """
+    if not vlm_text.strip():
+        return
+    try:
+        import fitz
+
+        from deglyph import map_for_doc
+
+        with fitz.open(pdf_path) as doc:
+            map_for_doc(doc, quiet=True, extra_text=vlm_text)
+    except Exception:
+        pass
+
+
 def page_tables(pdf_path: Path, page_number: int) -> list[str]:
     """Таблицы листа как GFM, собранные из текстового слоя PDF без модели.
 
@@ -274,6 +300,9 @@ def page_to_frontend(
         or kind_from_passport_md(pass_0)
         or kind_from_page(pdf_path, page_number)
     )
+    # Сначала подстановка — с выводом модели как словарём-подсказкой. Иначе на
+    # одностраничном файле и слой, и таблицы приедут кракозябрами.
+    prime_glyph_map(pdf_path, raw_page_md)
     layer_text = page_layer_text(pdf_path, page_number)
     tables = page_tables(pdf_path, page_number)
 
