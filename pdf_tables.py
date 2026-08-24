@@ -131,17 +131,56 @@ def _md_escape(s: str) -> str:
     return s.replace("|", "\\|").replace("\n", " ").strip()
 
 
+# Чем заканчивается законченная строка. Если предыдущий ярус кончился не на
+# этом, а следующий начался со строчной буквы — это перенос одного предложения,
+# а не два разных значения.
+_SENTENCE_END = (".", ";", ":", "!", "?", ")", "»")
+
+
+def _join_tiers(lines: list[str]) -> str:
+    """Склеивает ярусы одной ячейки.
+
+    Перенос длинного текста по ширине колонки склеиваем пробелом: в документе
+    это одно предложение, разорванное вёрсткой. Осмысленно отдельные строки
+    (шапка «Кол-во / потребителей», значения «сут / час») разделяем <br>.
+    """
+    out = lines[0]
+    for nxt in lines[1:]:
+        prev = out.rstrip()
+        # Перенос с дефисом: «Повышаю-» + «щий» = «Повышающий».
+        if prev.endswith("-") and nxt[:1].islower():
+            out = prev[:-1] + nxt
+            continue
+        # Хвост слова, оторванный вёрсткой: «потреблени» + «я».
+        if len(nxt) <= 2 and nxt.isalpha() and nxt.islower():
+            out = prev + nxt
+            continue
+        wrapped = bool(prev) and not prev.endswith(_SENTENCE_END) and nxt[:1].islower()
+        out = f"{out} {nxt}" if wrapped else f"{out} <br> {nxt}"
+    return out
+
+
 def _destack(grid: list[list[list[str]]]) -> list[list[str]]:
-    """grid[row][col] = список ярусов → плоские строки таблицы."""
+    """grid[row][col] = список ярусов → плоские строки таблицы.
+
+    Разворачиваем ярусы в отдельные строки ТОЛЬКО когда их подтверждают хотя бы
+    две колонки: в инженерной таблице один логический ряд часто держит два
+    яруса значений (сут/час, норма/факт), и это действительно разные строки.
+
+    Если же заполнена одна колонка, ярусы — это перенос длинного текста по
+    ширине ячейки. Разворачивать его нельзя: пункт «а) сведения о существующих
+    и проектируемых источниках водоснабжения…» превращался в четыре строки
+    таблицы с пустым «Обозначением», хотя в документе это одна ячейка.
+    """
     out: list[list[str]] = []
     for row in grid:
-        counts = {len(c) for c in row if c}
-        if len(counts) == 1 and (k := counts.pop()) > 1:
-            # все непустые ячейки имеют k ярусов → разворачиваем в k строк
+        filled = [c for c in row if c]
+        counts = {len(c) for c in filled}
+        if len(filled) >= 2 and len(counts) == 1 and (k := counts.pop()) > 1:
             for i in range(k):
                 out.append([(c[i] if c else "") for c in row])
         else:
-            out.append([" <br> ".join(c) if c else "" for c in row])
+            out.append([_join_tiers(c) if c else "" for c in row])
     return out
 
 
