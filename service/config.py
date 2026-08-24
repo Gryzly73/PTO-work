@@ -174,6 +174,7 @@ WHISPER_TOKEN = _env_str("PTO_WHISPER_TOKEN", "") or ""
 WHISPER_MODEL = _env_str("PTO_WHISPER_MODEL", "whisper-1") or "whisper-1"
 # Проектная документация русская — язык не угадываем, а задаём.
 WHISPER_LANGUAGE = _env_str("PTO_WHISPER_LANGUAGE", "ru") or "ru"
+WHISPER_TIMEOUT = max(5, _env_int("PTO_WHISPER_TIMEOUT", 60))
 
 
 def ensure_dirs() -> None:
