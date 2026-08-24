@@ -35,6 +35,8 @@ from service.jobs import (
     now_iso,
 )
 from service.pipeline import Pipeline, PipelineError, pdf_page_count
+from service.transcribe import TranscribeError, transcribe
+from service.transcribe import describe as whisper_describe
 from service.worker import Worker, load_page_json
 
 store = JobStore()
@@ -71,7 +73,11 @@ app.add_middleware(
 
 # Открыты без токена. /health дёргает healthcheck контейнера, которому секрет
 # передавать некуда; предполётный OPTIONS браузер шлёт без заголовков.
-_OPEN_PATHS = {"/health"}
+# /transcribe открыт по требованию фронтенда: страница замечаний шлёт запись
+# напрямую из браузера и токен туда не передаёт. Расшифровка ничего не читает
+# и ничего не запускает, так что цена открытого маршрута — только чужая
+# нагрузка на Whisper.
+_OPEN_PATHS = {"/health", "/transcribe"}
 
 
 @app.middleware("http")
@@ -91,7 +97,12 @@ async def require_api_token(request: Request, call_next):
                     header = auth[7:].strip()
             # compare_digest, а не ==, чтобы время ответа не подсказывало,
             # сколько символов угадано.
-            if not secrets.compare_digest(header, config.API_TOKEN):
+            # Сравниваем БАЙТЫ: compare_digest на строках с не-ASCII
+            # бросает TypeError, и токен с кириллицей ронял маршрут в 500
+            # вместо честного 401.
+            if not secrets.compare_digest(
+                header.encode("utf-8"), config.API_TOKEN.encode("utf-8")
+            ):
                 return JSONResponse(
                     status_code=401,
                     content={"detail": "Нужен токен: заголовок X-PTO-Token"},
@@ -245,8 +256,34 @@ def health():
             "canceled": sum(1 for j in jobs if j.status == STATUS_CANCELED),
         },
         "currentJobId": worker.current_job_id,
+        "transcribe": whisper_describe(),
         "time": now_iso(),
     }
+
+
+@app.post("/transcribe")
+async def transcribe_note(audio: UploadFile | None = None):
+    """Голосовое замечание → текст.
+
+    Контракт согласован с фронтендом: multipart, поле `audio`, ответ
+    `{"text": "фраза"}`, при отсутствии файла — 400.
+
+        curl -s -F "audio=@note.webm" http://127.0.0.1:8000/transcribe
+
+    Аудио на диск не кладём: это голос сотрудника, ему незачем оседать на
+    сервере. Файл живёт в памяти столько, сколько идёт запрос.
+    """
+    if audio is None:
+        raise HTTPException(status_code=400, detail="Нет файла: ожидается поле audio")
+    data = await audio.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Пустая запись")
+    try:
+        text = transcribe(data, audio.filename or "note.webm")
+    except TranscribeError as e:
+        # 503, а не 500: сервис жив, не настроена или недоступна расшифровка.
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    return {"text": text}
 
 
 @app.post("/jobs", status_code=201)

@@ -162,6 +162,19 @@ MAX_UPLOAD_BYTES = _env_int("PTO_MAX_UPLOAD_MB", 400) * 1024 * 1024
 # дёргает healthcheck контейнера, которому секрет передавать некуда.
 API_TOKEN = _env_str("PTO_API_TOKEN", "") or ""
 
+# ── Расшифровка голосовых замечаний (Whisper) ─────────────────────────────
+# Сам Whisper живёт отдельно, бэкенд к нему только ходит. Способ выбирается
+# автоматически: задан URL — идём по HTTP, стоит faster-whisper — считаем в
+# процессе, режим mock — отдаём заглушку. Подробности — service/transcribe.py.
+WHISPER_MODE = (_env_str("PTO_WHISPER_MODE", "auto") or "auto").lower()
+# Эндпоинт, совместимый с OpenAI Audio API, целиком:
+# http://127.0.0.1:9000/v1/audio/transcriptions
+WHISPER_URL = _env_str("PTO_WHISPER_URL", "") or ""
+WHISPER_TOKEN = _env_str("PTO_WHISPER_TOKEN", "") or ""
+WHISPER_MODEL = _env_str("PTO_WHISPER_MODEL", "whisper-1") or "whisper-1"
+# Проектная документация русская — язык не угадываем, а задаём.
+WHISPER_LANGUAGE = _env_str("PTO_WHISPER_LANGUAGE", "ru") or "ru"
+
 
 def ensure_dirs() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
