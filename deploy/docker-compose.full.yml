@@ -79,7 +79,9 @@ services:
   # ubuntu (uid 1000) и не сможет записать туда скачанную модель. Тот же приём,
   # что и для общего тома фронтенда ниже.
   whisper-init:
-    image: busybox:1.36
+    # Зеркало вместо Docker Hub: анонимные скачивания там лимитированы по IP
+    # и роняли деплой с 429 при обычной пересборке.
+    image: public.ecr.aws/docker/library/busybox:1.36
     profiles: ["mock", "real"]
     command: sh -c "mkdir -p /cache/huggingface && chown -R 1000:1000 /cache"
     volumes:
@@ -120,7 +122,9 @@ services:
   # Правим владельца здесь, а не в чужом Dockerfile: репозиторий фронтенда не
   # наш. Бэкенд работает от root и читает эти файлы без вопросов.
   data-init:
-    image: busybox:1.36
+    # Зеркало вместо Docker Hub: анонимные скачивания там лимитированы по IP
+    # и роняли деплой с 429 при обычной пересборке.
+    image: public.ecr.aws/docker/library/busybox:1.36
     profiles: ["mock", "real"]
     command: sh -c "mkdir -p /data/uploads /data/data && chown -R 1000:1000 /data"
     volumes:

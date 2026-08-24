@@ -3,7 +3,13 @@
 # Логика запуска та же, что у run-local.bat: настройки берутся из backend/.env
 # (в compose он подключается через env_file), пути задаются переменными,
 # готовность проверяется по /health.
-FROM python:3.12-slim
+# Базовый образ берём НЕ с Docker Hub. Анонимные скачивания там ограничены по
+# IP, и деплой падал на ровном месте: «429 Too Many Requests» при обычной
+# пересборке, притом что сам образ не менялся. public.ecr.aws/docker/library —
+# официальное зеркало Docker Official Images от AWS, те же образы, без лимита.
+# Переопределяется сборочным аргументом: docker build --build-arg PYTHON_IMAGE=...
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+FROM ${PYTHON_IMAGE}
 
 # Tesseract нужен local_ocr.py: OCR углов штампа и авторотация повёрнутых
 # листов через OSD. Без языковых пакетов rus+eng он бесполезен.
