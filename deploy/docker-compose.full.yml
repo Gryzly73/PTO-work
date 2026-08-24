@@ -55,6 +55,10 @@ x-backend-env: &backend-env
   PTO_RUNS_DIR: /runs
   PTO_UPLOADS_DIR: /data/uploads
   PTO_ALLOWED_PDF_ROOTS: /data/uploads
+  # Расшифровка голосовых замечаний. Имя сервиса, а не 127.0.0.1: из контейнера
+  # бэкенда localhost — это он сам, а не хост и не соседний контейнер.
+  PTO_WHISPER_URL: http://whisper:8000/v1/audio/transcriptions
+  PTO_WHISPER_MODEL: Systran/faster-whisper-small
 
 x-frontend: &frontend
   build: ./frontend/pto-drawings
@@ -71,6 +75,45 @@ x-frontend: &frontend
   restart: unless-stopped
 
 services:
+  # Named volume создаётся от root, а speaches работает под пользователем
+  # ubuntu (uid 1000) и не сможет записать туда скачанную модель. Тот же приём,
+  # что и для общего тома фронтенда ниже.
+  whisper-init:
+    image: busybox:1.36
+    profiles: ["mock", "real"]
+    command: sh -c "mkdir -p /cache/huggingface && chown -R 1000:1000 /cache"
+    volumes:
+      - whisper-cache:/cache
+
+  # --- расшифровка голосовых замечаний ---------------------------------------
+  # Инженер надиктовывает замечание во вкладке, бэкенд отдаёт текст маршрутом
+  # POST /transcribe. Отдельным сервисом, а не внутри бэкенда: модель не
+  # раздувает его образ, не ест память того же контейнера, который часами
+  # считает документ, и перезапускается независимо.
+  #
+  # speaches — поддерживаемый преемник faster-whisper-server, отдаёт наружу
+  # протокол OpenAI Audio API (/v1/audio/transcriptions), тот самый, который
+  # умеет service/transcribe.py. Тег зафиксирован: latest на сервере — это
+  # молчаливое обновление в неизвестный момент.
+  #
+  # Модель качается при первом обращении (~500 МБ) и остаётся в томе, поэтому
+  # первый запрос после чистого развёртывания идёт дольше обычного.
+  whisper:
+    image: ghcr.io/speaches-ai/speaches:0.6.2-cpu
+    profiles: ["mock", "real"]
+    container_name: pto-whisper
+    environment:
+      WHISPER__MODEL: Systran/faster-whisper-small
+      # Держать модель загруженной: замечания диктуют пачками, а выгрузка
+      # между ними означала бы ожидание на каждом.
+      WHISPER__TTL: "-1"
+    volumes:
+      - whisper-cache:/home/ubuntu/.cache
+    depends_on:
+      whisper-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
   # --- подготовка общего тома ------------------------------------------------
   # Named volume создаётся от root, а фронтенд в своём образе работает под
   # пользователем node (uid 1000) и падает с EACCES на mkdir /data/data.
@@ -137,6 +180,8 @@ services:
         condition: service_healthy
 
 volumes:
+  # Скачанная модель Whisper переживает пересоздание контейнера.
+  whisper-cache:
   app-data:
   runs:
   state:
