@@ -44,7 +44,11 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Час, а не полчаса: в первый раз образ собирает конвертер DWG из
+    # исходников, и на сервере это занимает больше получаса — прошлый деплой
+    # оборвался ровно на этом, посреди компиляции. Дальше слой кэшируется и
+    # деплой снова укладывается в минуты.
+    timeout-minutes: 60
     # Нужен, чтобы передать короткий GITHUB_TOKEN на сервер для git fetch
     # по HTTPS — без Deploy key на стороне GitHub.
     permissions:
@@ -88,7 +92,22 @@ jobs:
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
           # Без known_hosts ssh спросит подтверждение и повиснет.
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          #
+          # Ошибку keyscan разбираем словами, а не голым «exit 1»: шаг падал,
+          # не сказав ни строчки, и по логу нельзя было понять, что дело не в
+          # ключе и не в секретах, а в том, что сервер не отвечает.
+          if ! ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+            echo "Не удалось получить ключ хоста по SSH (порт $DEPLOY_PORT)."
+            echo "Сервер выключен, недоступен снаружи или SSH слушает другой порт."
+            echo "Вывод ssh-keyscan:"
+            cat /tmp/keyscan.err
+            {
+              echo "### Деплой не начался"
+              echo "Сервер не ответил на SSH по порту $DEPLOY_PORT."
+              echo "Проверьте, что машина поднята и порт открыт; порт задаётся переменной DEPLOY_PORT."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Обновить бэкенд на сервере
         if: steps.guard.outputs.skip != 'yes'
