@@ -9,7 +9,40 @@
 # официальное зеркало Docker Official Images от AWS, те же образы, без лимита.
 # Переопределяется сборочным аргументом: docker build --build-arg PYTHON_IMAGE=...
 ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+
+# --- конвертер DWG → DXF ----------------------------------------------------
+# Чертежи приходят в DWG, а читаем мы DXF. Конвертер приходится собирать
+# самим: LibreDWG нет ни в одном выпуске Debian (проверено по packages.debian.org
+# — пусто во всех, включая sid), а готовых сборок под Linux проект не выкладывает,
+# только исходники. ODA File Converter конвертирует полнее, но тянет Qt,
+# запускается лишь через виртуальный экран и требует принять их EULA — для
+# сервиса, который должен просто работать, это плохой размен.
+#
+# Сборка идёт отдельным слоем: в рабочий образ переезжают только сам dwg2dxf и
+# его библиотека, а компилятор с заголовками остаются здесь.
+FROM ${PYTHON_IMAGE} AS dwgtools
+ARG LIBREDWG_VERSION=0.14
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+RUN curl -fsSL -o libredwg.tar.xz \
+        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+    && tar xf libredwg.tar.xz \
+    && cd "libredwg-${LIBREDWG_VERSION}" \
+    && ./configure --disable-bindings --disable-dependency-tracking --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install-strip DESTDIR=/out \
+    && /out/usr/local/bin/dwg2dxf --version | head -1
+
 FROM ${PYTHON_IMAGE}
+
+# Конвертер и его библиотека. Путь кладём в PTO_DWG2DXF — dwg_sheets.py ищет
+# сначала там, и на сервере поиск по PATH уже не нужен.
+COPY --from=dwgtools /out/usr/local/bin/dwg2dxf /usr/local/bin/dwg2dxf
+COPY --from=dwgtools /out/usr/local/lib/ /usr/local/lib/
+RUN ldconfig && dwg2dxf --version | head -1
+ENV PTO_DWG2DXF=/usr/local/bin/dwg2dxf
 
 # Tesseract нужен local_ocr.py: OCR углов штампа и авторотация повёрнутых
 # листов через OSD. Без языковых пакетов rus+eng он бесполезен.
