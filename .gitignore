@@ -132,3 +132,18 @@ scratch/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# === Локальный GT условных обозначений заказчика ===
+symbols/fixtures/MANIFEST.local.json
+symbols/fixtures/local/
+symbols/fixtures/baselines/page_*.baseline.json
+symbols/fixtures/baselines/page_*.expected.gt.json
+
+# === Локальные прогоны экспериментального symbols-конвейера ===
+/h[0-9]_*/
+/s[0-9]_*/
+/page35*_review.png
+/h*_contact_sheet.png
+
+# Отчёты по конкретному клиентскому PDF остаются рядом с локальными артефактами.
+/docs/active/РЕЗУЛЬТАТЫ_РАСПОЗНАВАНИЯ_01_PDF*.md

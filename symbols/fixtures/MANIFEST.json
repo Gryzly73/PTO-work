@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {
+      "id": "synthetic-two-row-legend",
+      "roles": ["synthetic", "self-check"],
+      "visual": "synthetic_legend.svg",
+      "gt": "synthetic.gt.json",
+      "prediction": "synthetic.perfect.prediction.json",
+      "selfCheckExpected": "perfect"
+    }
+  ]
+}
+

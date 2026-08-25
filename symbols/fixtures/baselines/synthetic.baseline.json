@@ -1,0 +1,192 @@
+{
+  "baselineVersion": 1,
+  "clusteringBackend": "brute_force",
+  "configFingerprint": "dbfda97351f922c8",
+  "entityIds": {
+    "conflicts": [],
+    "legendEntries": [
+      "LE-p0001-6caead6cf6ea",
+      "LE-p0001-9263e9c5680b"
+    ],
+    "symbolCandidates": [
+      "SC-p0001-1c0015888ac2",
+      "SC-p0001-e4b4e6699b02"
+    ],
+    "symbolInstances": [
+      "SI-p0001-3844f880c384",
+      "SI-p0001-d3e97e8413ad",
+      "SI-p0001-e43dd5fab125",
+      "SI-p0001-f309b3f65421"
+    ],
+    "symbolTypes": [
+      "ST-p0001-2da1fa10f782",
+      "ST-p0001-32bd75e6c51b",
+      "ST-p0001-86f044bc32f2"
+    ]
+  },
+  "fixtureId": "synthetic-two-row-legend",
+  "page": 1,
+  "profileSource": "pipeline_run",
+  "reproducibilityDigest": "4a0ccb68dfc376c245ecfa73b27ea6a215f4d87b4e5c4014d15f0492e10d8593",
+  "stages": {
+    "s3": {
+      "bboxPdf": [
+        390.0,
+        35.0,
+        570.0,
+        140.0
+      ],
+      "confidence": 1.0,
+      "detectionSources": [
+        "frame",
+        "row_pattern",
+        "graphic_text_rows",
+        "raster_or_vector_rules",
+        "compact_whitespace"
+      ],
+      "elapsedMs": 106.799,
+      "legendEntryCount": 2,
+      "legendStatus": "found",
+      "regionAreaRatio": 0.07875,
+      "regionId": "legend-main",
+      "rows": [
+        {
+          "id": "LE-p0001-6caead6cf6ea",
+          "row": {
+            "area": 7140.0,
+            "bboxPdf": [
+              395.0,
+              39.0,
+              565.0,
+              81.0
+            ],
+            "height": 42.0,
+            "width": 170.0
+          },
+          "sourceKind": "pdf_text",
+          "status": "extracted",
+          "symbol": {
+            "area": 1680.0,
+            "bboxPdf": [
+              395.0,
+              39.0,
+              435.0,
+              81.0
+            ],
+            "height": 42.0,
+            "width": 40.0
+          },
+          "textLength": 8
+        },
+        {
+          "id": "LE-p0001-9263e9c5680b",
+          "row": {
+            "area": 7990.0,
+            "bboxPdf": [
+              395.0,
+              89.0,
+              565.0,
+              136.0
+            ],
+            "height": 47.0,
+            "width": 170.0
+          },
+          "sourceKind": "pdf_text",
+          "status": "extracted",
+          "symbol": {
+            "area": 1880.0,
+            "bboxPdf": [
+              395.0,
+              89.0,
+              435.0,
+              136.0
+            ],
+            "height": 47.0,
+            "width": 40.0
+          },
+          "textLength": 9
+        }
+      ]
+    },
+    "s4": {
+      "componentCount": 4,
+      "detectionCount": 2,
+      "elapsedMs": 146.123,
+      "instancesByStatus": {
+        "probable": 2
+      },
+      "rawComponentCount": 7,
+      "rawDetectionCount": 2,
+      "rejectedComponentGeometryCount": 3,
+      "rejectedTemplateCount": 0,
+      "templateCount": 2,
+      "typesByStatus": {
+        "probable": 2
+      }
+    },
+    "s5": {
+      "candidateCount": 2,
+      "candidatesBySource": {
+        "connected_component": 2,
+        "vector_path": 2
+      },
+      "candidatesByStatus": {
+        "unclassified": 2
+      },
+      "clusterCount": 1,
+      "clusteredCandidateCount": 2,
+      "componentExtractionElapsedMs": 61.655,
+      "connectedComponentCount": 2,
+      "cropFileCount": 4,
+      "cropSignatureElapsedMs": 22.047,
+      "dedupeElapsedMs": 0.071,
+      "elapsedMs": 130.355,
+      "filteredComponentCount": 4,
+      "geometryElapsedMs": 75.144,
+      "instancesByStatus": {
+        "probable": 2,
+        "unclassified": 2
+      },
+      "preDedupeCount": 4,
+      "rasterFilterElapsedMs": 0.287,
+      "rawConnectedComponentCount": 5,
+      "rawVectorPathCount": 14,
+      "rejectedCount": 15,
+      "rejectedDimensionOrLineNetworkCount": 0,
+      "rejectedHatchingCount": 0,
+      "rejectedKnownOverlapCount": 0,
+      "rejectedLineNetworkCount": 5,
+      "rejectedLowFillCount": 0,
+      "rejectedSinglePrimitiveCount": 0,
+      "rejectedSizeOrAspectCount": 6,
+      "rejectedSolidFillCount": 0,
+      "rejectedTextOverlapCount": 4,
+      "signatureCount": 2,
+      "vectorFilterElapsedMs": 0.883,
+      "vectorPathCount": 2
+    },
+    "s6": {
+      "conflictsByKind": {},
+      "elapsedMs": 51.03,
+      "instancesByStatus": {
+        "probable": 2,
+        "unresolved": 2
+      },
+      "typesByStatus": {
+        "probable": 2,
+        "unresolved": 1
+      },
+      "unmatchedLegendEntryCount": 2
+    }
+  },
+  "summary": {
+    "conflictCount": 0,
+    "legendEntryCount": 2,
+    "page": 1,
+    "status": "complete",
+    "symbolInstanceCount": 4,
+    "symbolTypeCount": 3,
+    "unclassifiedCount": 2,
+    "unmatchedLegendEntryCount": 2
+  }
+}

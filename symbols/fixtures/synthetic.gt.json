@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "documentId": "synthetic-two-row-legend",
+  "pages": [
+    {
+      "pageId": "page-1",
+      "expectedStatus": "annotated",
+      "legend": {
+        "region": {
+          "id": "legend-main",
+          "bbox": [390, 35, 570, 140],
+          "status": "found"
+        },
+        "rows": [
+          {
+            "id": "row-valve",
+            "bbox": [395, 40, 565, 82],
+            "label": "Valve V1",
+            "status": "extracted",
+            "typeId": "valve-v1"
+          },
+          {
+            "id": "row-sensor",
+            "bbox": [395, 88, 565, 135],
+            "label": "Sensor S1",
+            "status": "extracted",
+            "typeId": "sensor-s1"
+          }
+        ]
+      },
+      "instances": [
+        {
+          "id": "known-valve-1",
+          "bbox": [88, 88, 112, 112],
+          "status": "confirmed",
+          "typeId": "valve-v1",
+          "legendRowId": "row-valve"
+        },
+        {
+          "id": "known-sensor-1",
+          "bbox": [188, 78, 212, 102],
+          "status": "confirmed",
+          "typeId": "sensor-s1",
+          "legendRowId": "row-sensor"
+        },
+        {
+          "id": "unknown-repeat-1",
+          "bbox": [88, 228, 112, 252],
+          "status": "unclassified",
+          "typeId": null,
+          "legendRowId": null
+        },
+        {
+          "id": "unknown-repeat-2",
+          "bbox": [238, 228, 262, 252],
+          "status": "unclassified",
+          "typeId": null,
+          "legendRowId": null
+        }
+      ],
+      "negativeComponents": [
+        {"id": "negative-text", "bbox": [38, 164, 145, 184], "kind": "text"},
+        {"id": "negative-table", "bbox": [350, 220, 480, 285], "kind": "table"},
+        {
+          "id": "negative-line-intersection",
+          "bbox": [164, 319, 186, 341],
+          "kind": "line_intersection"
+        }
+      ]
+    }
+  ]
+}
+

@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "documentId": "synthetic-perfect-prediction",
+  "pages": [
+    {
+      "pageId": "page-1",
+      "expectedStatus": "annotated",
+      "legend": {
+        "region": {"id": "predicted-legend", "bbox": [390, 35, 570, 140], "status": "found"},
+        "rows": [
+          {"id": "row-valve", "bbox": [395, 40, 565, 82], "label": "Valve V1", "status": "extracted", "typeId": "valve-v1"},
+          {"id": "row-sensor", "bbox": [395, 88, 565, 135], "label": "Sensor S1", "status": "extracted", "typeId": "sensor-s1"}
+        ]
+      },
+      "instances": [
+        {"id": "p-valve", "bbox": [89, 89, 113, 113], "status": "confirmed", "typeId": "valve-v1", "legendRowId": "row-valve"},
+        {"id": "p-sensor", "bbox": [187, 77, 211, 101], "status": "confirmed", "typeId": "sensor-s1", "legendRowId": "row-sensor"},
+        {"id": "p-unknown-1", "bbox": [89, 229, 113, 253], "status": "unclassified", "typeId": null, "legendRowId": null},
+        {"id": "p-unknown-2", "bbox": [237, 227, 261, 251], "status": "unclassified", "typeId": null, "legendRowId": null}
+      ],
+      "negativeComponents": []
+    }
+  ]
+}
+

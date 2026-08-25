@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "fixtures": [
+    {"id": "pb-dev", "roles": ["PB", "dev"], "visual": "local/PB/page.svg", "gt": "local/PB/page.gt.json", "kpi": {"legendRowRecallMin": 0.8, "instanceRecallMin": 0.7, "bindingPrecisionMin": 0.95, "duplicatesMax": 5}},
+    {"id": "kr1-vertical", "roles": ["KR1", "vertical-slice"], "visual": "local/KR1/page.svg", "gt": "local/KR1/page.gt.json", "kpi": {"legendRowRecallMin": 0.8, "instanceRecallMin": 0.7, "bindingPrecisionMin": 0.95, "duplicatesMax": 5}},
+    {"id": "odi-vertical", "roles": ["ODI", "vertical-slice"], "visual": "local/ODI/page.svg", "gt": "local/ODI/page.gt.json", "kpi": {"legendRowRecallMin": 0.8, "instanceRecallMin": 0.7, "bindingPrecisionMin": 0.95, "duplicatesMax": 5}},
+    {"id": "kr4-holdout", "roles": ["KR4", "holdout"], "visual": "local/KR4/page.svg", "gt": "local/KR4/page.gt.json"},
+    {"id": "kr5-negative", "roles": ["KR5", "negative"], "visual": "local/KR5/page.svg", "gt": "local/KR5/page.gt.json"},
+    {"id": "kr3-regression", "roles": ["KR3", "regression", "out-of-kpi"], "visual": "local/KR3/page.svg", "gt": "local/KR3/page.gt.json"},
+    {"id": "ios2-page35-regression", "roles": ["IOS2", "regression", "page35"], "visual": "local/IOS2/document.pdf", "gt": "local/IOS2/page35.gt.json", "page": 35, "legendRowRecallMin": 0.9}
+  ]
+}
+

@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "documentId": "synthetic-bad-prediction",
+  "pages": [
+    {
+      "pageId": "page-1",
+      "expectedStatus": "annotated",
+      "legend": {
+        "region": {"id": "predicted-legend", "bbox": [390, 35, 570, 140], "status": "found"},
+        "rows": [
+          {"id": "row-valve", "bbox": [395, 40, 565, 82], "label": "Valve V1", "status": "extracted", "typeId": "valve-v1"},
+          {"id": "row-sensor", "bbox": [395, 40, 565, 82], "label": "Sensor S1", "status": "extracted", "typeId": "sensor-s1"}
+        ]
+      },
+      "instances": [
+        {"id": "bad-binding", "bbox": [88, 88, 112, 112], "status": "confirmed", "typeId": "sensor-s1", "legendRowId": "row-sensor"},
+        {"id": "sensor-hit", "bbox": [188, 78, 212, 102], "status": "confirmed", "typeId": "sensor-s1", "legendRowId": "row-sensor"},
+        {"id": "sensor-duplicate", "bbox": [189, 79, 213, 103], "status": "confirmed", "typeId": "sensor-s1", "legendRowId": "row-sensor"}
+      ],
+      "negativeComponents": []
+    }
+  ]
+}
+
