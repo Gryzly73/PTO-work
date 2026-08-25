@@ -18,41 +18,16 @@ ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 # запускается лишь через виртуальный экран и требует принять их EULA — для
 # сервиса, который должен просто работать, это плохой размен.
 #
-# Сборка идёт отдельным слоем: в рабочий образ переезжают только сам dwg2dxf и
-# его библиотека, а компилятор с заголовками остаются здесь.
-FROM ${PYTHON_IMAGE} AS dwgtools
-ARG LIBREDWG_VERSION=0.14
-# pkg-config и libpcre2-dev — не подстраховка: без первого configure
-# LibreDWG останавливается сразу («pkg-config not found»), второй нужен ему
-# для разбора кодовых страниц. Оба остаются в этой стадии.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates curl pkg-config libpcre2-dev \
-    && rm -rf /var/lib/apt/lists/*
-WORKDIR /build
-# Сборка идёт с -O1, а не с обычным -O2. У LibreDWG несколько огромных
-# сгенерированных файлов (decode2.c, out_dxf.c, out_json.c), и на скромном
-# сервере оптимизатор жуёт каждый по одной-две минуты: первая сборка не
-# уложилась в получасовой лимит деплоя и была прервана на середине. С -O1
-# компиляция кратно быстрее, а разница в скорости самой конвертации незаметна:
-# DWG переводится в DXF один раз на документ и занимает секунды.
+# Собирается он НЕ здесь, а отдельным образом (Dockerfile.dwgtools), который
+# GitHub Actions кладёт в GHCR. Причина простая: на сервере эта сборка не
+# доходила до конца — на файле decode2.c машина уходила в своп и обрывала
+# SSH-сессию деплоя вместе со сборкой. Здесь остаётся только взять готовое.
 #
-# По той же причине сборка идёт в два потока, а не по числу ядер: gcc на этих
-# файлах съедает сотни мегабайт на процесс, и на сервере с небольшой памятью
-# параллельная сборка уводит машину в своп — вместе со всем остальным, что на
-# ней работает, включая SSH, по которому идёт деплой.
-#
-# Долго это только в первый раз. Слой кэшируется и переиспользуется, пока
-# строки этой стадии не изменятся, так что обычный деплой конвертер не
-# пересобирает.
-RUN curl -fsSL -o libredwg.tar.xz \
-        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
-    && tar xf libredwg.tar.xz \
-    && cd "libredwg-${LIBREDWG_VERSION}" \
-    && ./configure --disable-bindings --disable-dependency-tracking \
-        --prefix=/usr/local CFLAGS="-O1 -g0" \
-    && make -j2 \
-    && make install-strip DESTDIR=/out \
-    && /out/usr/local/bin/dwg2dxf --version | head -1
+# Локально можно подставить свой образ:
+#   docker build -f Dockerfile.dwgtools -t pto-dwgtools:local .
+#   docker build --build-arg DWGTOOLS_IMAGE=pto-dwgtools:local -t pto-backend .
+ARG DWGTOOLS_IMAGE=ghcr.io/sorryprod/pto-dwgtools:0.14
+FROM ${DWGTOOLS_IMAGE} AS dwgtools
 
 FROM ${PYTHON_IMAGE}
 

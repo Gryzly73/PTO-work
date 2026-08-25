@@ -1,0 +1,45 @@
+# Конвертер DWG → DXF отдельным образом.
+#
+# Почему он вынесен из основного Dockerfile. LibreDWG нет ни в одном выпуске
+# Debian, готовых сборок под Linux проект не выкладывает, поэтому конвертер
+# приходится собирать из исходников. Раньше это делалось прямо на сервере при
+# каждом деплое — и не получалось: на файле decode2.c (несколько мегабайт
+# сгенерированного кода) машина уходила в своп, обрывая заодно и SSH-сессию
+# деплоя. Ни -O1, ни сборка в два потока не помогли.
+#
+# Теперь образ собирается один раз в GitHub Actions, где памяти достаточно, и
+# кладётся в GHCR. Серверу остаётся скачать готовый бинарник. Пересобирается он
+# только когда меняется этот файл или версия LibreDWG.
+#
+# Собрать вручную (например, чтобы проверить локально):
+#   docker build -f Dockerfile.dwgtools -t pto-dwgtools:local .
+#   docker build --build-arg DWGTOOLS_IMAGE=pto-dwgtools:local -t pto-backend .
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
+
+FROM ${PYTHON_IMAGE} AS build
+ARG LIBREDWG_VERSION=0.14
+
+# pkg-config и libpcre2-dev — не подстраховка: без первого configure LibreDWG
+# останавливается сразу («pkg-config not found»), второй нужен ему для разбора
+# кодовых страниц.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl pkg-config libpcre2-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+RUN curl -fsSL -o libredwg.tar.xz \
+        "https://github.com/LibreDWG/libredwg/releases/download/${LIBREDWG_VERSION}/libredwg-${LIBREDWG_VERSION}.tar.xz" \
+    && tar xf libredwg.tar.xz \
+    && cd "libredwg-${LIBREDWG_VERSION}" \
+    && ./configure --disable-bindings --disable-dependency-tracking \
+        --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install-strip DESTDIR=/out \
+    && /out/usr/local/bin/dwg2dxf --version | head -1
+
+# В готовом образе — только результат сборки. Основной Dockerfile берёт файлы
+# из /out тем же COPY --from, что и раньше, поэтому его правка минимальна.
+FROM ${PYTHON_IMAGE}
+LABEL org.opencontainers.image.source="https://github.com/Sorryprod/PTO-work"
+LABEL org.opencontainers.image.description="dwg2dxf (LibreDWG) для бэкенда ПТО"
+COPY --from=build /out /out
