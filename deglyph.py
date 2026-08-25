@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -616,6 +617,160 @@ def page_raw_text(page) -> str:
     return "".join(b[4] for b in blocks if b[6] == 0 and isinstance(b[4], str))
 
 
+# --- починка по глифам встроенного шрифта -----------------------------------
+#
+# Второй способ снять ту же порчу, независимый от кроссворда и, в отличие от
+# него, точный. Подменена только таблица ToUnicode; сам шрифт лежит в PDF
+# целиком, и его cmap хранит, какой букве принадлежит глиф. MuPDF отдаёт номер
+# глифа (get_texttrace) и помечает FFFD ровно те коды, которые не смог
+# сопоставить, — по ним и чиним, остальное не трогаем.
+#
+# Почему пошрифтово, а не одной таблицей на документ: в файле бывает несколько
+# сломанных шрифтов с РАЗНЫМИ смещениями, и общая таблица на них конфликтует —
+# «9» из одного шрифта уезжает в «V» из другого. Проверено на ИОС2: пошрифтовая
+# подстановка чинит 4744 символа и ни разу не расходится с кроссвордом там, где
+# оба знают ответ, а сверх него берёт «№», кавычки и подстрочные индексы, до
+# которых кроссворду не хватает словаря.
+
+_GLYPH_TABLES: dict[str, dict[str, dict[int, set[int]]]] = {}
+
+# Символы вне ASCII, которые тоже надо поискать в cmap: без них «№» в штампе и
+# «∅» в спецификации остались бы неисправленными.
+_EXTRA_CODES = (
+    0x2116, 0x2205, 0x2013, 0x2014, 0x2022, 0x00B0, 0x00B1, 0x00D8, 0x00F8,
+)
+
+
+def font_glyph_tables(doc: fitz.Document) -> dict[str, dict[int, set[int]]]:
+    """{имя шрифта: {номер глифа: коды символов}} по встроенным шрифтам.
+
+    Обратное отображение cmap неоднозначно: один глиф бывает записан за
+    несколькими кодами. Поэтому храним множество кандидатов, а чиним только
+    там, где кандидат один, — гадать себе дороже.
+    """
+    key = getattr(doc, "name", "") or f"id{id(doc)}"
+    cached = _GLYPH_TABLES.get(key)
+    if cached is not None:
+        return cached
+
+    tables: dict[str, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
+    seen: set[int] = set()
+    for page in doc:
+        for info in page.get_fonts(full=True):
+            xref, base, name = info[0], info[3], info[4]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            try:
+                buffer = doc.extract_font(xref)[3]
+                if not buffer:
+                    continue
+                font = fitz.Font(fontbuffer=buffer)
+            except Exception:
+                continue  # шрифт не встроен или не читается — не беда
+            for code in list(range(0x20, 0x2100)) + list(_EXTRA_CODES):
+                gid = font.has_glyph(code)
+                if gid:
+                    for label in {base.split("+")[-1], name.split("+")[-1]}:
+                        tables[label][gid].add(code)
+    plain = {name: dict(gids) for name, gids in tables.items()}
+    _GLYPH_TABLES[key] = plain
+    return plain
+
+
+def page_text_by_glyphs(page) -> tuple[str, int]:
+    """Текст листа с восстановленными по шрифту символами и число замен.
+
+    Порядок чтения — как у `page_raw_text()`: блоки сверху вниз и слева
+    направо. Иначе страница начиналась бы со штампа.
+    """
+    tables = font_glyph_tables(page.parent)
+    if not tables:
+        return "", 0
+    trace: dict[tuple[float, float], tuple[int, int, str]] = {}
+    for span in page.get_texttrace():
+        for unicode_value, gid, origin, *_ in span["chars"]:
+            trace[(round(origin[0], 1), round(origin[1], 1))] = (
+                unicode_value,
+                gid,
+                span["font"],
+            )
+    if not trace:
+        return "", 0
+
+    blocks = [b for b in page.get_text("rawdict").get("blocks", []) if b.get("type") == 0]
+    blocks.sort(key=lambda b: (round(b["bbox"][1], 1), round(b["bbox"][0], 1)))
+    out: list[str] = []
+    fixes = 0
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                for char in span.get("chars", []):
+                    ch = char.get("c") or ""
+                    origin = char.get("origin")
+                    hit = (
+                        trace.get((round(origin[0], 1), round(origin[1], 1)))
+                        if origin
+                        else None
+                    )
+                    # FFFD у MuPDF означает «код глифа не сопоставился» — это и
+                    # есть подмена. Там, где он сопоставился, текст верен.
+                    if hit and hit[0] == 0xFFFD:
+                        candidates = tables.get(hit[2], {}).get(hit[1], set())
+                        if len(candidates) == 1:
+                            right = chr(next(iter(candidates)))
+                            if right != ch:
+                                ch = right
+                                fixes += 1
+                    out.append(ch)
+            out.append("\n")
+        out.append("\n")
+    return "".join(out), fixes
+
+
+# Диапазон математических алфавитных символов: Word кладёт в формулы «𝐻» и
+# «𝑖» вместо обычных букв. Юникод они валидный, но в браузере часто рисуются
+# пустым квадратом, а инженеру в «H = H + H» ничего от курсива не нужно.
+_MATH_ALPHA = (0x1D400, 0x1D7FF)
+
+
+def sanitize_text(text: str) -> str:
+    """Снимает с готового текста то, что дойдёт до инженера мусором.
+
+    Три источника «закорючек», которые не лечатся подстановкой:
+      * приватная область шрифта (U+F0xx): символ из Symbol или Wingdings.
+        Пунктуацию и цифры из неё восстанавливаем по младшему байту — это
+        обычная для таких шрифтов раскладка; буквы выбрасываем, потому что там
+        раскладка греческая и подстановка соврала бы;
+      * управляющие коды: невидимый мусор внутри таблиц;
+      * математические алфавитные символы формул Word — приводим к обычным
+        буквам.
+    """
+    if not text:
+        return text
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if ch in ("\n", "\t"):
+            out.append(ch)
+            continue
+        if code < 0x20 or code == 0x7F:
+            out.append(" ")
+            continue
+        if code == 0xFFFD:  # «символ неизвестен» — показывать нечего
+            continue
+        if 0xE000 <= code <= 0xF8FF:
+            ascii_code = code - 0xF000
+            plain = chr(ascii_code) if 0x20 <= ascii_code <= 0x7E else ""
+            out.append(plain if plain and not plain.isalpha() else "")
+            continue
+        if _MATH_ALPHA[0] <= code <= _MATH_ALPHA[1]:
+            out.append(unicodedata.normalize("NFKC", ch))
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
 def page_text_fixed(page, *, quiet: bool = False, extra_text: str = "") -> str:
     """Текстовый слой листа с починкой сломанного ToUnicode.
 
@@ -626,16 +781,42 @@ def page_text_fixed(page, *, quiet: bool = False, extra_text: str = "") -> str:
     raw = page_raw_text(page)
     if not raw.strip():
         return raw
-    broken = sum(1 for ch in raw if is_broken_any(ch))
-    if not broken:
-        return raw
     # Чиним по наличию битых символов, а не по вердикту «вся страница битая».
     # На чертеже штамп и основной текст часто набраны разными шрифтами: доля
     # порчи мала, страница проходит как исправная, а из слоя вываливается
     # «ǨКСПЛИКАЦИǪ ǒДАНИǔ» — то есть ровно то слово, ради которого лист и читают.
-    mapping = map_for_doc(page.parent, quiet=quiet, extra_text=extra_text)
-    if not mapping:
-        return raw
-    fixed = decode(raw, mapping)
-    left = sum(1 for ch in fixed if is_broken_any(ch))
-    return fixed if left < broken else raw
+    best = raw
+    broken = sum(1 for ch in best if is_broken_any(ch))
+
+    # Сначала точный способ — по глифам встроенного шрифта. Он не гадает и не
+    # нуждается в словаре, поэтому работает и на единственном битом листе.
+    if broken:
+        try:
+            by_glyphs, fixes = page_text_by_glyphs(page)
+        except Exception as error:
+            by_glyphs, fixes = "", 0
+            if not quiet:
+                print(f"    deglyph: глифы шрифта не прочитались ({error})", flush=True)
+        if fixes:
+            left = sum(1 for ch in by_glyphs if is_broken_any(ch))
+            if left < broken and by_glyphs.strip():
+                if not quiet:
+                    print(
+                        f"    deglyph: по шрифту восстановлено {fixes} символов",
+                        flush=True,
+                    )
+                best, broken = by_glyphs, left
+
+    # Остаток добираем кроссвордом: он знает кавычки и редкие знаки, которых
+    # нет в cmap шрифта, и наоборот — вместе они полнее каждого по отдельности.
+    if broken:
+        mapping = map_for_doc(page.parent, quiet=quiet, extra_text=extra_text)
+        if mapping:
+            fixed = decode(best, mapping)
+            left = sum(1 for ch in fixed if is_broken_any(ch))
+            if left < broken:
+                best = fixed
+
+    # Санация нужна и там, где чинить было нечего: приватные глифы Symbol и
+    # управляющие коды приходят и с исправным ToUnicode.
+    return sanitize_text(best)
