@@ -42,13 +42,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # Конвертер DWG собирается здесь, а не на сервере. На сервере эта сборка не
+  # доходила до конца: на файле decode2.c машина уходила в своп и обрывала
+  # SSH-сессию деплоя вместе со сборкой. Здесь памяти хватает, а результат
+  # переиспользуется — при неизменной версии LibreDWG всё берётся из кэша и
+  # шаг занимает меньше минуты.
+  dwgtools:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Нужен, чтобы передать короткий GITHUB_TOKEN на сервер для git fetch
-    # по HTTPS — без Deploy key на стороне GitHub.
+    timeout-minutes: 45
     permissions:
       contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Забрать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Собрать имя образа
+        id: meta
+        run: |
+          # GHCR принимает только строчные буквы в пути образа.
+          owner="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          version="$(grep -m1 '^ARG LIBREDWG_VERSION=' Dockerfile.dwgtools | cut -d= -f2)"
+          echo "image=ghcr.io/${owner}/pto-dwgtools:${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Войти в GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Настроить buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Собрать и опубликовать конвертер
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dwgtools
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: dwgtools
+    timeout-minutes: 30
+    # Нужен, чтобы передать короткий GITHUB_TOKEN на сервер: тем же токеном
+    # сервер делает git fetch по HTTPS (без Deploy key на стороне GitHub) и
+    # забирает образ конвертера из GHCR — пакет приватный, как и репозиторий.
+    permissions:
+      contents: read
+      packages: read
 
     steps:
       - name: Забрать репозиторий
@@ -87,8 +135,41 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          # Без known_hosts ssh спросит подтверждение и повиснет.
-          ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+          # Без known_hosts ssh спросит подтверждение и повиснет. Ключ хоста
+          # берём заранее, но не делаем на этом ставку: сервер небольшой, и
+          # пока он занят сборкой образа, на SSH он отвечает не сразу. Одна
+          # неудачная попытка keyscan роняла весь деплой — с этого начиналась
+          # половина красных прогонов.
+          #
+          # Поэтому: несколько попыток с паузой, а если ключ так и не пришёл —
+          # не падаем, а идём дальше с accept-new. Доверия это не убавляет:
+          # keyscan точно так же берёт ключ у того, кто ответил, ничего не
+          # проверяя. Настоящая неудача вскроется на следующем шаге, где уже
+          # будет видно, что именно ответил сервер.
+          got_key=""
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -T 10 -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" \
+                 >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+              got_key="yes"
+              break
+            fi
+            echo "Попытка $attempt: сервер не отдал ключ хоста, жду 15 секунд."
+            sleep 15
+          done
+          if [ -z "$got_key" ]; then
+            echo "За пять попыток ключ хоста получить не удалось."
+            echo "Вывод последней попытки:"
+            cat /tmp/keyscan.err || true
+            echo "Продолжаю с StrictHostKeyChecking=accept-new."
+            echo "PTO_SSH_ACCEPT_NEW=yes" >> "$GITHUB_ENV"
+            {
+              echo "### Ключ хоста не получен заранее"
+              echo "Сервер не ответил на SSH по порту $DEPLOY_PORT за пять попыток."
+              echo "Если деплой упал следом — проверьте, что машина поднята,"
+              echo "порт открыт (задаётся переменной DEPLOY_PORT) и вход не"
+              echo "заблокирован fail2ban после неудачных попыток."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Обновить бэкенд на сервере
         if: steps.guard.outputs.skip != 'yes'
@@ -102,11 +183,19 @@ jobs:
           # Токен не кладём в argv ssh (видно в ps) — первой строкой в stdin.
           PTO_GITHUB_TOKEN: ${{ github.token }}
         run: |
+          # accept-new включается только если ключ не удалось взять заранее.
+          # Он не спрашивает подтверждения (в отличие от «ask»), поэтому
+          # деплой не повиснет молча в ожидании ввода.
+          host_check="yes"
+          if [ "${PTO_SSH_ACCEPT_NEW:-}" = "yes" ]; then
+            host_check="accept-new"
+          fi
           {
             printf '%s\n' "$PTO_GITHUB_TOKEN"
             cat deploy/deploy.sh
           } | ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" \
               -o BatchMode=yes -o ServerAliveInterval=30 \
+              -o StrictHostKeyChecking="$host_check" \
               "$DEPLOY_USER@$DEPLOY_HOST" \
               "read -r PTO_GITHUB_TOKEN; export PTO_GITHUB_TOKEN; \
                export PTO_BACKEND_DIR='$DEPLOY_PATH' \

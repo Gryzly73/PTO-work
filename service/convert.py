@@ -38,7 +38,7 @@ KIND_TITLE = {
 
 # Версия формата страницы. Растёт, когда меняется состав markdown — по ней
 # сервис понимает, что кэш листа собран старым кодом, и пересобирает его.
-PAGE_SCHEMA = 5
+PAGE_SCHEMA = 6
 
 # Выводить ли PASS-B в markdown интерфейса. По умолчанию нет: на чертеже это
 # до 100 тыс. символов на лист. Данные остаются в поле fragments и в файле
@@ -165,6 +165,32 @@ def dedupe_fragment_lines(text: str, *, min_len: int = 8) -> tuple[str, int]:
     return result, removed
 
 
+def prime_glyph_map(pdf_path: Path, vlm_text: str) -> None:
+    """Готовит подстановку глифов, подсказав ей словарь выводом модели.
+
+    Кроссворд подбирает буквы по словарю ЧИТАЕМЫХ листов документа. Когда
+    инженер открывает одну выгруженную страницу отдельным файлом, читаемых
+    листов нет вовсе: словаря нет, подстановка пустая, и текст остаётся
+    кракозябрами — «ǜодерǱаǸие» вместо «Содержание». Текст модели по этому же
+    листу в роли словаря работает: слова те же, а читаемость обеспечена тем,
+    что модель смотрела на картинку, а не на слой.
+
+    Вызывать ДО чтения слоя и сборки таблиц: подстановка кэшируется на
+    документ, и оба потом берут уже готовую.
+    """
+    if not vlm_text.strip():
+        return
+    try:
+        import fitz
+
+        from deglyph import map_for_doc
+
+        with fitz.open(pdf_path) as doc:
+            map_for_doc(doc, quiet=True, extra_text=vlm_text)
+    except Exception:
+        pass
+
+
 def page_tables(pdf_path: Path, page_number: int) -> list[str]:
     """Таблицы листа как GFM, собранные из текстового слоя PDF без модели.
 
@@ -192,6 +218,49 @@ def page_tables(pdf_path: Path, page_number: int) -> list[str]:
         return []
 
 
+def page_flow_elements(pdf_path: Path, page_number: int) -> list[dict]:
+    """Блоки листа в порядке исходника. [] — если разобрать не удалось.
+
+    Ошибка здесь не должна стоить листа: без потока страница соберётся старым
+    способом — таблицы отдельной секцией, текст отдельной.
+    """
+    try:
+        from service.flow import page_elements
+
+        return page_elements(pdf_path, page_number)
+    except Exception:
+        return []
+
+
+# Строка таблицы в markdown: «| Водопотребитель | ... |» и «|---|---|».
+_TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
+
+
+def drop_tables_from_description(pass_a: str) -> str:
+    """Убирает из описания листа таблицы, которые мы и так собрали скриптом.
+
+    Модель, увидев таблицу на картинке, пересказывает её своими словами — и
+    рядом с точной таблицей из текстового слоя это второй, менее надёжный
+    экземпляр тех же чисел. Инженеру приходится сверять их между собой, а
+    ошибки при этом всегда у модели. Поэтому пересказ убираем, а сами данные
+    остаются ниже, в потоке листа.
+    """
+    if not pass_a.strip():
+        return pass_a
+    lines = pass_a.splitlines()
+    kept: list[str] = []
+    dropped = 0
+    for line in lines:
+        if _TABLE_LINE_RE.match(line):
+            dropped += 1
+            continue
+        kept.append(line)
+    if not dropped:
+        return pass_a
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return text
+
+
 def build_page_markdown(
     *,
     page_number: int,
@@ -205,6 +274,9 @@ def build_page_markdown(
     fragments_summary: str = "",
     layer_is_source: bool = False,
     tables: list[str] | None = None,
+    text_title: str = "Текст с листа (из PDF, дословно)",
+    sheet_map: str = "",
+    flow: str = "",
 ) -> str:
     parts = [
         f"# Лист {page_number}",
@@ -216,6 +288,11 @@ def build_page_markdown(
     ]
     if note:
         parts += [f"_{note}_", ""]
+    # Карта листа идёт первой: она отвечает на «что где находится» до того, как
+    # начнётся содержимое. Пишется для модели — однообразными строками, без
+    # пересказа самих данных.
+    if sheet_map.strip():
+        parts += ["## Карта листа", "", sheet_map.strip(), ""]
     if pass_a.strip():
         parts += ["## Описание листа", "", pass_a.strip(), ""]
     if pass_b.strip():
@@ -230,22 +307,27 @@ def build_page_markdown(
         parts += [clean_b, ""]
     elif fragments_summary:
         parts += ["## Извлечение по фрагментам", "", fragments_summary, ""]
-    # Таблицы идут ПЕРЕД сырым текстом: инженеру нужна структура, а не поток
-    # слов, и в потоке та же таблица уже развалена на отдельные значения.
-    if tables:
-        parts += ["## Таблицы листа (из PDF)", ""]
-        for i, table_md in enumerate(tables, start=1):
-            if len(tables) > 1:
-                parts += [f"**Таблица {i}**", ""]
-            parts += [table_md, ""]
-    # Текст из PDF не печатаем, когда описание листа само собрано из него:
-    # иначе один и тот же текст идёт на экран двумя блоками подряд.
-    if layer_text.strip() and not layer_is_source:
-        parts += ["## Текст с листа (из PDF, дословно)", "", layer_text.strip(), ""]
+    # Содержимое листа — одним потоком, в порядке исходника: заголовок, текст,
+    # таблица на своём месте, текст под ней, штамп в конце. Отдельные секции
+    # «Таблицы листа» и «Текст с листа» разрывали документ: примечание под
+    # таблицей уезжало от неё на десяток абзацев.
+    if flow.strip():
+        parts += [f"## {text_title}", "", flow.strip(), ""]
+    else:
+        if tables:
+            parts += ["## Таблицы листа (из PDF)", ""]
+            for i, table_md in enumerate(tables, start=1):
+                if len(tables) > 1:
+                    parts += [f"**Таблица {i}**", ""]
+                parts += [table_md, ""]
+        # Текст из PDF не печатаем, когда описание листа само собрано из него:
+        # иначе один и тот же текст идёт на экран двумя блоками подряд.
+        if layer_text.strip() and not layer_is_source:
+            parts += [f"## {text_title}", "", layer_text.strip(), ""]
     # Паспорт (kind, размер листа, причины классификации) — служебная
     # диагностика конвейера. Инженеру она не нужна и читается как третий
     # пересказ тех же меток, поэтому уходит отдельным полем, а не в markdown.
-    if not any(s.strip() for s in (pass_a, pass_b, layer_text)) and not tables:
+    if not any(s.strip() for s in (pass_a, pass_b, layer_text, flow)) and not tables:
         parts += ["_С листа пока ничего не извлечено._", ""]
     return "\n".join(parts).rstrip() + "\n"
 
@@ -269,16 +351,39 @@ def page_to_frontend(
     """
     pass_0, pass_a, pass_b = extract_pass(raw_page_md)
     layer_is_source = bool(_LAYER_SOURCE_RE.search(raw_page_md))
-    kind = (
-        kind_hint
-        or kind_from_passport_md(pass_0)
-        or kind_from_page(pdf_path, page_number)
-    )
-    layer_text = page_layer_text(pdf_path, page_number)
-    tables = page_tables(pdf_path, page_number)
+    # У чертежа ни текстового слоя PDF, ни сеток MuPDF нет и быть не может:
+    # его лист уже разобран конвейером в данные.
+    vector = pdf_path.suffix.lower() in (".dwg", ".dxf")
+    kind = kind_hint or kind_from_passport_md(pass_0)
+    if not kind and not vector:
+        kind = kind_from_page(pdf_path, page_number)
+    kind = kind or "mixed"
+    # Всё PDF-специфичное для чертежа пропускаем.
+    sheet_map, flow = "", ""
+    if vector:
+        layer_text, tables = "", []
+    else:
+        # Сначала подстановка — с выводом модели как словарём-подсказкой. Иначе
+        # на одностраничном файле и слой, и таблицы приедут кракозябрами.
+        prime_glyph_map(pdf_path, raw_page_md)
+        layer_text = page_layer_text(pdf_path, page_number)
+        elements = page_flow_elements(pdf_path, page_number)
+        tables = [e["text"] for e in elements if e["kind"] == "table"]
+        if elements:
+            from service.flow import flow_markdown, sheet_map_markdown
+
+            sheet_map = sheet_map_markdown(elements)
+            flow = flow_markdown(elements)
+        else:
+            tables = page_tables(pdf_path, page_number)
 
     fragments, removed = ("", 0)
-    if pass_b.strip():
+    # У чертежа PASS-B — не описания тайлов, а точный текст листа: пара
+    # килобайт, ради которых векторный путь и затевался. Прятать его за
+    # «не выводится из-за объёма» бессмысленно, он идёт на экран целиком.
+    if vector:
+        layer_text = pass_b.strip()
+    elif pass_b.strip():
         fragments, removed = dedupe_fragment_lines(pass_b)
 
     summary = ""
@@ -291,6 +396,9 @@ def page_to_frontend(
             f"или `GET /jobs/{{id}}/pages/{page_number}/raw`._"
         ).replace(",", " ")
 
+    if tables:
+        pass_a = drop_tables_from_description(pass_a)
+
     markdown = build_page_markdown(
         page_number=page_number,
         file_name=file_name,
@@ -302,6 +410,13 @@ def page_to_frontend(
         fragments_summary=summary,
         layer_is_source=layer_is_source,
         tables=tables,
+        text_title=(
+            "Текст листа (из чертежа, дословно)"
+            if vector
+            else "Лист дословно (из PDF, в порядке исходника)"
+        ),
+        sheet_map=sheet_map,
+        flow=flow,
     )
     return {
         "pageNumber": page_number,

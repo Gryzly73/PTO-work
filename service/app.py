@@ -21,7 +21,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+)
 
 from service import config
 from service.jobs import (
@@ -34,7 +39,12 @@ from service.jobs import (
     JobStore,
     now_iso,
 )
-from service.pipeline import Pipeline, PipelineError, pdf_page_count
+from service.pipeline import (
+    Pipeline,
+    PipelineError,
+    document_sheets,
+    is_vector,
+)
 from service.transcribe import TranscribeError, transcribe
 from service.transcribe import describe as whisper_describe
 from service.worker import Worker, load_page_json
@@ -55,8 +65,8 @@ async def lifespan(app: FastAPI):
         )
     worker.start()
     print(
-        f"[service] режим={config.MODE} модель={config.MODEL} "
-        f"прогоны={config.RUNS_DIR}",
+        f"[service] режим={config.MODE} (источник={config.MODE_SOURCE}) "
+        f"модель={config.MODEL} прогоны={config.RUNS_DIR}",
         flush=True,
     )
     yield
@@ -166,7 +176,7 @@ def _create_job(
     pages_spec: str | None,
 ):
     try:
-        total = pdf_page_count(pdf_path)
+        total = document_sheets(pdf_path)
     except Exception as error:
         raise HTTPException(status_code=400, detail=f"Не удалось прочитать PDF: {error}")
     if total == 0:
@@ -246,6 +256,7 @@ def health():
     return {
         "ok": True,
         "mode": config.MODE,
+        "modeSource": config.MODE_SOURCE,
         "profile": pipeline.describe(),
         "runsDir": str(config.RUNS_DIR),
         "queue": {
@@ -301,10 +312,18 @@ async def create_job(
     (когда сервис стоит рядом с фронтом и видит его uploads/).
     """
     if file is not None:
-        if not (file.filename or "").lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Принимаются только PDF")
+        name = (file.filename or "").lower()
+        # DWG и DXF принимаем наравне с PDF: у чертежа текст, слои и размеры
+        # лежат данными, и лист читается точнее, чем из отрисованной страницы.
+        suffix = next(
+            (s for s in (".pdf", ".dwg", ".dxf") if name.endswith(s)), ""
+        )
+        if not suffix:
+            raise HTTPException(
+                status_code=400, detail="Принимаются PDF, DWG и DXF"
+            )
         config.ensure_dirs()
-        target = config.UPLOADS_DIR / f"{uuid.uuid4()}.pdf"
+        target = config.UPLOADS_DIR / f"{uuid.uuid4()}{suffix}"
         size = 0
         with target.open("wb") as sink:
             while chunk := await file.read(1024 * 1024):
@@ -418,6 +437,106 @@ def get_page_raw(job_id: str, page_number: int):
     )
 
 
+@app.get("/jobs/{job_id}/pages/{page_number}/geometry", response_class=PlainTextResponse)
+def get_page_geometry(job_id: str, page_number: int):
+    """Геометрия листа чертежа таблицей CSV: линии, полилинии и подписи.
+
+    Интерфейс рисует лист по ней сам — и получает то, чего не даёт картинка:
+    зум без потери качества, поиск и выделение текста, привязку замечания к
+    координатам чертежа. Формат описан в `dwg_geometry.to_csv()`.
+
+    Для PDF маршрут не отвечает: страницу PDF интерфейс рисует через pdf.js.
+    """
+    job = _job_or_404(job_id)
+    source = Path(job.pdfPath)
+    if source.suffix.lower() not in (".dwg", ".dxf"):
+        raise HTTPException(
+            status_code=404,
+            detail="Геометрия отдаётся только для чертежей: PDF интерфейс рисует сам",
+        )
+
+    # Разбор листа стоит секунды и не меняется, пока лежит тот же файл, —
+    # держим рядом с прогоном, вместе с ним и удалится.
+    cache = Path(job.runDir) / "geometry"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"page_{page_number:04d}.csv"
+    if not target.exists():
+        from dwg_geometry import sheet_csv
+
+        try:
+            data = sheet_csv(source, page_number)
+        except IndexError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Не удалось разобрать лист: {error}"
+            ) from error
+        if not data:
+            raise HTTPException(status_code=404, detail="На листе нечего рисовать")
+        target.write_text(data, encoding="utf-8")
+
+    return PlainTextResponse(
+        target.read_text(encoding="utf-8"),
+        media_type="text/csv; charset=utf-8",
+    )
+
+
+@app.get("/jobs/{job_id}/pages/{page_number}/preview")
+def get_page_preview(job_id: str, page_number: int, format: str = "svg"):
+    """Картинка листа чертежа: `format=svg` для показа, `format=png` для миниатюр.
+
+    Нужна интерфейсу: PDF он рисует сам через pdf.js, а DWG браузер не
+    открывает — без этой картинки у чертежа рядом с расшифровкой пустое место
+    и сверить одно с другим нечем.
+
+    Для PDF маршрут не отвечает: там страницу по-прежнему рисует фронтенд, и
+    отдавать вторую, свою версию той же страницы незачем.
+    """
+    job = _job_or_404(job_id)
+    source = Path(job.pdfPath)
+    if source.suffix.lower() not in (".dwg", ".dxf"):
+        raise HTTPException(
+            status_code=404,
+            detail="Предпросмотр отдаётся только для чертежей: PDF интерфейс рисует сам",
+        )
+    if format not in ("svg", "png"):
+        raise HTTPException(status_code=400, detail="format: svg или png")
+
+    # Картинка листа считается секунды, а запрашивается при каждом открытии.
+    # Держим её рядом с прогоном — вместе с ним и удалится.
+    #
+    # В имени файла есть версия отрисовки. Она нужна ровно для таких случаев,
+    # как переход на отрисовку по геометрии листа: у прогонов, сделанных
+    # раньше, в кэше лежат картинки, нарисованные прежним способом, и без
+    # версии интерфейс продолжал бы получать их до конца жизни прогона.
+    cache = Path(job.runDir) / "preview"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"page_{page_number:04d}.v2.{format}"
+    if not target.exists():
+        from dwg_render import sheet_preview
+
+        try:
+            if format == "svg":
+                image = sheet_preview(source, page_number, "svg")
+                if not image:
+                    raise HTTPException(status_code=404, detail="Лист нечего рисовать")
+                target.write_text(image, encoding="utf-8")
+            else:
+                if sheet_preview(source, page_number, "png", target) is None:
+                    raise HTTPException(status_code=404, detail="Лист нечего рисовать")
+        except IndexError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except HTTPException:
+            raise
+        except Exception as error:  # отрисовка не должна ронять сервис
+            raise HTTPException(
+                status_code=500, detail=f"Не удалось нарисовать лист: {error}"
+            ) from error
+
+    media = "image/svg+xml" if format == "svg" else "image/png"
+    return FileResponse(target, media_type=media)
+
+
 @app.get("/jobs/{job_id}/markdown", response_class=PlainTextResponse)
 def get_markdown(job_id: str):
     """Весь документ одним markdown — собирается на лету из готовых листов."""
@@ -436,6 +555,72 @@ def get_markdown(job_id: str):
         "\n\n---\n\n".join(chunks) + "\n",
         media_type="text/markdown; charset=utf-8",
     )
+
+
+def _project_or_404(project_id: str):
+    jobs = [job for job in store.list(project_id=project_id)]
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Нет документов такого проекта")
+    return jobs
+
+
+def _project_sections(project_id: str):
+    """Разделы проекта, сведённые из всех его документов.
+
+    Модель не вызывается: реквизиты листов читаются из самих файлов. Поэтому
+    отчёт о составе доступен сразу после загрузки, ещё до того как конвейер
+    дойдёт до последнего листа, — а тексты листов подставляются те, что уже
+    посчитаны.
+    """
+    import bundle
+
+    variants = []
+    skipped: list[str] = []
+    for job in _project_or_404(project_id):
+        path = Path(job.pdfPath)
+        if not path.exists():
+            skipped.append(f"{job.originalName}: файл не найден")
+            continue
+        try:
+            variants += bundle.read_source(
+                path, name=job.originalName, run_dir=job.runDir, job_id=job.id
+            )
+        except Exception as error:
+            # Один нечитаемый файл не должен ронять отчёт по всему проекту:
+            # остальные документы инженеру нужны сейчас, а не после разбора
+            # с чужим чертежом.
+            skipped.append(f"{job.originalName}: {error}")
+    return bundle.build(variants), skipped
+
+
+@app.get("/projects/{project_id}/sections")
+def get_project_sections(project_id: str):
+    """Состав проекта по разделам: что за листы и из каких файлов взяты."""
+    import bundle
+
+    sections, skipped = _project_sections(project_id)
+    return {
+        "projectId": project_id,
+        "sections": bundle.sections_dict(sections),
+        "skipped": skipped,
+    }
+
+
+@app.get("/projects/{project_id}/report", response_class=PlainTextResponse)
+def get_project_report(project_id: str, bodies: bool = True):
+    """Сводный отчёт по проекту одним markdown.
+
+    `bodies=false` отдаёт только состав и расхождения — это быстро и
+    достаточно, когда нужно проверить комплектность, а не читать листы.
+    """
+    import bundle
+
+    sections, skipped = _project_sections(project_id)
+    text = bundle.report_markdown(sections, with_bodies=bodies)
+    if skipped:
+        listed = "\n".join(f"- {item}" for item in skipped)
+        text += f"\n\n## Не удалось прочитать\n\n{listed}\n"
+    return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
 
 
 @app.post("/jobs/{job_id}/cancel")

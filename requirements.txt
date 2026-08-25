@@ -4,3 +4,8 @@ requests>=2.31.0
 pytesseract>=0.3.10
 python-dotenv>=1.0.0
 huggingface_hub>=0.27.0
+
+# Чтение чертежей DWG (dwg_sheets.py). Сам DWG закрытый и двоичный — ezdxf
+# читает DXF, в который его переводит внешний конвертер (LibreDWG dwg2dxf или
+# ODA File Converter, путь в PTO_DWG2DXF).
+ezdxf>=1.4

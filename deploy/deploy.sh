@@ -106,8 +106,37 @@ git log --oneline -1
 [ -f .env ] || { echo "НЕТ .env на сервере: без него не будет ни HF_TOKEN, ни PTO_API_TOKEN"; exit 1; }
 
 # --- 3. Пересобрать и поднять ------------------------------------------------
+# Конвертер DWG сервер больше не компилирует — берёт готовый образ из GHCR
+# (собирает его Actions, см. Dockerfile.dwgtools). Пакет приватный, как и
+# репозиторий, поэтому нужен вход тем же коротким токеном, что и для git.
+# Без токена (ручной запуск на сервере) вход пропускаем: если образ уже
+# скачан, сборка пройдёт и так.
+ghcr_logged=""
+if [ -n "${PTO_GITHUB_TOKEN:-}" ]; then
+  say "Вхожу в GHCR за образом конвертера"
+  if printf '%s' "$PTO_GITHUB_TOKEN" \
+       | docker login ghcr.io -u x-access-token --password-stdin >/dev/null; then
+    ghcr_logged="да"
+  else
+    echo "вход не удался — если образа нет локально, сборка упадёт"
+  fi
+fi
+
 say "Собираю образ и пересоздаю контейнер (профиль: $PROFILE)"
-docker compose --profile "$PROFILE" up -d --build
+build_status=0
+docker compose --profile "$PROFILE" up -d --build || build_status=$?
+
+# Токен живёт один прогон, но оставлять его в ~/.docker/config.json незачем.
+if [ -n "$ghcr_logged" ]; then
+  docker logout ghcr.io >/dev/null 2>&1 || true
+fi
+
+if [ "$build_status" -ne 0 ]; then
+  echo "Сборка образа не удалась (код $build_status)."
+  echo "Если жалуется на ghcr.io/…/pto-dwgtools — сначала должен пройти"
+  echo "job «dwgtools» в Actions: он собирает конвертер и кладёт его в GHCR."
+  exit "$build_status"
+fi
 
 # --- 4. Дождаться готовности -------------------------------------------------
 say "Жду /health"
