@@ -771,6 +771,83 @@ def sanitize_text(text: str) -> str:
     return "".join(out)
 
 
+def page_blocks_fixed(
+    page, *, quiet: bool = True, extra_text: str = ""
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Блоки листа с координатами и уже починенным текстом, в порядке чтения.
+
+    Нужны, чтобы собрать лист так, как он выглядит в исходнике: текст до
+    таблицы, таблица, текст под ней. Один сплошной кусок текста, который
+    отдаёт `page_text_fixed()`, для этого не годится — в нём не видно, где
+    кончается один блок и начинается другой.
+
+    Починка та же и в том же порядке: сперва глифы встроенного шрифта, потом
+    кроссворд по остатку, в конце санация.
+    """
+    tables = font_glyph_tables(page.parent)
+    trace: dict[tuple[float, float], tuple[int, int, str]] = {}
+    if tables:
+        try:
+            for span in page.get_texttrace():
+                for unicode_value, gid, origin, *_ in span["chars"]:
+                    trace[(round(origin[0], 1), round(origin[1], 1))] = (
+                        unicode_value,
+                        gid,
+                        span["font"],
+                    )
+        except Exception:
+            trace = {}
+
+    try:
+        raw_blocks = page.get_text("rawdict").get("blocks", [])
+    except Exception:
+        return []
+    blocks = [b for b in raw_blocks if b.get("type") == 0]
+    blocks.sort(key=lambda b: (round(b["bbox"][1], 1), round(b["bbox"][0], 1)))
+
+    mapping: dict[str, str] | None = None
+    out: list[tuple[tuple[float, float, float, float], str]] = []
+    for block in blocks:
+        lines: list[str] = []
+        for line in block.get("lines", []):
+            chars: list[str] = []
+            for char in line.get("spans", []):
+                for item in char.get("chars", []):
+                    ch = item.get("c") or ""
+                    origin = item.get("origin")
+                    hit = (
+                        trace.get((round(origin[0], 1), round(origin[1], 1)))
+                        if origin
+                        else None
+                    )
+                    if hit and hit[0] == 0xFFFD:
+                        candidates = tables.get(hit[2], {}).get(hit[1], set())
+                        if len(candidates) == 1:
+                            right = chr(next(iter(candidates)))
+                            if right != ch:
+                                ch = right
+                    chars.append(ch)
+            text = "".join(chars).strip()
+            if text:
+                lines.append(text)
+        body = "\n".join(lines)
+        if not body.strip():
+            continue
+        if any(is_broken_any(ch) for ch in body):
+            if mapping is None:
+                mapping = map_for_doc(page.parent, quiet=quiet, extra_text=extra_text)
+            if mapping:
+                fixed = decode(body, mapping)
+                if sum(1 for ch in fixed if is_broken_any(ch)) <= sum(
+                    1 for ch in body if is_broken_any(ch)
+                ):
+                    body = fixed
+        body = sanitize_text(body).strip()
+        if body:
+            out.append((tuple(round(v, 1) for v in block["bbox"]), body))
+    return out
+
+
 def page_text_fixed(page, *, quiet: bool = False, extra_text: str = "") -> str:
     """Текстовый слой листа с починкой сломанного ToUnicode.
 
