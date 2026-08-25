@@ -31,13 +31,14 @@
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
 import subprocess
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -65,6 +66,55 @@ class TextItem:
     height: float
     text: str
     source: str  # mtext | text | attrib | dimension | leader
+    # Поворот подписи в градусах. В штампе «Взам. инв. №» и «Инв. № подл.»
+    # стоят вертикально, и без угла интерфейс нарисовал бы их поперёк рамки.
+    rotation: float = 0.0
+    # Ширина текстового блока в единицах чертежа (у MTEXT). По ней подпись
+    # переносится по строкам; без неё длинное примечание рисуется одной
+    # строкой и уезжает за рамку листа.
+    width: float = 0.0
+    # Каким углом подпись прижата к своей точке. Без этого выровненный по
+    # центру текст рисуется от неё вправо и наезжает на соседний.
+    anchor: str = "left"
+    valign: str = "baseline"
+
+
+@dataclass
+class SheetView:
+    """Окно вида: кусок модели, показанный в прямоугольнике на листе.
+
+    Держит всё, что нужно, чтобы перевести координаты модели в координаты
+    листа. Без этого перевода лист собирается в двух системах сразу: рамка и
+    штамп лежат в миллиметрах бумаги (0…1783), а подписи с генплана — в
+    мировых координатах площадки (2 226 000). Разница в два миллиона, и лист
+    выглядит пустым: и то и другое сжимается в точку по разным углам.
+    """
+
+    world: tuple[float, float, float, float]  # окно в координатах модели
+    paper_center: tuple[float, float]  # центр окна на листе, мм
+    paper_size: tuple[float, float]  # размер окна на листе, мм
+    scale: float  # во сколько раз модель крупнее бумаги
+    twist: float  # разворот вида, радианы
+
+    def to_paper(self, x: float, y: float) -> tuple[float, float]:
+        """Точку модели — в координаты листа."""
+        cx = (self.world[0] + self.world[2]) / 2
+        cy = (self.world[1] + self.world[3]) / 2
+        dx, dy = x - cx, y - cy
+        cos_a, sin_a = math.cos(-self.twist), math.sin(-self.twist)
+        rx = dx * cos_a - dy * sin_a
+        ry = dx * sin_a + dy * cos_a
+        return (
+            self.paper_center[0] + rx / self.scale,
+            self.paper_center[1] + ry / self.scale,
+        )
+
+    def holds(self, x: float, y: float) -> bool:
+        """Точка модели попадает в это окно."""
+        return (
+            self.world[0] <= x <= self.world[2]
+            and self.world[1] <= y <= self.world[3]
+        )
 
 
 @dataclass
@@ -82,6 +132,23 @@ class Sheet:
     # рамка. По ним лист и разбирается — что на нём есть и где именно.
     # (x0, y0, x1, y1, масштаб) — окна вьюпортов или сама рамка.
     windows: list[tuple[float, float, float, float, float]] = field(default_factory=list)
+    # Окна вида с полным преобразованием «модель → лист». Пусты у листов,
+    # найденных по рамкам: там чертёж и рамка уже в одной системе.
+    views: list[SheetView] = field(default_factory=list)
+    # Имя layout'а, если лист им и является: по нему берут рамку и штамп,
+    # нарисованные на самой бумаге.
+    layout_name: str = ""
+    # Имя блока, из которого собран лист. Заполняется у таблиц, потерявших
+    # привязку: их сетку надо искать не в модели, а внутри самого блока.
+    source_block: str = ""
+    # Чем разбор листа оказался неполон — это идёт в паспорт, чтобы инженер
+    # видел разницу между «на листе ничего нет» и «мы не смогли прочитать».
+    note: str = ""
+    # Сколько подписей пришло из пространства модели через окна вьюпортов.
+    # Ноль при непустом чертеже означает, что окно настроено мимо, — и это
+    # надо отличать от «на листе просто нет текста»: собственный штамп в
+    # layout'е есть почти всегда, и по `texts` промах не виден.
+    from_model: int = 0
 
     def extent(self) -> tuple[float, float, float, float] | None:
         """Общий охват листа в координатах модели."""
@@ -139,9 +206,13 @@ def find_converter() -> Path | None:
 
 
 def to_dxf(path: Path, out_dir: Path | None = None) -> Path:
-    """DWG → DXF. Если на вход уже DXF, возвращает его же."""
+    """DWG → DXF, готовый к чтению. Если на вход уже DXF, конвертация не нужна.
+
+    В обоих случаях файл проходит через `merge_split_text()`: разрезанные
+    строки чинятся и в том DXF, который прислали готовым.
+    """
     if path.suffix.lower() == ".dxf":
-        return path
+        return merge_split_text(path)
     converter = find_converter()
     if converter is None:
         raise RuntimeError(
@@ -164,7 +235,87 @@ def to_dxf(path: Path, out_dir: Path | None = None) -> Path:
         raise RuntimeError(
             f"Конвертер не создал {target.name}: {result.stderr.strip()[:300]}"
         )
-    return target
+    return merge_split_text(target)
+
+
+# Сущности, у которых длинный текст разложен по нескольким тегам: 3 —
+# продолжения, 1 — последний кусок. У ATTRIB и TEXT ezdxf выбрасывает всё,
+# кроме последнего куска, и от подписи остаётся хвост.
+#
+# MTEXT ezdxf склеивает сам, но склеивает УЖЕ ДЕКОДИРОВАННЫЕ куски, а режет их
+# конвертер по границе 255 БАЙТ — прямо посередине кириллической буквы. Её
+# половинки при декодировании теряются, и в тексте появляется «инженрно-
+# технического» вместо «инженерно-технического». Склейка на байтах собирает
+# букву обратно, поэтому MTEXT здесь тоже.
+_SPLIT_TEXT_ENTITIES = (b"ATTRIB", b"ATTDEF", b"TEXT", b"MTEXT")
+
+
+def merge_split_text(dxf_path: Path) -> Path:
+    """Склеивает разрезанные строки в DXF и возвращает путь к исправленному.
+
+    Зачем. В штампе комплекта «Жуковский» название объекта — 175 символов, а в
+    DXF строка режется по границе 255 БАЙТ: начало уходит в тег 3, остаток — в
+    тег 1. ezdxf отдаёт для ATTRIB только тег 1, и в вывод попадало «ковская
+    область, городской округ Жуковский» вместо полного названия — то есть
+    ровно та строка, по которой ПТО опознаёт объект.
+
+    Режется по байтам, а не по символам, поэтому кириллическая буква на стыке
+    разрывается пополам и превращается в пару одиноких суррогатов. Склейка
+    делается на байтах — тогда буква собирается обратно сама.
+
+    Файл переписывается рядом (суффикс `.merged.dxf`); если склеивать нечего,
+    возвращается исходный путь.
+    """
+    if dxf_path.name.endswith(".merged.dxf"):
+        return dxf_path  # уже склеенный — второй раз не переписываем
+    ready = dxf_path.with_suffix(".merged.dxf")
+    if ready.exists() and ready.stat().st_mtime >= dxf_path.stat().st_mtime:
+        return ready  # склейка ПОС на 42 МБ стоит секунды, повторять её незачем
+
+    data = dxf_path.read_bytes()
+    if b"\n  3\n" not in data and b"\r\n  3\r\n" not in data:
+        return dxf_path
+
+    lines = data.splitlines(keepends=True)
+    out: list[bytes] = []
+    entity = b""
+    pending: list[bytes] = []
+    merged = 0
+    index = 0
+    while index + 1 < len(lines):
+        code_line, value_line = lines[index], lines[index + 1]
+        code = code_line.strip()
+        if code == b"0":
+            entity = value_line.strip()
+            pending.clear()
+        if code == b"3" and entity in _SPLIT_TEXT_ENTITIES:
+            pending.append(value_line.rstrip(b"\r\n"))
+            index += 2
+            continue
+        if pending:
+            if code == b"1":
+                value = b"".join(pending) + value_line.rstrip(b"\r\n")
+                ending = value_line[len(value_line.rstrip(b"\r\n")):]
+                out.append(code_line)
+                out.append(value + ending)
+                merged += 1
+                pending.clear()
+                index += 2
+                continue
+            # Тег 3 был не продолжением строки — возвращаем как было.
+            for chunk in pending:
+                out.append(b"  3\n")
+                out.append(chunk + b"\n")
+            pending.clear()
+        out.append(code_line)
+        out.append(value_line)
+        index += 2
+    out.extend(lines[index:])
+    if not merged:
+        return dxf_path
+
+    ready.write_bytes(b"".join(out))
+    return ready
 
 
 # Управляющие последовательности AutoCAD внутри текста. Они универсальны для
@@ -186,6 +337,27 @@ _ACAD_CODES = (
 )
 
 
+# Юникод, записанный escape-последовательностью AutoCAD: «\U+041E» — это «О»,
+# «\M+1041E» — то же самое через кодовую страницу. Без раскрытия в вывод едет
+# «1-1 (\U+041E\U+043F\U+0430…)» вместо «1-1 (Опалубка)»: на фундаментах КР1
+# таких мест 36, на стройгенплане ПОС — 434.
+_UNI_ESCAPE = re.compile(r"\\U\+([0-9A-Fa-f]{4})|\\M\+[0-9A-Fa-f]([0-9A-Fa-f]{4})")
+
+
+def _unescape_unicode(text: str) -> str:
+    if r"\U+" not in text and r"\M+" not in text:
+        return text
+
+    def repl(match: re.Match) -> str:
+        code = match.group(1) or match.group(2)
+        try:
+            return chr(int(code, 16))
+        except ValueError:
+            return match.group(0)
+
+    return _UNI_ESCAPE.sub(repl, text)
+
+
 def clean_text(raw: str) -> str:
     """Убирает то, что не переживёт запись в файл.
 
@@ -204,21 +376,100 @@ def clean_text(raw: str) -> str:
         if code < 0x20 and ch not in (chr(10), chr(9)):
             continue
         out.append(ch)
-    text = "".join(out)
+    text = _unescape_unicode("".join(out))
     for code, repl in _ACAD_CODES:
         if code in text:
             text = text.replace(code, repl)
     return text
 
 
+# Заглушка невычисленного поля AutoCAD: две решётки и больше, ничего кроме.
+_FIELD_STUB = re.compile(r"#{2,}")
+
+
 def _plain(entity) -> str:
-    """Текст сущности без разметки MTEXT."""
+    """Текст сущности без разметки MTEXT.
+
+    «####» отбрасываем: так AutoCAD показывает поле, значение которого не
+    вычислено, а конвертер поля не переносит вовсе («copy process ignored
+    FIELD»). В штампе ПЗУ таких заглушек 172 штуки — в выводе они выглядели бы
+    строкой «Разраб. Терещенко #### #### ####».
+    """
     try:
         if entity.dxftype() == "MTEXT":
-            return clean_text(entity.plain_text())
-        return clean_text(entity.dxf.text)
+            text = clean_text(entity.plain_text())
+        else:
+            text = clean_text(entity.dxf.text)
     except Exception:
         return ""
+    return "" if _FIELD_STUB.fullmatch(text.strip()) else text
+
+
+# Выравнивание текста в DXF. Точка вставки у выровненной подписи лежит НЕ в
+# группе 10 (insert), а в группе 11 (align_point) — это правило формата, и без
+# него подписи уезжают: на листе фундаментов таких 336 штук, часть из них
+# сходится в одну точку и наезжает друг на друга.
+_HALIGN = {0: "left", 1: "center", 2: "right", 3: "left", 4: "center", 5: "left"}
+_VALIGN = {0: "baseline", 1: "bottom", 2: "middle", 3: "top"}
+
+# У MTEXT точка одна, но attachment_point говорит, каким углом текст к ней
+# прижат: 1 — левый верхний, 5 — центр, 9 — правый нижний.
+_MTEXT_ANCHOR = {
+    1: ("left", "top"), 2: ("center", "top"), 3: ("right", "top"),
+    4: ("left", "middle"), 5: ("center", "middle"), 6: ("right", "middle"),
+    7: ("left", "bottom"), 8: ("center", "bottom"), 9: ("right", "bottom"),
+}
+
+
+def _placement(entity) -> tuple[float, float, str, str]:
+    """Где на самом деле стоит подпись: (x, y, привязка по X, привязка по Y)."""
+    kind = entity.dxftype()
+    try:
+        if kind == "MTEXT":
+            point = entity.dxf.insert
+            anchor, valign = _MTEXT_ANCHOR.get(
+                int(entity.dxf.get("attachment_point", 1) or 1), ("left", "top")
+            )
+            return point.x, point.y, anchor, valign
+        halign = int(entity.dxf.get("halign", 0) or 0)
+        valign = int(entity.dxf.get("valign", 0) or 0)
+        point = entity.dxf.insert
+        if halign or valign:
+            aligned = entity.dxf.get("align_point", None)
+            if aligned is not None:
+                point = aligned
+        return (
+            point.x,
+            point.y,
+            _HALIGN.get(halign, "left"),
+            _VALIGN.get(valign, "baseline"),
+        )
+    except Exception:
+        try:
+            point = entity.dxf.insert
+            return point.x, point.y, "left", "baseline"
+        except Exception:
+            return 0.0, 0.0, "left", "baseline"
+
+
+def _rotation(entity) -> float:
+    """Угол поворота подписи в градусах. 0, если его нет."""
+    for attr in ("rotation", "text_direction", "char_height"):
+        if attr != "rotation":
+            continue
+        try:
+            return float(entity.dxf.get("rotation", 0.0) or 0.0) % 360
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _text_width(entity) -> float:
+    """Ширина текстового блока MTEXT в единицах чертежа. 0 — не задана."""
+    try:
+        return float(entity.dxf.get("width", 0.0) or 0.0)
+    except Exception:
+        return 0.0
 
 
 def _text_height(entity) -> float:
@@ -248,15 +499,37 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
             if kind in ("MTEXT", "TEXT"):
                 text = _plain(e).strip()
                 if text:
-                    p = e.dxf.insert
+                    x, y, anchor, valign = _placement(e)
                     out.append(
-                        TextItem(p.x, p.y, _text_height(e), text, kind.lower())
+                        TextItem(
+                            x,
+                            y,
+                            _text_height(e),
+                            text,
+                            kind.lower(),
+                            _rotation(e),
+                            _text_width(e),
+                            anchor,
+                            valign,
+                        )
                     )
             elif kind == "ATTRIB":
-                text = clean_text(e.dxf.text or "").strip()
+                text = _plain(e).strip()
                 if text:
-                    p = e.dxf.insert
-                    out.append(TextItem(p.x, p.y, _text_height(e), text, "attrib"))
+                    x, y, anchor, valign = _placement(e)
+                    out.append(
+                        TextItem(
+                            x,
+                            y,
+                            _text_height(e),
+                            text,
+                            "attrib",
+                            _rotation(e),
+                            _text_width(e),
+                            anchor,
+                            valign,
+                        )
+                    )
             elif kind == "DIMENSION":
                 # Размер несёт либо явный текст, либо измеренное значение.
                 text = clean_text(e.dxf.get("text", "") or "").strip()
@@ -282,11 +555,21 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                     out.append(TextItem(x, y, 2.5, text, "leader"))
             elif kind == "INSERT":
                 for attrib in e.attribs:
-                    text = clean_text(attrib.dxf.text or "").strip()
+                    text = _plain(attrib).strip()
                     if text:
-                        p = attrib.dxf.insert
+                        x, y, anchor, valign = _placement(attrib)
                         out.append(
-                            TextItem(p.x, p.y, _text_height(attrib), text, "attrib")
+                            TextItem(
+                                x,
+                                y,
+                                _text_height(attrib),
+                                text,
+                                "attrib",
+                                _rotation(attrib),
+                                _text_width(attrib),
+                                anchor,
+                                valign,
+                            )
                         )
                 _collect_from(e.virtual_entities(), out, depth + 1)
         except Exception:
@@ -294,16 +577,28 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
             continue
 
 
-def _viewport_window(vp) -> tuple[float, float, float, float, float] | None:
-    """Окно вьюпорта в координатах модели: (x0, y0, x1, y1, масштаб).
+def _viewport_window(vp):
+    """Окно вьюпорта: (x0, y0, x1, y1, масштаб, преобразование в лист).
 
     Масштаб — во сколько раз модель крупнее бумаги: высота вида, делённая на
     высоту окна на бумаге. Для листа 1:40 это ровно 40.
+
+    Где на самом деле центр вида. Поле `view_center_point` задано НЕ в мировых
+    координатах, а в системе координат самого вида, и у площадочных чертежей
+    это разные вещи: у ПЗУ комплекта «Жуковский» центр по этому полю выходит
+    около x=20 000, а сам генплан вычерчен около x=2 226 000 — вид уезжал на
+    два миллиона единиц, и в лист не попадало НИ ОДНОЙ подписи из модели.
+    Правильная точка — «цель вида» (`view_target_point`, она в мировых) плюс
+    смещение центра, повёрнутое на угол разворота вида. После поправки на
+    листы ПЗУ легло 3, 28, 26 и 33 подписи; там, где всё работало и раньше
+    (КР1), числа не изменились.
     """
     try:
         if int(vp.dxf.get("id", 0)) == PAPER_VIEWPORT_ID:
             return None
         center = vp.dxf.view_center_point
+        target = vp.dxf.get("view_target_point", None)
+        twist = math.radians(float(vp.dxf.get("view_twist_angle", 0.0) or 0.0))
         view_h = float(vp.dxf.view_height)
         paper_w = float(vp.dxf.width)
         paper_h = float(vp.dxf.height)
@@ -311,14 +606,30 @@ def _viewport_window(vp) -> tuple[float, float, float, float, float] | None:
         return None
     if view_h <= 0 or paper_h <= 0:
         return None
+    cos_a, sin_a = math.cos(twist), math.sin(twist)
+    shift_x = center.x * cos_a - center.y * sin_a
+    shift_y = center.x * sin_a + center.y * cos_a
+    if target is not None:
+        center_x = target.x + shift_x
+        center_y = target.y + shift_y
+    else:
+        center_x, center_y = center.x, center.y
     view_w = view_h * (paper_w / paper_h)
-    return (
-        center.x - view_w / 2,
-        center.y - view_h / 2,
-        center.x + view_w / 2,
-        center.y + view_h / 2,
-        view_h / paper_h,
+    world = (
+        center_x - view_w / 2,
+        center_y - view_h / 2,
+        center_x + view_w / 2,
+        center_y + view_h / 2,
     )
+    paper_center = vp.dxf.get("center", None)
+    view = SheetView(
+        world=world,
+        paper_center=(paper_center.x, paper_center.y) if paper_center else (0.0, 0.0),
+        paper_size=(paper_w, paper_h),
+        scale=view_h / paper_h,
+        twist=twist,
+    )
+    return (*world, view_h / paper_h, view)
 
 
 # Форматы по ГОСТ 2.301 / ISO 216, в миллиметрах. Нужны, чтобы по размеру
@@ -460,6 +771,65 @@ def _sheets_from_frames(msp, model_texts: list[TextItem]) -> list[Sheet]:
     return sheets
 
 
+# Анонимные блоки AutoCAD: «*T17», «*U258». В них он держит развёрнутое
+# содержимое таблиц и динамических вставок. Обычно на такой блок ссылается
+# сущность-таблица, и мы добираемся до текста через неё.
+_ANON_BLOCK_PREFIXES = ("*T", "*U", "*X", "*D")
+
+
+def orphan_blocks(doc) -> list[tuple[str, list]]:
+    """Блоки с текстом, на которые в файле никто не ссылается.
+
+    Зачем это нужно. В файле ТБЭ состав проекта — это таблица AutoCAD; её
+    содержимое конвертер перенёс в анонимные блоки «*T17» и «*T18», а саму
+    вставку потерял. Формально блоки в файле есть, фактически их не видно
+    ниоткуда — и лист «Состав проекта» приезжал пустым, хотя в исходнике на
+    нём полсотни строк с шифрами разделов.
+
+    Такой блок нельзя поставить на лист: без вставки неизвестно ни место, ни
+    масштаб. Но потерять его тем более нельзя, поэтому содержимое отдаётся
+    отдельно — как приложение к документу.
+    """
+    used: set[str] = set()
+    spaces = [doc.modelspace()] + [
+        layout for layout in doc.layouts if layout.name != "Model"
+    ]
+    spaces += [doc.blocks.get(block.name) for block in doc.blocks]
+    for space in spaces:
+        try:
+            items = list(space)
+        except Exception:
+            continue
+        for entity in items:
+            if entity.dxftype() == "INSERT":
+                try:
+                    used.add(entity.dxf.name)
+                except Exception:
+                    continue
+
+    found: list[tuple[str, list]] = []
+    seen_content: set[str] = set()
+    for block in doc.blocks:
+        name = block.name
+        if name in used or not name.startswith(_ANON_BLOCK_PREFIXES):
+            continue
+        texts: list[TextItem] = []
+        try:
+            _collect_from(doc.blocks.get(name), texts)
+        except Exception:
+            continue
+        if len(texts) < 5:
+            continue  # пара подписей — это не потерянная таблица
+        # Копии одной таблицы AutoCAD держит под разными именами: «*T17» и
+        # «*T22» у ТБЭ совпадают знак в знак. Второй экземпляр не нужен.
+        fingerprint = "|".join(sorted(t.text for t in texts))[:2000]
+        if fingerprint in seen_content:
+            continue
+        seen_content.add(fingerprint)
+        found.append((name, texts))
+    return found
+
+
 def read_sheets(dxf_path: Path) -> list[Sheet]:
     """Листы чертежа с текстом, привязанным к каждому."""
     import ezdxf
@@ -481,37 +851,138 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
         sheet = Sheet(
             number=number,
             name=name,
+            layout_name=name,
             paper=paper,
             paper_width=float(d.get("paper_width", 0) or 0),
             paper_height=float(d.get("paper_height", 0) or 0),
         )
         # Текст, лежащий на самом листе (рамка, штамп бывают и там).
         _collect_from(layout, sheet.texts)
+        # Лист, у которого в файле нет вообще ничего, — это не «пустой лист
+        # комплекта», а потеря: у ПЗУ так выглядят «ПЗМ» и «Озел. и МАФ» —
+        # в DXF от них остались только границы блока, без рамки и без окна
+        # вида, хотя в самом DWG листы не пустые. Молчать об этом нельзя:
+        # инженер должен знать, что смотреть его надо в исходнике.
+        if not any(True for _ in layout):
+            sheet.note = (
+                "после конвертации DWG → DXF лист пуст: в файле не осталось "
+                "ни рамки, ни окна вида — смотрите исходный чертёж"
+            )
         # Плюс всё, что попадает в окна вьюпортов.
         seen: set[tuple[float, float, str]] = set()
         for vp in layout.query("VIEWPORT"):
             window = _viewport_window(vp)
             if window is None:
                 continue
-            x0, y0, x1, y1, scale = window
+            x0, y0, x1, y1, scale, view = window
             sheet.scales.append(round(scale, 2))
             sheet.windows.append((x0, y0, x1, y1, round(scale, 2)))
+            sheet.views.append(view)
             for item in model_texts:
-                if x0 <= item.x <= x1 and y0 <= item.y <= y1:
-                    key = (round(item.x, 2), round(item.y, 2), item.text)
-                    if key in seen:
-                        continue  # врезки перекрываются, текст не дублируем
-                    seen.add(key)
-                    sheet.texts.append(item)
+                if not view.holds(item.x, item.y):
+                    continue
+                key = (round(item.x, 2), round(item.y, 2), item.text)
+                if key in seen:
+                    continue  # врезки перекрываются, текст не дублируем
+                seen.add(key)
+                # Подпись из модели переносим в координаты листа — туда, где
+                # инженер её и видит. Высоту делим на масштаб вида по той же
+                # причине: 2.5 мм на бумаге при 1:500 — это 1250 единиц в
+                # модели, и без пересчёта надпись накрыла бы весь лист.
+                paper_x, paper_y = view.to_paper(item.x, item.y)
+                sheet.texts.append(
+                    replace(
+                        item,
+                        x=paper_x,
+                        y=paper_y,
+                        height=item.height / view.scale if view.scale else item.height,
+                        width=item.width / view.scale if view.scale else item.width,
+                    )
+                )
+                sheet.from_model += 1
         sheets.append(sheet)
 
     # Layout'ы бывают пустыми: комплект вычерчен прямо в модели, листы стоят
     # рядом каждый в своей рамке. Тогда листы ищем по рамкам.
-    if not any(s.texts for s in sheets):
+    #
+    # Сравниваем два разбиения по существу, а не по признаку «layout'ы совсем
+    # пусты»: у ИОС5 единственный layout цепляет пару подписей из модели, и по
+    # такому признаку разбиение по рамкам не включалось бы — пять листов
+    # комплекта схлопывались в один почти пустой.
+    caught_by_layouts = sum(len(s.texts) for s in sheets)
+    if caught_by_layouts < len(model_texts):
         by_frames = _sheets_from_frames(doc.modelspace(), model_texts)
-        if by_frames:
+        caught_by_frames = sum(len(s.texts) for s in by_frames)
+        if by_frames and (
+            caught_by_frames > caught_by_layouts or len(by_frames) > len(sheets)
+        ):
             return by_frames
+
+    # Окно вьюпорта бывает настроено мимо чертежа: в «КР1 Планы» вид смотрит на
+    # x −52 816..169 632, а сам чертёж вычерчен около x 2 900 000, и по окну не
+    # находится ни одной подписи. Пока лист в файле один, сомнений нет — весь
+    # текст модели относится к нему. Когда листов несколько, раздавать один и
+    # тот же текст всем неправильно, поэтому лист остаётся пустым, но об этом
+    # прямо сказано в паспорте.
+    caught = sum(item.from_model for item in sheets)
+    if model_texts and not caught:
+        if len(sheets) == 1:
+            sheets[0].texts.extend(model_texts)
+            sheets[0].note = (
+                "окно вида в файле указывает мимо чертежа — взят весь текст "
+                "пространства модели"
+            )
+        else:
+            # Листов несколько, и раздать им один и тот же текст нельзя. Но и
+            # потерять его нельзя: на стройгенплане ПОС в модели 33 825
+            # подписей, а через окна на листы не попадает ни одна. Отдаём их
+            # отдельным листом в конце — с честной пометкой, что разложить по
+            # листам комплекта не удалось.
+            for sheet in sheets:
+                sheet.note = (
+                    "окно вида в файле указывает мимо чертежа — виден только "
+                    "собственный текст листа"
+                )
+            sheets.append(
+                Sheet(
+                    number=None,
+                    name="Текст пространства модели",
+                    paper="",
+                    paper_width=0.0,
+                    paper_height=0.0,
+                    texts=list(model_texts),
+                    note=(
+                        "лист собран из подписей, которые не привязались ни к "
+                        "одному листу комплекта"
+                    ),
+                )
+            )
+            return sheets
     sheets.sort(key=lambda s: (s.number is None, s.number or 0, s.name))
+
+    # Потерянные при конвертации таблицы — отдельными листами в конце. Иначе
+    # состав проекта из файла ТБЭ пропадал целиком: на своём листе он не
+    # появлялся, а больше его взять неоткуда.
+    for name, texts in orphan_blocks(doc):
+        xs = [t.x for t in texts]
+        ys = [t.y for t in texts]
+        sheets.append(
+            Sheet(
+                number=None,
+                name=f"Таблица без привязки ({name})",
+                source_block=name,
+                paper="",
+                paper_width=0.0,
+                paper_height=0.0,
+                texts=list(texts),
+                windows=[(min(xs), min(ys), max(xs), max(ys), 1.0)],
+                note=(
+                    "таблица есть в файле, но конвертер потерял её привязку к "
+                    "листу — место на листе неизвестно, содержимое приведено "
+                    "полностью"
+                ),
+            )
+        )
     return sheets
 
 
@@ -532,14 +1003,35 @@ def reading_order(texts: list[TextItem]) -> list[str]:
             lines[-1].append(item)
         else:
             lines.append([item])
-    out: list[str] = []
+    joined_lines: list[str] = []
     for line in lines:
         line.sort(key=lambda t: t.x)
-        joined = " ".join(t.text.replace("\n", " ").strip() for t in line)
+        joined = " ".join(t.text.replace(chr(10), " ").strip() for t in line)
         joined = re.sub(r"\s{2,}", " ", joined).strip()
         if joined:
-            out.append(joined)
+            joined_lines.append(joined)
+
+    # На плане одна и та же метка стоит у каждого объекта: на стройгенплане
+    # ПОС отдельные подписи повторяются сотнями. Для чтения это шум, поэтому
+    # частые повторы схлопываем — тем же приёмом, каким normalize_pdf_text()
+    # разбирается со спамом меток в текстовом слое PDF.
+    counts = Counter(joined_lines)
+    shown: set[str] = set()
+    out: list[str] = []
+    for line in joined_lines:
+        repeats = counts[line]
+        if repeats < REPEAT_LIMIT:
+            out.append(line)
+            continue
+        if line in shown:
+            continue
+        shown.add(line)
+        out.append(f"{line} (×{repeats} на листе — схлопнуто)")
     return out
+
+
+# Сколько одинаковых строк на листе считать спамом меток, а не текстом.
+REPEAT_LIMIT = 4
 
 
 # Код единиц чертежа ($INSUNITS) → сколько это метров. Спрашиваем у файла, а
@@ -699,11 +1191,153 @@ def _analyse_box(msp, box, unit_m: float) -> tuple[list[LayerStat], Counter]:
     return stats, blocks
 
 
+def xref_names(doc) -> set[str]:
+    """Имена блоков, которые на деле — внешние ссылки на другие файлы.
+
+    В комплекте «Жуковский» весь ПЗУ собран из xref: в самом файле лежат рамка
+    и штамп, а генплан, топосъёмка и сети — в отдельных DWG папки `_Ссылки`,
+    которой в присланном комплекте нет. Без пометки лист выглядит так, будто на
+    нём почти ничего не начерчено, — а на самом деле начерченное не приложено.
+    """
+    names = set()
+    for block in doc.blocks:
+        try:
+            flags = int(block.block.dxf.get("flags", 0))
+        except Exception:
+            continue
+        if flags & 4:  # бит внешней ссылки
+            names.add(block.name)
+    return names
+
+
+# Слова основной надписи листа. Штамп есть почти на каждом листе, и в карте
+# он должен называться штампом, а не «текстом в юго-восточном углу».
+_STAMP_WORDS = ("изм.", "кол.уч", "подпись и дата", "инв. n°", "инв. №", "взам")
+
+
+def _text_zone(item, box) -> str:
+    """Зона листа, в которой лежит подпись."""
+    return _zone((item.x, item.y, item.x, item.y), box)
+
+
+def sheet_extras(msp, sheet: Sheet):
+    """Таблицы листа и число вставленных OLE-объектов.
+
+    OLE — это вставленный кусок Excel или картинка. В комплекте «Жуковский»
+    так вставлен состав проекта: внутри лежит растр, а не данные, поэтому в
+    текст листа он не попадает. Молчать об этом нельзя — иначе лист выглядит
+    пустым, хотя на нём напечатана таблица.
+    """
+    try:
+        from dwg_tables import sheet_tables
+
+        # У листа, собранного из потерянного блока, и сетка, и подписи лежат
+        # внутри этого блока, а не в пространстве модели.
+        space = msp
+        if sheet.source_block:
+            try:
+                space = msp.doc.blocks.get(sheet.source_block)
+            except Exception:
+                space = msp
+        tables = sheet_tables(space, sheet, sheet.texts)
+    except Exception:
+        tables = []
+    box = sheet.extent()
+    ole = 0
+    # У листа, собранного из потерянного блока, своей области на чертеже нет —
+    # считать по ней вставки бессмысленно.
+    if box is not None and not sheet.source_block:
+        for entity in msp:
+            if entity.dxftype() != "OLE2FRAME":
+                continue
+            try:
+                point = entity.dxf.get("insert", None)
+                if point is None or (
+                    box[0] <= point.x <= box[2] and box[1] <= point.y <= box[3]
+                ):
+                    ole += 1
+            except Exception:
+                ole += 1
+    return tables, ole
+
+
+def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
+    """Содержимое листа в порядке чертежа: подписи сверху вниз, таблицы на месте.
+
+    Таблица врезается туда, где она нарисована, а не выносится отдельным
+    списком в конец: инженер читает лист так же, как смотрит на него.
+    """
+    tables = tables or []
+    lines: list[tuple[float, str]] = []
+    covered = []
+    for box, markdown in tables:
+        covered.append(box)
+        lines.append((box[3], "\n".join(["**Таблица**", "", markdown])))
+    outside = [
+        item
+        for item in sheet.texts
+        if not any(
+            b[0] <= item.x <= b[2] and b[1] <= item.y <= b[3] for b in covered
+        )
+    ]
+    for text in reading_order(outside):
+        lines.append((None, text))
+    # Таблицы расставляем по своей высоте, текст идёт своим порядком чтения:
+    # смешивать их по одному ключу нельзя — у строк текста высоты уже нет.
+    ordered: list[str] = []
+    table_lines = sorted([ln for ln in lines if ln[0] is not None], key=lambda ln: -ln[0])
+    text_lines = [ln[1] for ln in lines if ln[0] is None]
+    ordered.extend(text_lines)
+    for _, block in table_lines:
+        ordered.insert(0, block)
+    return ordered
+
+
+def sheet_map(sheet: Sheet, layers=None, tables=None, ole=0) -> str:
+    """Карта листа: что за блок, где он и какого объёма.
+
+    Пишется для модели: строки однообразны, содержимое не пересказывается —
+    оно идёт ниже дословно. Нужна, чтобы вопрос «что в правом нижнем углу»
+    не приходилось решать по потоку подписей.
+    """
+    box = sheet.extent()
+    rows = ["| Блок | Где на листе | Объём |", "|---|---|---|"]
+    if box is None:
+        return ""
+    stamp = [t for t in sheet.texts if any(w in t.text.lower() for w in _STAMP_WORDS)]
+    if stamp:
+        zone = _text_zone(stamp[0], box)
+        rows.append(f"| штамп | {zone} | {len(stamp)} стр. |")
+    by_zone: dict[str, int] = {}
+    for item in sheet.texts:
+        if item in stamp:
+            continue
+        by_zone[_text_zone(item, box)] = by_zone.get(_text_zone(item, box), 0) + 1
+    for zone, count in sorted(by_zone.items(), key=lambda kv: -kv[1]):
+        rows.append(f"| подписи | {zone} | {count} шт. |")
+    for index, (table_box, markdown) in enumerate(tables or [], start=1):
+        grid_rows = [ln for ln in markdown.splitlines() if ln.startswith("|")]
+        columns = grid_rows[0].count("|") - 1 if grid_rows else 0
+        rows.append(
+            f"| таблица {index} | {_zone(table_box, box)} | "
+            f"{max(len(grid_rows) - 1, 0)}×{columns} |"
+        )
+    for stat in (layers or [])[:10]:
+        volume = f"{stat.length_m:g} м" if stat.length_m >= 0.1 else f"{stat.entities} об."
+        rows.append(f"| слой {stat.name} | {stat.zone} | {volume} |")
+    if ole:
+        rows.append(f"| вставленный объект | — | {ole} шт. |")
+    return "\n".join(rows) if len(rows) > 2 else ""
+
+
 def sheet_markdown(
     sheet: Sheet,
     file_name: str,
     layers: list[LayerStat] | None = None,
     blocks: Counter | None = None,
+    xrefs: set[str] | None = None,
+    tables: list | None = None,
+    ole: int = 0,
 ) -> str:
     """Лист в том же контракте, что и страница PDF: ## Страница N / ### PASS-*."""
     number = sheet.number if sheet.number is not None else 0
@@ -725,9 +1359,32 @@ def sheet_markdown(
         f"- текстовых объектов: {len(sheet.texts)}",
         "",
     ]
+    if sheet.note:
+        parts[-1:] = [f"- разбор листа неполон: {sheet.note}", ""]
+    # Карта листа идёт в PASS-A, а не отдельной секцией PASS-0: сервис
+    # считает PASS-0 служебным паспортом и в интерфейс его не выводит, а карта
+    # нужна как раз на экране и в промпте.
+    map_md = sheet_map(sheet, layers, tables, ole)
+    if map_md:
+        parts += [
+            "### PASS-A Карта листа",
+            "",
+            "_Что где лежит на листе. Содержимое не пересказывается — оно ниже "
+            "дословно._",
+            "",
+            map_md,
+            "",
+        ]
+    if ole:
+        parts += [
+            f"_На листе вставленных объектов (OLE): {ole}. Внутри такой вставки "
+            "лежит картинка, а не векторные данные, и её содержимое в текст "
+            "листа не попадает._",
+            "",
+        ]
     if layers:
         parts += [
-            "### PASS-A Состав листа (из геометрии)",
+            "**Состав листа (из геометрии)**",
             "",
             "_Собрано из данных чертежа: принадлежность линий к слоям, их "
             "длины и габариты. Модель не вызывалась._",
@@ -742,13 +1399,23 @@ def sheet_markdown(
     if blocks:
         named = ", ".join(f"{n} ×{c}" for n, c in blocks.most_common(15))
         parts += ["**Вставленные элементы:** " + named, ""]
+        outside = [n for n in blocks if xrefs and n in xrefs]
+        if outside:
+            listed = ", ".join(f"`{n}`" for n in outside[:10])
+            parts += [
+                "_Часть изображённого на листе — внешние ссылки на другие "
+                f"файлы ({len(outside)} шт.: {listed}). Этих файлов в "
+                "комплекте нет, поэтому в состав по слоям вошло только то, "
+                "что вычерчено в самом чертеже._",
+                "",
+            ]
     parts += [
         "### PASS-B Текст листа (из DWG)",
         "",
         "_Текст взят из чертежа как данные: модель не вызывалась._",
         "",
     ]
-    parts.extend(reading_order(sheet.texts))
+    parts.extend(sheet_flow(sheet, tables))
     return "\n".join(parts).rstrip() + "\n"
 
 
@@ -766,9 +1433,13 @@ def build_markdown(path: Path, sheets: list[Sheet], dxf_path: Path) -> str:
         f"Единицы чертежа: {unit_name}.\n"
     )
     chunks = []
+    xrefs = xref_names(doc)
     for sheet in sheets:
         layers, blocks = analyse_sheet(msp, sheet, unit_m)
-        chunks.append(sheet_markdown(sheet, path.name, layers, blocks))
+        tables, ole = sheet_extras(msp, sheet)
+        chunks.append(
+            sheet_markdown(sheet, path.name, layers, blocks, xrefs, tables, ole)
+        )
     return head + "\n" + "\n\n".join(chunks)
 
 
@@ -813,8 +1484,12 @@ def page_markdown(path: Path, page_number: int) -> tuple[str, str]:
     doc = ezdxf.readfile(str(dxf))
     unit_code = int(doc.header.get("$INSUNITS", 0) or 0)
     unit_m = _UNIT_TO_M.get(unit_code, 0.001)
-    layers, blocks = analyse_sheet(doc.modelspace(), sheet, unit_m)
-    body = sheet_markdown(sheet, path.name, layers, blocks)
+    msp = doc.modelspace()
+    layers, blocks = analyse_sheet(msp, sheet, unit_m)
+    tables, ole = sheet_extras(msp, sheet)
+    body = sheet_markdown(
+        sheet, path.name, layers, blocks, xref_names(doc), tables, ole
+    )
     # Сервис нумерует листы сам, поэтому свой заголовок убираем.
     head, sep, rest = body.partition(chr(10))
     if head.startswith("## Страница"):
