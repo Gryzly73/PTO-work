@@ -386,13 +386,27 @@ def page_tables_md(
     glyph_map — отображение из `deglyph` для листов со сломанным ToUnicode:
     сетка у таких страниц определяется нормально, чинить нужно только текст.
     """
+    return [md for _, md in page_tables_placed(page, glyph_map, frames)]
+
+
+def page_tables_placed(
+    page: fitz.Page,
+    glyph_map: dict[str, str] | None = None,
+    frames: set[tuple] | None = None,
+) -> list[tuple[fitz.Rect, str]]:
+    """То же, но с местом таблицы на листе: [(прямоугольник, GFM), ...].
+
+    Место нужно, чтобы собрать лист в порядке исходника: текст до таблицы,
+    таблица, текст под ней. Без координат таблицы приходилось складывать
+    отдельной секцией, и связь с текстом вокруг терялась.
+    """
     try:
         finder = page.find_tables()
     except Exception:
         return []
     # один раз на страницу, не на ячейку
     words = _words_with_glyphs(page, glyph_map)
-    out: list[str] = []
+    out: list[tuple[fitz.Rect, str]] = []
     for tab in finder.tables:
         if frames and _table_sig(page, tab) in frames:
             continue  # рамка листа со штампом, а не содержательная таблица
@@ -439,7 +453,8 @@ def page_tables_md(
         trimmed = _trim_frame(_destack(grid))
         if len(trimmed) < MIN_ROWS or max((len(r) for r in trimmed), default=0) < MIN_COLS:
             continue  # после обрезки рамки не осталось таблицы
-        out.append(_to_gfm(trimmed))
+        out.append((fitz.Rect(tab.bbox), _to_gfm(trimmed)))
+    out.sort(key=lambda item: (round(item[0].y0, 1), round(item[0].x0, 1)))
     return out
 
 
