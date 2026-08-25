@@ -112,9 +112,19 @@ class Pipeline:
             }
         self.prepare()
         if self.mode == "mock":
+            print(
+                f"[pipeline] лист {page_number}: MOCK "
+                f"(источник={config.MODE_SOURCE}, модель не вызывается)",
+                flush=True,
+            )
             raw = self._mock_page(pdf_path, page_number, run_dir)
             usage: dict = {}
         else:
+            print(
+                f"[pipeline] лист {page_number}: REAL "
+                f"модель={config.MODEL}",
+                flush=True,
+            )
             raw, usage = self._real_page(pdf_path, page_number, run_dir)
         return {
             "markdown": raw,

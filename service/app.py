@@ -65,8 +65,8 @@ async def lifespan(app: FastAPI):
         )
     worker.start()
     print(
-        f"[service] режим={config.MODE} модель={config.MODEL} "
-        f"прогоны={config.RUNS_DIR}",
+        f"[service] режим={config.MODE} (источник={config.MODE_SOURCE}) "
+        f"модель={config.MODEL} прогоны={config.RUNS_DIR}",
         flush=True,
     )
     yield
@@ -256,6 +256,7 @@ def health():
     return {
         "ok": True,
         "mode": config.MODE,
+        "modeSource": config.MODE_SOURCE,
         "profile": pipeline.describe(),
         "runsDir": str(config.RUNS_DIR),
         "queue": {

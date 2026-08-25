@@ -49,12 +49,15 @@ docker compose --profile mock up --build
 
 | `PTO_PIPELINE_MODE` | Что делает |
 | --- | --- |
-| `real` (по умолчанию) | настоящий прогон VLM через HF Inference Providers: ~2 мин и токены на лист |
-| `mock` | лист за ~1.5 с без обращения к модели, вывод помечен `[MOCK]` |
+| `mock` (дефолт на localhost) | лист за ~1.5 с без обращения к модели, вывод помечен `[MOCK]` |
+| `real` (дефолт при `PTO_ENV`/`NODE_ENV=production`, и в compose `--profile real`) | настоящий прогон VLM через HF Inference Providers |
 
 `mock` нужен, чтобы проверять интеграцию с интерфейсом — очередь, потоковую
 выдачу листов, поведение при перезагрузке страницы — не тратя часы и деньги.
 Принять его вывод за работу модели нельзя: каждая страница помечена.
+
+Приоритет выбора: `PTO_PIPELINE_MODE` → `USE_MOCK_PROCESSOR` → `PTO_ENV`/`NODE_ENV`
+→ иначе `mock`.
 
 **Данные уходят наружу.** В режиме `real` страницы отправляются стороннему
 провайдеру (сейчас `featherless-ai`). До перехода на локальную модель через
@@ -64,7 +67,9 @@ docker compose --profile mock up --build
 
 | Переменная | По умолчанию | Смысл |
 | --- | --- | --- |
-| `PTO_PIPELINE_MODE` | `real` | `real` / `mock` |
+| `PTO_PIPELINE_MODE` | `real` / `mock` | явный выбор обработчика |
+| `USE_MOCK_PROCESSOR` | `1` / `0` | алиас, если `PTO_PIPELINE_MODE` не задан |
+| `PTO_ENV` / `NODE_ENV` | `production` → real, иначе mock | автовыбор окружения |
 | `PTO_MODEL` | `qwen3vl-32b` | id из каталога `python hf_api_bench.py --list` |
 | `PTO_PROVIDER` | — | провайдер HF; `auto` не использовать |
 | `PTO_SERVICE_HOST` / `PTO_SERVICE_PORT` | `127.0.0.1` / `8000` | адрес сервиса |
