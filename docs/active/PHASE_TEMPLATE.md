@@ -28,7 +28,11 @@
 
 ```powershell
 cd PTO-work
-python -m pytest -q
+# Указать реально существующий gate текущего main.
+# Минимум для HTTP-контура:
+python -m service.smoke_test --pages 1
+# pytest добавлять только если тестовый набор присутствует в ветке:
+# python -m pytest -q
 ```
 
 ## Harness

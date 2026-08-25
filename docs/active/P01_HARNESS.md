@@ -1,9 +1,11 @@
 # Basket P01 — слой и паспорт в живом контуре (D0–D6)
 
-**Статус:** D0–D6 done · gate P01 (с оговоркой КР5/растр)  
+**Статус:** исторический план/чекпоинт 2026-08-22; код D0–D6 целиком в текущий `main` не вошёл
 **Дата:** 2026-08-22  
 **Резюме для человека:** [РЕЗЮМЕ_P01.md](./РЕЗЮМЕ_P01.md)  
-**Опора:** [ТЗ_ОБРАБОТКА_ИНФОРМАЦИИ.md](../../ТЗ_ОБРАБОТКА_ИНФОРМАЦИИ.md) §3.3, §5.2–5.3 · [SVERKA_S_IDEAL.md](../../hf_runs/20260819_132438_qwen3vl-32b_sheetaware/SVERKA_S_IDEAL.md) · [УСЛОВНЫЕ_ОБОЗНАЧЕНИЯ_В_ИДЕАЛ.md](../../УСЛОВНЫЕ_ОБОЗНАЧЕНИЯ_В_ИДЕАЛ.md) (только как «не имитировать легенду»)
+**Опора:** [ТЗ_ОБРАБОТКА_ИНФОРМАЦИИ.md](../../ТЗ_ОБРАБОТКА_ИНФОРМАЦИИ.md) §3.3, §5.2–5.3 · локальные `hf_runs/.../SVERKA_S_IDEAL.md` и `УСЛОВНЫЕ_ОБОЗНАЧЕНИЯ_В_ИДЕАЛ.md` (не гарантируются в git)
+
+> **Важно для новых работ:** этот basket фиксирует локальную реализацию 2026-08-22, сохранённую отдельно от `main`. Не применять фазы D1–D6 буквально и не восстанавливать старый код поверх актуального `main`. Удалённая ветка реализовала часть целей другой архитектурой: `deglyph.py`, `pdf_tables.py`, `service/convert.py`, schema 5 и отдельные пороги layer-aware.
 
 Методология витка — как в `kultura1905/docs/AGENT_HARNESS_GUIDE.md`: Ask → решение человека → Agent по `@PHASE_Dn` → verify → checkpoint. Чат — память одного витка; решения — здесь и в `PHASE_Dn_*.md`.
 
@@ -11,7 +13,7 @@
 
 ## Зачем документ
 
-Ревью кода (2026-08-22) показало: `deglyph.py` и `pdf_tables.py` написаны по ТЗ, но живой путь (`run_vlm` / `service/convert.py`) их не вызывает. Паспорт на пустом слое объявляет большой лист `scheme`. Это P0/P1. Без harness легко слить это с промптами легенды (P2) или сменой CLI-дефолтов (P3).
+Ревью кода 2026-08-22 показало, что `deglyph.py` и `pdf_tables.py` не были включены в живой путь. В актуальном `main` эта часть уже исправлена: HTTP-контур отдаёт слой после deglyph и таблицы из PDF. Открытыми остаются pytest-регрессии, распознавание растровой таблицы, автоматический PASS-T и выравнивание CLI/HTTP.
 
 **Правило:** один Dn = один виток. Не запускать «сделай P0 и P1». Не стартовать Dn+1 без checkpoint предыдущего.
 
@@ -47,16 +49,16 @@
 
 ---
 
-## Решения R1–R4 (зафиксированы 2026-08-22)
+## Исторические решения R1–R4 (не переносить в main без нового replan)
 
 | ID | Решение |
 |---|---|
-| **R1** | Новый модуль `doc_context.py`. Воркер только вызывает. Не складывать pre-pass в `worker.py`. |
+| **R1** | Предлагался новый модуль `doc_context.py`. В актуальном main его нет; задачи разделены между `deglyph.py`, `pdf_tables.py` и `service/convert.py`. |
 | **R2** | Словарь глифов, рамка штампа и шифр — по **всему PDF**, не только по `pagesRequested`. Один проход MuPDF, без VLM. |
 | **R3** | Слой пригоден → таблицы только `pdf_tables`. Слоя нет и `kind==table` → PASS-T. Модель ведомость не перепечатывает, если слой живой. |
-| **R4** | Кэш: `hf_runs/<run>/doc_context.json`. После рестарта не пересчитывать, если файл есть и PDF тот же (mtime + size). |
+| **R4** | Предлагался кэш `hf_runs/<run>/doc_context.json`. В актуальном main используется процессный кэш `deglyph`, без такого JSON. |
 
-Менять R1–R4 — только через replan в этом файле, не «заодно» в Agent.
+R1–R4 описывают исторический вариант. Любая новая реализация должна начинаться с replan относительно актуальных функций, а не с восстановления `doc_context.py`.
 
 ---
 
@@ -91,13 +93,13 @@ Verify: команды из того же файла.
 
 | Dn | Тема | P | Runtime | Verify без модели | Active scope | Статус |
 |----|------|---|---------|-------------------|--------------|--------|
-| **D0** | Operational harness + baseline | — | нет | чтение docs | этот файл + [PHASE_D0_harness.md](./PHASE_D0_harness.md) | **done** |
-| **D1** | Pytest-замок на текущее поведение | фундамент | тесты only | `pytest -q` | [PHASE_D1_pytest_lock.md](./PHASE_D1_pytest_lock.md) | **done** |
-| **D2** | Модуль `doc_context.py` (map + frames + шифры) | P0 | да, ещё не вшит в выдачу | `pytest` + сухой прогон | [PHASE_D2_prepass.md](./PHASE_D2_prepass.md) | **done** |
-| **D3** | Вшить в `convert`: слой + таблицы | P0 | да | replay `hf_runs` + mock smoke | [PHASE_D3_convert_wire.md](./PHASE_D3_convert_wire.md) | **done** |
-| **D4** | `layer-aware` смотрит починенный слой | P0 | да | unit, мок vision | [PHASE_D4_layer_aware.md](./PHASE_D4_layer_aware.md) | **done** |
-| **D5** | Паспорт: сетка/линии, не `large→scheme` | P1 | да | `build_passport` на `01.pdf` стр. 5 | [PHASE_D5_passport_grid.md](./PHASE_D5_passport_grid.md) | **done** |
-| **D6** | Авто-PASS-T, если `kind==table` и слой непригоден | P1 | да | unit-роутинг; real — opt-in | [PHASE_D6_auto_pass_t.md](./PHASE_D6_auto_pass_t.md) | **done** |
+| **D0** | Operational harness + baseline | — | нет | чтение docs | этот файл + [PHASE_D0_harness.md](./PHASE_D0_harness.md) | **docs сохранены** |
+| **D1** | Pytest-замок на текущее поведение | фундамент | тесты only | `pytest -q` | [PHASE_D1_pytest_lock.md](./PHASE_D1_pytest_lock.md) | **нет в main** |
+| **D2** | Модуль `doc_context.py` (map + frames + шифры) | P0 | да | `pytest` + сухой прогон | [PHASE_D2_prepass.md](./PHASE_D2_prepass.md) | **замещён другой архитектурой** |
+| **D3** | Вшить в `convert`: слой + таблицы | P0 | да | replay `hf_runs` + mock smoke | [PHASE_D3_convert_wire.md](./PHASE_D3_convert_wire.md) | **цель реализована иначе** |
+| **D4** | `layer-aware` смотрит починенный слой | P0 | да | unit, мок vision | [PHASE_D4_layer_aware.md](./PHASE_D4_layer_aware.md) | **цель реализована иначе** |
+| **D5** | Паспорт: сетка/линии, не `large→scheme` | P1 | да | `build_passport` на `01.pdf` стр. 5 | [PHASE_D5_passport_grid.md](./PHASE_D5_passport_grid.md) | **нет в main** |
+| **D6** | Авто-PASS-T, если `kind==table` и слой непригоден | P1 | да | unit-роутинг; real — opt-in | [PHASE_D6_auto_pass_t.md](./PHASE_D6_auto_pass_t.md) | **нет в main; PASS-T ручной** |
 
 ```mermaid
 flowchart LR
@@ -138,11 +140,11 @@ flowchart LR
 
 ---
 
-## Baseline (факт на D0)
+## Baseline: исторический и текущий
 
-В `PTO-work` **нет** pytest и нет `docs/` до этой поставки. Целевая команда после D1: `python -m pytest -q` из корня `PTO-work`.
+На D0 в `PTO-work` не было pytest и каталога `docs/`. Сейчас `docs/active/` есть, но `tests/`, `pytest.ini` и зависимость pytest из локальной реализации D1 в `main` не вошли. Поэтому `python -m pytest -q` нельзя считать текущим обязательным gate.
 
-Уже существующие проверки (не заменяют D1):
+Доступная проверка текущего HTTP-контура:
 
 ```powershell
 cd PTO-work
@@ -158,9 +160,11 @@ python -m service.smoke_test --pages 1
 - `deglyph`: короткое слово без двух свидетелей не маппится
 - `build_passport` на пустом большом листе сейчас даёт `scheme` (якорь для D5)
 
+Если регрессионный набор будет восстановлен, тесты нужно писать заново против schema 5, текущих API и порогов: для `plan/scheme/mixed/table` пригодность слоя требует 1500 символов и 200 слов, а не единого порога 400.
+
 ---
 
-## Gate после D6 (stop всего P01)
+## Новый gate для актуального main
 
 Пока не выполнено — не открывать P2/P3:
 
@@ -169,7 +173,7 @@ python -m service.smoke_test --pages 1
 | Контракт заголовков | `extract_pass` на свежем mock-прогоне |
 | Клиентский лист | `**Файл:**`, `kind`, пустой `extractedText` на немом CAD |
 | Слой чинится в API | ИОС2 или фикстура: `extractedText` не пустой после deglyph |
-| Таблица без слоя | паспорт `table` + роутинг PASS-T в unit |
+| Таблица без слоя | отдельно проверить текущий ручной `--table-pages`; авто-PASS-T считать будущей доработкой |
 | Нет подсказки тест-сета | D4–D6 не трогали `ZONE_HINTS` / `crop_content_zones` |
 | Деньги | ни один обязательный verify не ходил в HF |
 
@@ -178,9 +182,9 @@ python -m service.smoke_test --pages 1
 ## Риски → replan, не «починить в том же PR»
 
 1. `find_tables()` пуст на КР5 — D5 не рисует `table`. Ask + правка D5/D6, не промпт.
-2. Deglyph не проходит гейт 90/85 на новом PDF — честный пустой map, пороги не крутить под файл.
-3. `PTO_PAGE_CONCURRENCY>1` — pre-pass обязан закончиться до пула листов. Чинить в D2, не в D4.
-4. Нет зелёного pytest после D1 — стоп, в D2 не идём.
+2. Runtime deglyph использует текущий порог покрытия 60%; пороги не крутить под один файл.
+3. `PTO_PAGE_CONCURRENCY>1` уже поддерживается; документные кэши должны быть готовы до параллельного чтения.
+4. Перед новой фазой восстановить минимальный pytest-набор либо явно использовать `service.smoke_test` и ручные фикстуры как временный gate.
 
 ---
 
@@ -190,7 +194,7 @@ python -m service.smoke_test --pages 1
 |------|-----|
 | Этот файл | статус Dn в таблице |
 | `PHASE_Dn_*.md` | таблица Checkpoint |
-| [CLAUDE.md](../../CLAUDE.md) | не трогать, пока не закроется gate (отдельное решение) |
+| `README.md` / `service/README.md` | обновлять только если меняется действующий контракт |
 
 ---
 
@@ -198,13 +202,13 @@ python -m service.smoke_test --pages 1
 
 | Поле | Значение |
 |------|----------|
-| Runtime-код менялся | D6: `should_run_pass_t` + авто PASS-T в `run_vlm` |
-| D0 | **done** — 2026-08-22 |
-| D1 | **done** — 2026-08-22. `tests/` + `pytest.ini`; `pytest>=8` в `requirements.txt`. |
-| D2 | **done** — 2026-08-22. `doc_context.build` / кэш JSON. |
-| D3 | **done** — 2026-08-22. Слой/таблицы/шифр в клиентский лист. |
-| D4 | **done** — 2026-08-22. layer-aware по `page_layer` + кэш. |
-| D5 | **done** — 2026-08-22. Векторная H/V решётка → `table`. |
-| D6 | **done** — 2026-08-22. Авто PASS-T. Verify: 36 passed, 1 skipped. |
-| Следующий виток | Gate P01 (человек). Затем отдельный basket: P3.2 → P2.2 → P3.1 → P2.1. `CLAUDE.md` не трогать, пока gate не принят. |
-| Оговорка gate | `01.pdf` КР5 — растр, kind=`scheme`; авто PASS-T на нём нет. `--table-pages 5` жив. |
+| Исторический runtime-код | Локально существовали `doc_context`, grid passport и авто-PASS-T; в текущем `main` их нет. |
+| D0 | **сохранён как документация** |
+| D1 | **нет в main** — тестовый набор требуется восстановить заново |
+| D2 | **не переносить** — заменён текущими `deglyph` / `pdf_tables` |
+| D3 | **цель закрыта upstream** — слой и таблицы отдаются через `service/convert.py`, schema 5 |
+| D4 | **цель закрыта upstream** — действуют текущие drawing-specific пороги layer-aware |
+| D5 | **открыто** — grid/raster table signal отсутствует |
+| D6 | **открыто** — PASS-T включается вручную через `--table-pages` |
+| Следующий виток | Новый P01b: тестовый lock → растровый/table routing → auto PASS-T, каждый шаг против актуального main. |
+| Оговорка | `01.pdf` КР5 — растр, kind=`scheme`; `--table-pages 5` остаётся ручным обходом. |
