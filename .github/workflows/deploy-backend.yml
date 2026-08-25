@@ -91,22 +91,40 @@ jobs:
           mkdir -p ~/.ssh && chmod 700 ~/.ssh
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          # Без known_hosts ssh спросит подтверждение и повиснет.
+          # Без known_hosts ssh спросит подтверждение и повиснет. Ключ хоста
+          # берём заранее, но не делаем на этом ставку: сервер небольшой, и
+          # пока он занят сборкой образа, на SSH он отвечает не сразу. Одна
+          # неудачная попытка keyscan роняла весь деплой — с этого начиналась
+          # половина красных прогонов.
           #
-          # Ошибку keyscan разбираем словами, а не голым «exit 1»: шаг падал,
-          # не сказав ни строчки, и по логу нельзя было понять, что дело не в
-          # ключе и не в секретах, а в том, что сервер не отвечает.
-          if ! ssh-keyscan -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
-            echo "Не удалось получить ключ хоста по SSH (порт $DEPLOY_PORT)."
-            echo "Сервер выключен, недоступен снаружи или SSH слушает другой порт."
-            echo "Вывод ssh-keyscan:"
-            cat /tmp/keyscan.err
+          # Поэтому: несколько попыток с паузой, а если ключ так и не пришёл —
+          # не падаем, а идём дальше с accept-new. Доверия это не убавляет:
+          # keyscan точно так же берёт ключ у того, кто ответил, ничего не
+          # проверяя. Настоящая неудача вскроется на следующем шаге, где уже
+          # будет видно, что именно ответил сервер.
+          got_key=""
+          for attempt in 1 2 3 4 5; do
+            if ssh-keyscan -T 10 -p "$DEPLOY_PORT" -H "$DEPLOY_HOST" \
+                 >> ~/.ssh/known_hosts 2>/tmp/keyscan.err; then
+              got_key="yes"
+              break
+            fi
+            echo "Попытка $attempt: сервер не отдал ключ хоста, жду 15 секунд."
+            sleep 15
+          done
+          if [ -z "$got_key" ]; then
+            echo "За пять попыток ключ хоста получить не удалось."
+            echo "Вывод последней попытки:"
+            cat /tmp/keyscan.err || true
+            echo "Продолжаю с StrictHostKeyChecking=accept-new."
+            echo "PTO_SSH_ACCEPT_NEW=yes" >> "$GITHUB_ENV"
             {
-              echo "### Деплой не начался"
-              echo "Сервер не ответил на SSH по порту $DEPLOY_PORT."
-              echo "Проверьте, что машина поднята и порт открыт; порт задаётся переменной DEPLOY_PORT."
+              echo "### Ключ хоста не получен заранее"
+              echo "Сервер не ответил на SSH по порту $DEPLOY_PORT за пять попыток."
+              echo "Если деплой упал следом — проверьте, что машина поднята,"
+              echo "порт открыт (задаётся переменной DEPLOY_PORT) и вход не"
+              echo "заблокирован fail2ban после неудачных попыток."
             } >> "$GITHUB_STEP_SUMMARY"
-            exit 1
           fi
 
       - name: Обновить бэкенд на сервере
@@ -121,11 +139,19 @@ jobs:
           # Токен не кладём в argv ssh (видно в ps) — первой строкой в stdin.
           PTO_GITHUB_TOKEN: ${{ github.token }}
         run: |
+          # accept-new включается только если ключ не удалось взять заранее.
+          # Он не спрашивает подтверждения (в отличие от «ask»), поэтому
+          # деплой не повиснет молча в ожидании ввода.
+          host_check="yes"
+          if [ "${PTO_SSH_ACCEPT_NEW:-}" = "yes" ]; then
+            host_check="accept-new"
+          fi
           {
             printf '%s\n' "$PTO_GITHUB_TOKEN"
             cat deploy/deploy.sh
           } | ssh -i ~/.ssh/id_deploy -p "$DEPLOY_PORT" \
               -o BatchMode=yes -o ServerAliveInterval=30 \
+              -o StrictHostKeyChecking="$host_check" \
               "$DEPLOY_USER@$DEPLOY_HOST" \
               "read -r PTO_GITHUB_TOKEN; export PTO_GITHUB_TOKEN; \
                export PTO_BACKEND_DIR='$DEPLOY_PATH' \
