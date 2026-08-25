@@ -103,7 +103,42 @@ ALLOWED_PDF_ROOTS = [UPLOADS_DIR] + [
 # mock — быстрая имитация из текстового слоя PDF: нужна, чтобы проверять
 #        склейку с фронтом (очередь, прогресс, перезагрузка страницы), не
 #        тратя ~2 минуты и токены на каждый лист.
-MODE = (_env_str("PTO_PIPELINE_MODE", "real") or "real").lower()
+#
+# Переключение (приоритет сверху вниз):
+#   1) PTO_PIPELINE_MODE=mock|real
+#   2) USE_MOCK_PROCESSOR=1|0  (алиас: 1 → mock, 0 → real)
+#   3) PTO_ENV / APP_ENV / NODE_ENV ∈ {production, prod} → real
+#   4) иначе mock — безопасный дефолт для localhost / разработки
+def resolve_pipeline_mode() -> tuple[str, str]:
+    """Явно выбирает обработчик и источник решения (для /health и логов)."""
+    explicit = (_env_str("PTO_PIPELINE_MODE") or "").lower()
+    if explicit in {"mock", "real"}:
+        return explicit, "PTO_PIPELINE_MODE"
+
+    if "USE_MOCK_PROCESSOR" in os.environ:
+        raw = (os.environ.get("USE_MOCK_PROCESSOR") or "").strip()
+        if raw:
+            if _env_bool("USE_MOCK_PROCESSOR", False):
+                return "mock", "USE_MOCK_PROCESSOR"
+            return "real", "USE_MOCK_PROCESSOR"
+
+    env_name = (
+        (_env_str("PTO_ENV") or "")
+        or (_env_str("APP_ENV") or "")
+        or (_env_str("NODE_ENV") or "")
+    ).lower()
+    if env_name in {"production", "prod"}:
+        return "real", f"env:{env_name}"
+
+    return "mock", "default-local"
+
+
+MODE, MODE_SOURCE = resolve_pipeline_mode()
+if MODE not in {"mock", "real"}:
+    raise RuntimeError(
+        f"Неизвестный режим конвейера MODE={MODE!r} (источник {MODE_SOURCE})"
+    )
+
 MOCK_PAGE_SECONDS = _env_float("PTO_MOCK_PAGE_SECONDS", 1.5)
 
 # --- профиль прогона --------------------------------------------------------
@@ -187,6 +222,7 @@ def profile_dict() -> dict:
     """Профиль прогона — уходит в ответ /health и в meta.json прогона."""
     return {
         "mode": MODE,
+        "modeSource": MODE_SOURCE,
         "model": MODEL,
         "provider": PROVIDER,
         "sheetAware": SHEET_AWARE,
