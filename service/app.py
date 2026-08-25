@@ -504,9 +504,14 @@ def get_page_preview(job_id: str, page_number: int, format: str = "svg"):
 
     # Картинка листа считается секунды, а запрашивается при каждом открытии.
     # Держим её рядом с прогоном — вместе с ним и удалится.
+    #
+    # В имени файла есть версия отрисовки. Она нужна ровно для таких случаев,
+    # как переход на отрисовку по геометрии листа: у прогонов, сделанных
+    # раньше, в кэше лежат картинки, нарисованные прежним способом, и без
+    # версии интерфейс продолжал бы получать их до конца жизни прогона.
     cache = Path(job.runDir) / "preview"
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"page_{page_number:04d}.{format}"
+    target = cache / f"page_{page_number:04d}.v2.{format}"
     if not target.exists():
         from dwg_render import sheet_preview
 

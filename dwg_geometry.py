@@ -294,12 +294,39 @@ def to_csv(primitives: list[dict], meta: dict, units: str = "mm") -> str:
     return buffer.getvalue()
 
 
-def sheet_csv(path, page_number: int, units: str = "mm") -> str:
-    """Готовый CSV листа документа."""
+# Разбор листа стоит от секунды до минуты, а интерфейс запрашивает подряд
+# геометрию и картинку одного и того же листа — это три полных прохода по
+# чертежу вместо одного. Держим последние разобранные листы; больше четырёх
+# ни к чему: листают по одному, а лист стройгенплана весит десятки мегабайт.
+_SHEET_CACHE: dict[tuple, tuple[list[dict], dict, str]] = {}
+_SHEET_CACHE_SIZE = 4
+
+
+def sheet_primitives(
+    path, page_number: int, units: str = "mm"
+) -> tuple[list[dict], dict, str]:
+    """Лист документа: примитивы, метаданные и единицы измерения.
+
+    Общий вход и для CSV, и для картинки листа. Раньше картинку рисовал
+    отдельный код, прямо по координатам модели, и она не совпадала с
+    геометрией: на листе ПЗУ чертёж занимал две десятых процента кадра,
+    потому что охват считался по подписям бумаги вместе с окнами вида —
+    по двум системам координат сразу.
+    """
     import ezdxf
 
     from dwg_render import sheet_box
     from dwg_sheets import sheets_for
+
+    from pathlib import Path as _Path
+
+    source = _Path(path)
+    try:
+        key = (str(source.resolve()), source.stat().st_mtime, page_number)
+    except OSError:
+        key = None
+    if key is not None and key in _SHEET_CACHE:
+        return _SHEET_CACHE[key]
 
     dxf_path, sheets = sheets_for(path)
     if not 1 <= page_number <= len(sheets):
@@ -307,7 +334,7 @@ def sheet_csv(path, page_number: int, units: str = "mm") -> str:
     sheet = sheets[page_number - 1]
     box = sheet_box(sheet)
     if box is None:
-        return ""
+        return [], {}, units
     doc = ezdxf.readfile(str(dxf_path))
     if sheet.views:
         # Лист собран в координатах бумаги, а бумага всегда в миллиметрах —
@@ -319,4 +346,16 @@ def sheet_csv(path, page_number: int, units: str = "mm") -> str:
         unit_code = int(doc.header.get("$INSUNITS", 0) or 0)
         units = {6: "m", 4: "mm", 5: "cm"}.get(unit_code, units)
     primitives, meta = sheet_geometry(doc, box, sheet)
+    if key is not None:
+        if len(_SHEET_CACHE) >= _SHEET_CACHE_SIZE:
+            _SHEET_CACHE.pop(next(iter(_SHEET_CACHE)))
+        _SHEET_CACHE[key] = (primitives, meta, units)
+    return primitives, meta, units
+
+
+def sheet_csv(path, page_number: int, units: str = "mm") -> str:
+    """Готовый CSV листа документа."""
+    primitives, meta, units = sheet_primitives(path, page_number, units)
+    if not primitives:
+        return ""
     return to_csv(primitives, meta, units)
