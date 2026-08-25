@@ -552,6 +552,72 @@ def get_markdown(job_id: str):
     )
 
 
+def _project_or_404(project_id: str):
+    jobs = [job for job in store.list(project_id=project_id)]
+    if not jobs:
+        raise HTTPException(status_code=404, detail="Нет документов такого проекта")
+    return jobs
+
+
+def _project_sections(project_id: str):
+    """Разделы проекта, сведённые из всех его документов.
+
+    Модель не вызывается: реквизиты листов читаются из самих файлов. Поэтому
+    отчёт о составе доступен сразу после загрузки, ещё до того как конвейер
+    дойдёт до последнего листа, — а тексты листов подставляются те, что уже
+    посчитаны.
+    """
+    import bundle
+
+    variants = []
+    skipped: list[str] = []
+    for job in _project_or_404(project_id):
+        path = Path(job.pdfPath)
+        if not path.exists():
+            skipped.append(f"{job.originalName}: файл не найден")
+            continue
+        try:
+            variants += bundle.read_source(
+                path, name=job.originalName, run_dir=job.runDir, job_id=job.id
+            )
+        except Exception as error:
+            # Один нечитаемый файл не должен ронять отчёт по всему проекту:
+            # остальные документы инженеру нужны сейчас, а не после разбора
+            # с чужим чертежом.
+            skipped.append(f"{job.originalName}: {error}")
+    return bundle.build(variants), skipped
+
+
+@app.get("/projects/{project_id}/sections")
+def get_project_sections(project_id: str):
+    """Состав проекта по разделам: что за листы и из каких файлов взяты."""
+    import bundle
+
+    sections, skipped = _project_sections(project_id)
+    return {
+        "projectId": project_id,
+        "sections": bundle.sections_dict(sections),
+        "skipped": skipped,
+    }
+
+
+@app.get("/projects/{project_id}/report", response_class=PlainTextResponse)
+def get_project_report(project_id: str, bodies: bool = True):
+    """Сводный отчёт по проекту одним markdown.
+
+    `bodies=false` отдаёт только состав и расхождения — это быстро и
+    достаточно, когда нужно проверить комплектность, а не читать листы.
+    """
+    import bundle
+
+    sections, skipped = _project_sections(project_id)
+    text = bundle.report_markdown(sections, with_bodies=bodies)
+    if skipped:
+        listed = "\n".join(f"- {item}" for item in skipped)
+        text += f"\n\n## Не удалось прочитать\n\n{listed}\n"
+    return PlainTextResponse(text, media_type="text/markdown; charset=utf-8")
+
+
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: str):
     job = _job_or_404(job_id)
