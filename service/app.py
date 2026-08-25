@@ -21,7 +21,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+)
 
 from service import config
 from service.jobs import (
@@ -429,6 +434,101 @@ def get_page_raw(job_id: str, page_number: int):
         target.read_text(encoding="utf-8"),
         media_type="text/markdown; charset=utf-8",
     )
+
+
+@app.get("/jobs/{job_id}/pages/{page_number}/geometry", response_class=PlainTextResponse)
+def get_page_geometry(job_id: str, page_number: int):
+    """Геометрия листа чертежа таблицей CSV: линии, полилинии и подписи.
+
+    Интерфейс рисует лист по ней сам — и получает то, чего не даёт картинка:
+    зум без потери качества, поиск и выделение текста, привязку замечания к
+    координатам чертежа. Формат описан в `dwg_geometry.to_csv()`.
+
+    Для PDF маршрут не отвечает: страницу PDF интерфейс рисует через pdf.js.
+    """
+    job = _job_or_404(job_id)
+    source = Path(job.pdfPath)
+    if source.suffix.lower() not in (".dwg", ".dxf"):
+        raise HTTPException(
+            status_code=404,
+            detail="Геометрия отдаётся только для чертежей: PDF интерфейс рисует сам",
+        )
+
+    # Разбор листа стоит секунды и не меняется, пока лежит тот же файл, —
+    # держим рядом с прогоном, вместе с ним и удалится.
+    cache = Path(job.runDir) / "geometry"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"page_{page_number:04d}.csv"
+    if not target.exists():
+        from dwg_geometry import sheet_csv
+
+        try:
+            data = sheet_csv(source, page_number)
+        except IndexError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Не удалось разобрать лист: {error}"
+            ) from error
+        if not data:
+            raise HTTPException(status_code=404, detail="На листе нечего рисовать")
+        target.write_text(data, encoding="utf-8")
+
+    return PlainTextResponse(
+        target.read_text(encoding="utf-8"),
+        media_type="text/csv; charset=utf-8",
+    )
+
+
+@app.get("/jobs/{job_id}/pages/{page_number}/preview")
+def get_page_preview(job_id: str, page_number: int, format: str = "svg"):
+    """Картинка листа чертежа: `format=svg` для показа, `format=png` для миниатюр.
+
+    Нужна интерфейсу: PDF он рисует сам через pdf.js, а DWG браузер не
+    открывает — без этой картинки у чертежа рядом с расшифровкой пустое место
+    и сверить одно с другим нечем.
+
+    Для PDF маршрут не отвечает: там страницу по-прежнему рисует фронтенд, и
+    отдавать вторую, свою версию той же страницы незачем.
+    """
+    job = _job_or_404(job_id)
+    source = Path(job.pdfPath)
+    if source.suffix.lower() not in (".dwg", ".dxf"):
+        raise HTTPException(
+            status_code=404,
+            detail="Предпросмотр отдаётся только для чертежей: PDF интерфейс рисует сам",
+        )
+    if format not in ("svg", "png"):
+        raise HTTPException(status_code=400, detail="format: svg или png")
+
+    # Картинка листа считается секунды, а запрашивается при каждом открытии.
+    # Держим её рядом с прогоном — вместе с ним и удалится.
+    cache = Path(job.runDir) / "preview"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"page_{page_number:04d}.{format}"
+    if not target.exists():
+        from dwg_render import sheet_preview
+
+        try:
+            if format == "svg":
+                image = sheet_preview(source, page_number, "svg")
+                if not image:
+                    raise HTTPException(status_code=404, detail="Лист нечего рисовать")
+                target.write_text(image, encoding="utf-8")
+            else:
+                if sheet_preview(source, page_number, "png", target) is None:
+                    raise HTTPException(status_code=404, detail="Лист нечего рисовать")
+        except IndexError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except HTTPException:
+            raise
+        except Exception as error:  # отрисовка не должна ронять сервис
+            raise HTTPException(
+                status_code=500, detail=f"Не удалось нарисовать лист: {error}"
+            ) from error
+
+    media = "image/svg+xml" if format == "svg" else "image/png"
+    return FileResponse(target, media_type=media)
 
 
 @app.get("/jobs/{job_id}/markdown", response_class=PlainTextResponse)
