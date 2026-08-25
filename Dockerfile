@@ -22,8 +22,11 @@ ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 # его библиотека, а компилятор с заголовками остаются здесь.
 FROM ${PYTHON_IMAGE} AS dwgtools
 ARG LIBREDWG_VERSION=0.14
+# pkg-config и libpcre2-dev — не подстраховка: без первого configure
+# LibreDWG останавливается сразу («pkg-config not found»), второй нужен ему
+# для разбора кодовых страниц. Оба остаются в этой стадии.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        build-essential ca-certificates curl \
+        build-essential ca-certificates curl pkg-config libpcre2-dev \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 RUN curl -fsSL -o libredwg.tar.xz \
@@ -37,20 +40,24 @@ RUN curl -fsSL -o libredwg.tar.xz \
 
 FROM ${PYTHON_IMAGE}
 
+# Системные пакеты ставятся ДО конвертера: dwg2dxf слинкован с libpcre2, и
+# проверка `dwg2dxf --version` без неё падала бы прямо на сборке.
+#
+# Tesseract нужен local_ocr.py: OCR углов штампа и авторотация повёрнутых
+# листов через OSD. Без языковых пакетов rus+eng он бесполезен.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libpcre2-8-0 \
+        tesseract-ocr \
+        tesseract-ocr-rus \
+        tesseract-ocr-eng \
+    && rm -rf /var/lib/apt/lists/*
+
 # Конвертер и его библиотека. Путь кладём в PTO_DWG2DXF — dwg_sheets.py ищет
 # сначала там, и на сервере поиск по PATH уже не нужен.
 COPY --from=dwgtools /out/usr/local/bin/dwg2dxf /usr/local/bin/dwg2dxf
 COPY --from=dwgtools /out/usr/local/lib/ /usr/local/lib/
 RUN ldconfig && dwg2dxf --version | head -1
 ENV PTO_DWG2DXF=/usr/local/bin/dwg2dxf
-
-# Tesseract нужен local_ocr.py: OCR углов штампа и авторотация повёрнутых
-# листов через OSD. Без языковых пакетов rus+eng он бесполезен.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        tesseract-ocr \
-        tesseract-ocr-rus \
-        tesseract-ocr-eng \
-    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
