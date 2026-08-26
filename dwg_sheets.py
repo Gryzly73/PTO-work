@@ -1186,6 +1186,25 @@ def orphan_blocks(doc) -> list[tuple[str, list]]:
     return found
 
 
+def _hidden_sheet(hidden_texts: list) -> "Sheet | None":
+    """Лист с текстом, который в чертеже скрыт. None — если скрывать нечего."""
+    if not hidden_texts:
+        return None
+    return Sheet(
+        number=None,
+        name="Текст с отключённых слоёв",
+        paper="",
+        paper_width=0.0,
+        paper_height=0.0,
+        texts=list(hidden_texts),
+        flat=True,
+        note=(
+            f"подписей на отключённых слоях: {len(hidden_texts)}. В чертеже они "
+            "скрыты и на печать не идут — приведены, чтобы ничего не потерялось"
+        ),
+    )
+
+
 def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
     """Листы чертежа с текстом, привязанным к каждому.
 
@@ -1305,7 +1324,10 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
         by_frames = _sheets_from_frames(doc.modelspace(), model_texts)
         caught_by_frames = sum(len(s.texts) for s in by_frames)
         if by_frames and caught_by_frames > caught_by_layouts:
-            return by_frames
+            # Скрытый текст отдаём и здесь: раньше ранний выход уносил его с
+            # собой, и 19 643 подписи ПОС не попадали никуда.
+            extra = _hidden_sheet(hidden_texts)
+            return by_frames + ([extra] if extra else [])
 
     # Окно вьюпорта бывает настроено мимо чертежа: в «КР1 Планы» вид смотрит на
     # x −52 816..169 632, а сам чертёж вычерчен около x 2 900 000, и по окну не
@@ -1351,6 +1373,9 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
                     ),
                 )
             )
+            extra = _hidden_sheet(hidden_texts)
+            if extra:
+                sheets.append(extra)
             return sheets
 
     # Остаток: подписи модели, не попавшие НИ В ОДНО окно. Раньше их подбирал
@@ -1443,23 +1468,9 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
     # смешивать его с содержимым листа нельзя: у ПЗУ так «2 СПОЗУ» ложилось
     # поверх наименования. Но и выбросить нельзя — на слое Defpoints у «Плана
     # кровли» лежат примечания на полторы тысячи знаков.
-    if hidden_texts:
-        sheets.append(
-            Sheet(
-                number=None,
-                name="Текст с отключённых слоёв",
-                paper="",
-                paper_width=0.0,
-                paper_height=0.0,
-                texts=list(hidden_texts),
-                flat=True,
-                note=(
-                    f"подписей на отключённых слоях: {len(hidden_texts)}. В "
-                    "чертеже они скрыты и на печать не идут — приведены, чтобы "
-                    "ничего не потерялось"
-                ),
-            )
-        )
+    extra = _hidden_sheet(hidden_texts)
+    if extra:
+        sheets.append(extra)
 
     missing = (
         _missing_texts(sheets, direct_texts, hidden_texts) if direct_texts else []
