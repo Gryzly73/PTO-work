@@ -261,6 +261,28 @@ def drop_tables_from_description(pass_a: str) -> str:
     return text
 
 
+# Паспорт листа приходит секциями «### PASS-0 …». В блок «Информация о листе»
+# берём только сами строки: заголовки PASS-0 — внутренняя разметка конвейера, а
+# «- kind: `text`» дублирует строку «тип листа» выше.
+def _passport_lines(pass_0: str) -> str:
+    kept: list[str] = []
+    for line in (pass_0 or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("- kind:"):
+            continue
+        # «источник» повторяет строку «файл» выше — в одном блоке это лишнее.
+        if stripped.startswith("- источник:"):
+            continue
+        kept.append(line.rstrip())
+    while kept and not kept[0].strip():
+        kept.pop(0)
+    while kept and not kept[-1].strip():
+        kept.pop()
+    return chr(10).join(kept)
+
+
 def build_page_markdown(
     *,
     page_number: int,
@@ -278,35 +300,29 @@ def build_page_markdown(
     sheet_map: str = "",
     flow: str = "",
 ) -> str:
+    # Первым идёт СОДЕРЖИМОЕ листа — текст и таблицы, то, что на нём
+    # напечатано. Всё служебное (карта листа, описание, паспорт) уходит вниз,
+    # отдельным блоком: инженер открывает лист, чтобы прочитать лист, а не
+    # чтобы сначала прочитать про лист.
     parts = [
         f"# Лист {page_number}",
-        "",
-        f"**Файл:** `{file_name}`",
-        "",
-        f"**Тип листа:** {KIND_TITLE.get(kind, kind)}",
         "",
     ]
     if note:
         parts += [f"_{note}_", ""]
-    # Карта листа идёт первой: она отвечает на «что где находится» до того, как
-    # начнётся содержимое. Пишется для модели — однообразными строками, без
-    # пересказа самих данных.
-    if sheet_map.strip():
-        parts += ["## Карта листа", "", sheet_map.strip(), ""]
-    if pass_a.strip():
-        parts += ["## Описание листа", "", pass_a.strip(), ""]
+    about: list[str] = []
     if pass_b.strip():
         clean_b, removed = dedupe_fragment_lines(pass_b)
-        parts += ["## Извлечение по фрагментам", ""]
+        about += ["**Извлечение по фрагментам**", ""]
         if removed:
-            parts += [
+            about += [
                 f"_Убрано повторов между фрагментами: {removed} строк. "
                 f"Полный вывод — в файле прогона._",
                 "",
             ]
-        parts += [clean_b, ""]
+        about += [clean_b]
     elif fragments_summary:
-        parts += ["## Извлечение по фрагментам", "", fragments_summary, ""]
+        about += ["**Извлечение по фрагментам**", "", fragments_summary]
     # Содержимое листа — одним потоком, в порядке исходника: заголовок, текст,
     # таблица на своём месте, текст под ней, штамп в конце. Отдельные секции
     # «Таблицы листа» и «Текст с листа» разрывали документ: примечание под
@@ -324,6 +340,19 @@ def build_page_markdown(
         # иначе один и тот же текст идёт на экран двумя блоками подряд.
         if layer_text.strip() and not layer_is_source:
             parts += [f"## {text_title}", "", layer_text.strip(), ""]
+
+    # Хвост: всё, что ПРО лист, а не сам лист.
+    tail: list[str] = [f"- файл: `{file_name}`", f"- тип листа: {KIND_TITLE.get(kind, kind)}"]
+    passport = _passport_lines(pass_0)
+    if passport:
+        tail += ["", passport]
+    if sheet_map.strip():
+        tail += ["", "**Что где на листе**", "", sheet_map.strip()]
+    if pass_a.strip():
+        tail += ["", "**Описание листа**", "", pass_a.strip()]
+    if about:
+        tail += [""] + about
+    parts += ["## Информация о листе", ""] + tail + [""]
     # Паспорт (kind, размер листа, причины классификации) — служебная
     # диагностика конвейера. Инженеру она не нужна и читается как третий
     # пересказ тех же меток, поэтому уходит отдельным полем, а не в markdown.

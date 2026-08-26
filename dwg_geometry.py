@@ -163,6 +163,33 @@ def _record(doc, entities) -> list[dict]:
     return out
 
 
+def _fit_to_paper(sheet, frame: tuple[float, float, float, float]):
+    """Расширить кадр до формата листа, когда содержимое в него укладывается.
+
+    Лист должен показываться в своих габаритах, а не по обрезку содержимого:
+    иначе масштаб скачет от листа к листу и подписи выглядят то мелкими, то во
+    весь экран. Формат применяем только к настоящим листам (у них есть layout)
+    и только если содержимое лежит внутри бумаги — у листов, найденных по
+    рамкам в модели, координаты совсем другие.
+    """
+    width = float(getattr(sheet, "paper_width", 0) or 0)
+    height = float(getattr(sheet, "paper_height", 0) or 0)
+    if not getattr(sheet, "layout_name", "") or width <= 0 or height <= 0:
+        return frame
+    x0, y0, x1, y1 = frame
+    # Запас на рамку, которую чертёжник выносит чуть за формат.
+    margin_x, margin_y = width * 0.25, height * 0.25
+    inside = (
+        -margin_x <= x0 <= width + margin_x
+        and -margin_y <= y0 <= height + margin_y
+        and -margin_x <= x1 <= width + margin_x
+        and -margin_y <= y1 <= height + margin_y
+    )
+    if not inside:
+        return frame
+    return min(x0, 0.0), min(y0, 0.0), max(x1, width), max(y1, height)
+
+
 def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
     """Примитивы таблиц, посаженных на лист по заголовку.
 
@@ -315,6 +342,12 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
         x1, y1 = max(xs) + pad_x, max(ys) + pad_y
     else:
         x0, y0, x1, y1 = box
+    # Кадр по содержимому вырождается, когда содержимого мало: у
+    # восстановленного листа «Озел. и МАФ» формат 1783×841, а собранные
+    # подписи легли в полоску 43×240. При растягивании такой полоски на экран
+    # подпись превращается в надпись во весь лист. Формат листа известен —
+    # берём его, если содержимое в нём и помещается.
+    x0, y0, x1, y1 = _fit_to_paper(sheet, (x0, y0, x1, y1))
     meta = {
         "bbox": [round(v, _ROUND) for v in (x0, y0, x1, y1)],
         "scale": sheet.scale(),
