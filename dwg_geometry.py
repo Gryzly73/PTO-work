@@ -190,6 +190,10 @@ def _fit_to_paper(sheet, frame: tuple[float, float, float, float]):
     return min(x0, 0.0), min(y0, 0.0), max(x1, width), max(y1, height)
 
 
+# Сколько примитивов на листе означает «здесь уже нарисован чертёж».
+_CROWDED_SHEET = 500
+
+
 def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
     """Примитивы таблиц, посаженных на лист по заголовку.
 
@@ -199,6 +203,12 @@ def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
     """
     attached = list(getattr(sheet, "attached", []) or [])
     if not attached:
+        return []
+    # Место у блока приблизительное, поэтому дорисовываем его только туда, где
+    # рисовать больше нечего. На листе ИГР собственного чертежа почти тринадцать
+    # тысяч примитивов — вписанные поверх разрезы легли бы кляксой посреди
+    # готового листа. Текст такого блока всё равно попадает в расшифровку.
+    if len(placed) > _CROWDED_SHEET:
         return []
     frame = _bounds(placed)
     if frame is None:
@@ -214,8 +224,15 @@ def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
     tx0, tx1 = fx0 + width * 0.13, fx1 - width * 0.04
     ty0, ty1 = fy0 + height * 0.26, fy1 - height * 0.06
 
+    # Блоков может быть несколько — на листе ИГР это штамп и четыре разреза.
+    # Кладём их столбиком, деля свободную полосу поровну: иначе все девять
+    # вписываются в одно место и накрывают друг друга.
     out: list[dict] = []
-    for name, texts in attached:
+    rows = len(attached)
+    band = (ty1 - ty0) / rows if rows else (ty1 - ty0)
+    for index, (name, texts) in enumerate(attached):
+        top = ty1 - index * band
+        bottom = top - band * 0.94
         block = None
         try:
             block = doc.blocks.get(name)
@@ -229,9 +246,9 @@ def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
             continue
         bx0, by0, bx1, by1 = box
         span_x, span_y = (bx1 - bx0) or 1.0, (by1 - by0) or 1.0
-        scale = min((tx1 - tx0) / span_x, (ty1 - ty0) / span_y)
+        scale = min((tx1 - tx0) / span_x, (top - bottom) / span_y)
         shift_x = tx0 + ((tx1 - tx0) - span_x * scale) / 2
-        shift_y = ty1 - span_y * scale
+        shift_y = top - span_y * scale
 
         def to_sheet(x: float, y: float) -> tuple[float, float]:
             return shift_x + (x - bx0) * scale, shift_y + (y - by0) * scale

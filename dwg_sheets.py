@@ -968,6 +968,10 @@ def _sheets_from_frames(msp, model_texts: list[TextItem]) -> list[Sheet]:
 # сущность-таблица, и мы добираемся до текста через неё.
 _ANON_BLOCK_PREFIXES = ("*T", "*U", "*X", "*D")
 
+# Блоки, которые не бывают потерянной вставкой: пространства читаются
+# напрямую, а «_None» AutoCAD держит как пустышку.
+_SERVICE_BLOCKS = {"*model_space", "*paper_space", "_none"}
+
 
 # Слова, которыми чертёжник делит длинную таблицу между листами. Порядок
 # здесь — это и есть порядок листов: «(начало)» на первом, «(окончание)» на
@@ -1045,6 +1049,22 @@ def attach_tables(sheets: list[Sheet], orphans: list[tuple[str, list]]):
         title, part = caption
         by_name.setdefault(_fold(title), []).append((part * 1000 + index, name, texts))
 
+    # Когда настоящий лист в документе ОДИН, гадать не о чем: всё, что
+    # потеряло вставку, принадлежит ему. Так на лист ИГР возвращаются штамп и
+    # четыре геологических разреза — 1600 подписей, которые иначе висели бы
+    # десятком отдельных листов.
+    single = [rows[0][1] for rows in documents.values() if len(rows) == 1]
+    if len(documents) == 1 and len(single) == 1:
+        target_sheet = single[0]
+        for name, texts in orphans:
+            target_sheet.attached.append((name, texts))
+        target_sheet.recovered = True
+        target_sheet.note = (
+            "содержимое листа собрано заново: конвертер потерял привязку "
+            "блоков, а лист в документе один"
+        )
+        return []
+
     left: list[tuple[str, list]] = []
     for folded, group in by_name.items():
         group.sort(key=lambda row: row[0])
@@ -1103,7 +1123,16 @@ def orphan_blocks(doc) -> list[tuple[str, list]]:
     seen_content: set[str] = set()
     for block in doc.blocks:
         name = block.name
-        if name in used or not name.startswith(_ANON_BLOCK_PREFIXES):
+        if name in used:
+            continue
+        # Вставку конвертер теряет не только у анонимных блоков с таблицами, но
+        # и у обычных: в файле ИГР без вставки остались «Штамп КРП» и
+        # «ГП-СООРУЖЕНИЯ-БЛОК 4» — 910 подписей, включая фамилии из штампа и
+        # номера скважин. Служебные блоки пространств пропускаем: их
+        # содержимое читается напрямую.
+        if name.startswith("*") and not name.startswith(_ANON_BLOCK_PREFIXES):
+            continue
+        if name.lower() in _SERVICE_BLOCKS:
             continue
         texts: list[TextItem] = []
         try:
