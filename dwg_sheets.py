@@ -167,7 +167,18 @@ class Sheet:
     from_model: int = 0
 
     def extent(self) -> tuple[float, float, float, float] | None:
-        """Общий охват листа в координатах модели."""
+        """Охват листа — в той же системе координат, что и его подписи.
+
+        Смешивать окна вида с подписями нельзя. У листа, собранного из
+        layout'а, подписи уже пересчитаны в миллиметры бумаги, а окна остались
+        в мировых координатах площадки: у листа ИГР это −3 062…−1 821 против
+        −624 118…−433 116. По такому охвату все 1 248 подписей оказывались «в
+        северо-восточном углу», и карта листа врала.
+        """
+        if self.views and self.texts:
+            xs = [item.x for item in self.texts]
+            ys = [item.y for item in self.texts]
+            return min(xs), min(ys), max(xs), max(ys)
         if not self.windows:
             return None
         return (
@@ -1369,13 +1380,19 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
     # Потерянные при конвертации таблицы. Сначала пробуем посадить каждую на
     # свой лист — по заголовку и штампу; что не село, идёт отдельными листами
     # в конце, как раньше.
-    for name, texts in attach_tables(sheets, orphan_blocks(doc)):
+    # Блоки, которым лист найти не удалось. Каждый отдельным листом — это
+    # десятки лишних листов на документ (по комплекту набегало 181), поэтому
+    # одиночный блок остаётся листом, а когда их много, они собираются в один
+    # лист с подзаголовками: содержимое всё равно всё, а листать нечего.
+    left = attach_tables(sheets, orphan_blocks(doc))
+    if len(left) == 1:
+        name, texts = left[0]
         xs = [t.x for t in texts]
         ys = [t.y for t in texts]
         sheets.append(
             Sheet(
                 number=None,
-                name=f"Таблица без привязки ({name})",
+                name=f"Без привязки ({name})",
                 source_block=name,
                 paper="",
                 paper_width=0.0,
@@ -1383,9 +1400,32 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
                 texts=list(texts),
                 windows=[(min(xs), min(ys), max(xs), max(ys), 1.0)],
                 note=(
-                    "таблица есть в файле, но конвертер потерял её привязку к "
-                    "листу — место на листе неизвестно, содержимое приведено "
-                    "полностью"
+                    "содержимое есть в файле, но конвертер потерял его привязку "
+                    "к листу — место неизвестно, приведено полностью"
+                ),
+            )
+        )
+    elif left:
+        merged: list[TextItem] = []
+        for name, texts in left:
+            merged.extend(texts)
+        xs = [t.x for t in merged] or [0.0]
+        ys = [t.y for t in merged] or [0.0]
+        sheets.append(
+            Sheet(
+                number=None,
+                name="Содержимое без привязки к листам",
+                paper="",
+                paper_width=0.0,
+                paper_height=0.0,
+                texts=merged,
+                windows=[(min(xs), min(ys), max(xs), max(ys), 1.0)],
+                flat=True,
+                note=(
+                    f"блоков, потерявших привязку: {len(left)} "
+                    f"({', '.join(name for name, _ in left[:6])}"
+                    f"{' и другие' if len(left) > 6 else ''}). Место на листах "
+                    "неизвестно, содержимое приведено полностью"
                 ),
             )
         )
@@ -2054,9 +2094,18 @@ def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
     tables = tables or []
     lines: list[tuple[float, str]] = []
     covered = []
+    number = 0
     for box, markdown in tables:
         covered.append(box)
-        lines.append((box[3], "\n".join(["**Таблица**", "", markdown])))
+        grid = [ln for ln in markdown.splitlines() if ln.startswith("|")]
+        if len(grid) < 2 or grid[0].count("|") - 1 < 2:
+            # Сетки нет — это просто подписи, лежавшие рядом. Заголовок
+            # «Таблица» над одной строкой обманывает: на листе ИГР таких
+            # заголовков набиралось десять, и ни один не вёл к таблице.
+            lines.append((box[3], markdown))
+            continue
+        number += 1
+        lines.append((box[3], chr(10).join([f"**Таблица {number}**", "", markdown])))
     outside = [
         item
         for item in sheet.texts
@@ -2064,7 +2113,7 @@ def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
             b[0] <= item.x <= b[2] and b[1] <= item.y <= b[3] for b in covered
         )
     ]
-    for text in reading_order(outside):
+    for text in _text_by_zone(sheet, outside):
         lines.append((None, text))
     # Таблицы расставляем по своей высоте, текст идёт своим порядком чтения:
     # смешивать их по одному ключу нельзя — у строк текста высоты уже нет.
@@ -2075,6 +2124,48 @@ def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
     for _, block in table_lines:
         ordered.insert(0, block)
     return ordered
+
+
+# С какого числа подписей простыню текста стоит делить на части. Ниже этого
+# порога заголовки только мешают: на титульном листе их три штуки.
+_ZONE_SPLIT_FROM = 40
+
+# Порядок обхода листа: сверху вниз, слева направо — как читают чертёж.
+_ZONE_ORDER = (
+    "северо-запад", "север", "северо-восток",
+    "запад", "центр", "восток",
+    "юго-запад", "юг", "юго-восток",
+    "по всему листу",
+)
+
+
+def _text_by_zone(sheet: Sheet, items: list[TextItem]) -> list[str]:
+    """Текст листа, разбитый по углам и середине.
+
+    На чертеже подписи разбросаны, и сплошная лента строк («СКВ 89 155.80»,
+    «10 лоб, МПа») не читается вовсе: непонятно, что относится к разрезу, что
+    к условным обозначениям, а что к штампу. Разбиваем по зонам листа и
+    подписываем каждую — тогда видно, из какого места чертежа строки.
+    """
+    if len(items) < _ZONE_SPLIT_FROM:
+        return reading_order(items)
+    box = sheet.extent()
+    if box is None:
+        return reading_order(items)
+    groups: dict[str, list[TextItem]] = {}
+    for item in items:
+        groups.setdefault(_text_zone(item, box), []).append(item)
+    if len(groups) < 2:
+        return reading_order(items)
+    out: list[str] = []
+    known = [z for z in _ZONE_ORDER if z in groups]
+    for zone in known + [z for z in groups if z not in _ZONE_ORDER]:
+        body = reading_order(groups[zone])
+        if not body:
+            continue
+        out.append(f"**{zone.capitalize()} листа**")
+        out.extend(body)
+    return out
 
 
 def sheet_map(sheet: Sheet, layers=None, tables=None, ole=0) -> str:
@@ -2099,16 +2190,20 @@ def sheet_map(sheet: Sheet, layers=None, tables=None, ole=0) -> str:
         by_zone[_text_zone(item, box)] = by_zone.get(_text_zone(item, box), 0) + 1
     for zone, count in sorted(by_zone.items(), key=lambda kv: -kv[1]):
         rows.append(f"| подписи | {zone} | {count} шт. |")
-    for index, (table_box, markdown) in enumerate(tables or [], start=1):
+    index = 0
+    for table_box, markdown in tables or []:
         grid_rows = [ln for ln in markdown.splitlines() if ln.startswith("|")]
         columns = grid_rows[0].count("|") - 1 if grid_rows else 0
+        # Блок, у которого сетка не нашлась, таблицей называть нельзя: в карте
+        # он выглядел строкой «таблица 7 · 0×0», и таких строк набиралось
+        # больше, чем настоящих таблиц.
+        if len(grid_rows) < 2 or columns < 2:
+            continue
+        index += 1
         rows.append(
             f"| таблица {index} | {_zone(table_box, box)} | "
             f"{max(len(grid_rows) - 1, 0)}×{columns} |"
         )
-    for stat in (layers or [])[:10]:
-        volume = f"{stat.length_m:g} м" if stat.length_m >= 0.1 else f"{stat.entities} об."
-        rows.append(f"| слой {stat.name} | {stat.zone} | {volume} |")
     if ole:
         rows.append(f"| вставленный объект | — | {ole} шт. |")
     return "\n".join(rows) if len(rows) > 2 else ""
