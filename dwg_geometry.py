@@ -300,6 +300,16 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
                 primitives.append(item)
                 if len(primitives) >= MAX_PRIMITIVES:
                     break
+    elif sheet.source_block:
+        # Лист собран из блока, потерявшего вставку: и сетка, и подписи лежат
+        # внутри блока, а не в модели. Без этой ветки такая таблица рисовалась
+        # голым текстом без единой линии — сетку было взять неоткуда.
+        try:
+            block = doc.blocks.get(sheet.source_block)
+        except Exception:
+            block = None
+        if block is not None:
+            primitives.extend(_record(doc, list(block)))
     else:
         # Лист найден по рамке в модели: чертёж и рамка уже в одной системе.
         primitives.extend(_record(doc, _entities(doc, box)))
