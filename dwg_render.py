@@ -170,6 +170,47 @@ def _sheet_frame(meta: dict) -> tuple[float, float, float, float, float, float]:
     return x0, y0, x1, y1, max(x1 - x0, 1e-9), max(y1 - y0, 1e-9)
 
 
+# ── лист без текста ─────────────────────────────────────────────────────────
+#
+# Пустой картинки быть не должно. Если на листе нет подписей, у этого ровно две
+# причины, и обе надо назвать прямо на превью: либо лист графический — чертёж
+# или схема, где текста и не было, — либо лист не пережил конвертацию. Инженер,
+# листающий документ, должен видеть разницу, не открывая исходник.
+
+BANNER_DRAWING = (
+    "ЧЕРТЁЖ · ТЕКСТА НЕТ",
+    "на листе только графика — подписей в файле нет",
+)
+BANNER_LOST = (
+    "ЛИСТ НЕ ПРОЧИТАН",
+    "потеря при конвертации DWG → DXF — смотрите исходный чертёж",
+)
+BANNER_BLANK = (
+    "ЛИСТ ПУСТ В ЧЕРТЕЖЕ",
+    "заготовка: содержимое вычерчено в модели и отдано отдельным листом",
+)
+
+# Лист-заглушка, когда рисовать нечего вовсе: А4 в миллиметрах.
+_BLANK_SHEET = (0.0, 0.0, 210.0, 297.0)
+
+
+def banner_for(primitives: list[dict], meta: dict | None = None) -> tuple[str, str] | None:
+    """Надпись для превью листа без текста. None — если подписи есть.
+
+    Потерянным лист считается по метке из разбора, а не по пустоте примитивов:
+    у листа опорных точек ПОС рисовать нечего лишь потому, что окно вида
+    нечитаемое, — но сам лист на месте.
+    """
+    if any(item.get("type") == "text" and item.get("text") for item in primitives):
+        return None
+    meta = meta or {}
+    if meta.get("lost"):
+        return BANNER_LOST
+    if meta.get("blank"):
+        return BANNER_BLANK
+    return BANNER_DRAWING
+
+
 def _escape(text: str) -> str:
     return (
         text.replace("&", "&amp;")
@@ -184,16 +225,51 @@ def _text_lines(value: str) -> list[str]:
     return value.split(chr(92) + "n")
 
 
+def _banner_svg(width: float, height: float, banner: tuple[str, str]) -> str:
+    """Плашка поверх листа: крупный заголовок и строка пояснения под ним."""
+    title, note = banner
+    # Кегль от ширины листа, а не абсолютный: одна и та же плашка должна
+    # читаться и на А4, и на стройгенплане в три метра.
+    size = max(width * 0.035, 4.0)
+    box_h = size * 3.4
+    box_y = height * 0.5 - box_h / 2
+    return (
+        f'<g><rect x="{width * 0.06:.2f}" y="{box_y:.2f}" '
+        f'width="{width * 0.88:.2f}" height="{box_h:.2f}" '
+        'fill="#ffffff" fill-opacity="0.88" stroke="#b42318" '
+        f'stroke-width="{max(size * 0.06, 0.3):.2f}"/>'
+        f'<text x="{width / 2:.2f}" y="{box_y + box_h * 0.42:.2f}" '
+        f'font-size="{size:.2f}" font-family="sans-serif" font-weight="bold" '
+        'fill="#b42318" text-anchor="middle" dominant-baseline="central">'
+        f"{_escape(title)}</text>"
+        f'<text x="{width / 2:.2f}" y="{box_y + box_h * 0.78:.2f}" '
+        f'font-size="{size * 0.42:.2f}" font-family="sans-serif" '
+        'fill="#667085" text-anchor="middle" dominant-baseline="central">'
+        f"{_escape(note)}</text></g>"
+    )
+
+
 def render_svg(primitives: list[dict], meta: dict) -> str:
-    """Лист как SVG. Пустая строка — если рисовать нечего.
+    """Лист как SVG. Лист без подписей отдаётся с плашкой, а не пустым.
 
     Координаты сразу переводятся в экранные (начало в левом верхнем углу, Y
     вниз), поэтому в самом SVG нет ни одного преобразования: так его одинаково
     показывают браузер, конвертер и просмотрщик, и подписи не оказываются
     зеркальными — обычная плата за трюк со `scale(1,-1)`.
     """
+    banner = banner_for(primitives, meta)
     if not primitives:
-        return ""
+        # Рисовать нечего, но отдать пустоту нельзя: пустое место в интерфейсе
+        # читается как «лист пустой», а он не пустой — он до нас не дошёл.
+        x0, y0, x1, y1 = _BLANK_SHEET
+        width, height = x1 - x0, y1 - y0
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.2f} {height:.2f}" '
+            f'width="{width:.1f}mm" height="{height:.1f}mm">'
+            '<rect width="100%" height="100%" fill="#ffffff"/>'
+            + _banner_svg(width, height, banner or BANNER_DRAWING)
+            + "</svg>"
+        )
     x0, y0, x1, y1, width, height = _sheet_frame(meta)
 
     def to_screen(x: float, y: float) -> tuple[float, float]:
@@ -240,7 +316,15 @@ def render_svg(primitives: list[dict], meta: dict) -> str:
         strokes.setdefault(key, []).append("".join(path))
 
     if not strokes and not texts:
-        return ""
+        # Примитивы были, но ни одного рисуемого: те же две причины, что и у
+        # пустого листа, — отвечаем плашкой, а не пустотой.
+        return (
+            f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width:.2f} {height:.2f}" '
+            f'width="{width:.1f}mm" height="{height:.1f}mm">'
+            '<rect width="100%" height="100%" fill="#ffffff"/>'
+            + _banner_svg(width, height, banner or BANNER_DRAWING)
+            + "</svg>"
+        )
 
     # Линии одного цвета и толщины идут одним path: у стройгенплана это
     # десятки тысяч отрезков, и по отдельному элементу на каждый браузер
@@ -259,20 +343,26 @@ def render_svg(primitives: list[dict], meta: dict) -> str:
         '<rect width="100%" height="100%" fill="#ffffff"/>'
         + "".join(body)
         + "".join(texts)
+        + (_banner_svg(width, height, banner) if banner else "")
         + "</svg>"
     )
 
 
 def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
-    """Лист как PNG — для ленты миниатюр и как запасной путь интерфейса."""
-    if not primitives:
-        return None
+    """Лист как PNG — для ленты миниатюр и как запасной путь интерфейса.
+
+    Лист без подписей рисуется с плашкой, а не отдаётся пустым: см. `banner_for`.
+    """
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
 
+    banner = banner_for(primitives, meta)
+    if not primitives:
+        x0, y0, x1, y1 = _BLANK_SHEET
+        meta = dict(meta or {}, bbox=(x0, y0, x1, y1))
     x0, y0, x1, y1, width, height = _sheet_frame(meta)
     dpi = 100
     px_per_unit = _PREVIEW_WIDTH_PX / width
@@ -320,6 +410,29 @@ def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
             LineCollection(lines, colors=color, linewidths=to_points(lw))
         )
 
+    if banner:
+        title, note = banner
+        axes.text(
+            (x0 + x1) / 2,
+            (y0 + y1) / 2 + height * 0.012,
+            title,
+            fontsize=22,
+            color="#b42318",
+            fontweight="bold",
+            ha="center",
+            va="center",
+            bbox={"facecolor": "white", "alpha": 0.88, "edgecolor": "#b42318"},
+        )
+        axes.text(
+            (x0 + x1) / 2,
+            (y0 + y1) / 2 - height * 0.018,
+            note,
+            fontsize=11,
+            color="#667085",
+            ha="center",
+            va="center",
+        )
+
     axes.set_xlim(x0, x1)
     axes.set_ylim(y0, y1)
     axes.set_aspect("equal")
@@ -335,8 +448,9 @@ def sheet_preview(path: Path, page_number: int, fmt: str = "svg", target: Path |
     from dwg_geometry import sheet_primitives
 
     primitives, meta, _ = sheet_primitives(path, page_number)
-    if not primitives:
-        return "" if fmt == "svg" else None
+    # Пустой ответ здесь означал бы для интерфейса «картинки нет», и лист,
+    # потерянный конвертером, выглядел бы так же, как сбой отдачи. Рисуем
+    # плашку — она и есть ответ.
     if fmt == "svg":
         return render_svg(primitives, meta)
     if target is None:

@@ -511,7 +511,7 @@ def get_page_preview(job_id: str, page_number: int, format: str = "svg"):
     # версии интерфейс продолжал бы получать их до конца жизни прогона.
     cache = Path(job.runDir) / "preview"
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"page_{page_number:04d}.v2.{format}"
+    target = cache / f"page_{page_number:04d}.v3.{format}"
     if not target.exists():
         from dwg_render import sheet_preview
 

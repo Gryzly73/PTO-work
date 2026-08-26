@@ -144,6 +144,12 @@ class Sheet:
     # Чем разбор листа оказался неполон — это идёт в паспорт, чтобы инженер
     # видел разницу между «на листе ничего нет» и «мы не смогли прочитать».
     note: str = ""
+    # Лист не пережил конвертацию: в файле от него не осталось ни одного
+    # объекта. Отличается от «на листе нет текста» — там есть хотя бы линии.
+    lost: bool = False
+    # Лист пуст и в самом чертеже: комплект вычерчен в модели, а layout'ы
+    # оставлены пустыми заготовками. Не потеря — сверено прямым чтением DWG.
+    blank: bool = False
     # Сколько подписей пришло из пространства модели через окна вьюпортов.
     # Ноль при непустом чертеже означает, что окно настроено мимо, — и это
     # надо отличать от «на листе просто нет текста»: собственный штамп в
@@ -205,6 +211,15 @@ def find_converter() -> Path | None:
     return None
 
 
+# Сколько раз повторить конвертацию, если её результат не читается. Выход
+# dwg2dxf НЕ детерминирован: восемь прогонов на одном и том же DWG дают восемь
+# разных файлов (размер гуляет на килобайты — в секцию материалов попадает
+# мусор из неинициализированной памяти), и примерно каждый восьмой оказывается
+# структурно битым. Ретрай стоит секунды и убирает эту лотерею: три неудачи
+# подряд — это уже не случайность, а свойство файла.
+_CONVERT_ATTEMPTS = 3
+
+
 def to_dxf(path: Path, out_dir: Path | None = None) -> Path:
     """DWG → DXF, готовый к чтению. Если на вход уже DXF, конвертация не нужна.
 
@@ -222,20 +237,59 @@ def to_dxf(path: Path, out_dir: Path | None = None) -> Path:
     out_dir = out_dir or Path(tempfile.mkdtemp(prefix="dwg2dxf_"))
     out_dir.mkdir(parents=True, exist_ok=True)
     target = out_dir / (path.stem + ".dxf")
-    # dwg2dxf молчалив в успехе и болтлив в предупреждениях: часть объектов он
-    # пропускает («Unknown object»). Это не отказ — файл читаемый, но полноту
-    # стоит сверять с ODA, когда есть с чем сравнить.
-    result = subprocess.run(
-        [str(converter), "-o", str(target), str(path)],
-        capture_output=True,
-        text=True,
-        errors="replace",
-    )
-    if not target.exists():
-        raise RuntimeError(
-            f"Конвертер не создал {target.name}: {result.stderr.strip()[:300]}"
+    last_error = ""
+    for attempt in range(1, _CONVERT_ATTEMPTS + 1):
+        # dwg2dxf молчалив в успехе и болтлив в предупреждениях: часть объектов
+        # он пропускает («Unknown object»). Это не отказ — файл читаемый, но
+        # полноту стоит сверять с ODA, когда есть с чем сравнить.
+        result = subprocess.run(
+            [str(converter), "-o", str(target), str(path)],
+            capture_output=True,
+            text=True,
+            errors="replace",
         )
-    return merge_split_text(target)
+        if not target.exists():
+            raise RuntimeError(
+                f"Конвертер не создал {target.name}: {result.stderr.strip()[:300]}"
+            )
+        try:
+            _check_readable(target)
+        except Exception as error:
+            # Битый выход — не повод сдаваться: следующая попытка даёт другой
+            # файл. Мусор удаляем, иначе merge_split_text подберёт его по кэшу.
+            last_error = f"{type(error).__name__}: {error}"
+            merged = target.with_suffix(".merged.dxf")
+            for junk in (target, merged):
+                junk.unlink(missing_ok=True)
+            if attempt == _CONVERT_ATTEMPTS:
+                raise RuntimeError(
+                    f"Конвертер {_CONVERT_ATTEMPTS} раза подряд выдал нечитаемый "
+                    f"DXF для {path.name}: {last_error}"
+                ) from error
+            continue
+        return merge_split_text(target)
+    raise RuntimeError(f"Не удалось получить читаемый DXF для {path.name}")
+
+
+def _check_readable(dxf_path: Path) -> None:
+    """Быстрая проверка структуры DXF: коды групп идут через строку и числовые.
+
+    Полное чтение через ezdxf здесь не годится: разбор повторится сразу после
+    конвертации, а на ПОС это 42 МБ и десятки секунд. Скан по строкам ловит
+    ровно тот класс поломок, которым портит файл конвертер, — сбитую пару
+    «код / значение», на которой ezdxf и падает с DXFStructureError.
+    """
+    with dxf_path.open("rb") as handle:
+        for number, line in enumerate(handle):
+            if number % 2:
+                continue  # нечётная строка — значение, оно любое
+            code = line.strip()
+            if not code.isdigit() and not (
+                code[:1] in (b"-", b"+") and code[1:].isdigit()
+            ):
+                raise ValueError(
+                    f"строка {number + 1}: код группы не число ({code[:40]!r})"
+                )
 
 
 # Сущности, у которых длинный текст разложен по нескольким тегам: 3 —
@@ -864,6 +918,7 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
         # вида, хотя в самом DWG листы не пустые. Молчать об этом нельзя:
         # инженер должен знать, что смотреть его надо в исходнике.
         if not any(True for _ in layout):
+            sheet.lost = True
             sheet.note = (
                 "после конвертации DWG → DXF лист пуст: в файле не осталось "
                 "ни рамки, ни окна вида — смотрите исходный чертёж"
@@ -902,6 +957,20 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
                 sheet.from_model += 1
         sheets.append(sheet)
 
+    # Пустой layout — это потеря конвертера только тогда, когда рядом есть
+    # непустые: у ПЗУ из тринадцати листов пусты два, и в DWG они не пусты
+    # (сверено `dwgread`). Когда пусты ВСЕ, это заготовки: комплект вычерчен в
+    # модели, а layout'ы никто не наполнял — у «Сводного плана по сетям» оба
+    # листа пусты и в самом DWG. Называть это потерей было бы враньём.
+    if sheets and all(s.lost for s in sheets):
+        for sheet in sheets:
+            sheet.lost = False
+            sheet.blank = True
+            sheet.note = (
+                "лист пуст и в самом чертеже: содержимое вычерчено в "
+                "пространстве модели — смотрите его отдельным листом"
+            )
+
     # Layout'ы бывают пустыми: комплект вычерчен прямо в модели, листы стоят
     # рядом каждый в своей рамке. Тогда листы ищем по рамкам.
     #
@@ -909,13 +978,17 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
     # пусты»: у ИОС5 единственный layout цепляет пару подписей из модели, и по
     # такому признаку разбиение по рамкам не включалось бы — пять листов
     # комплекта схлопывались в один почти пустой.
+    #
+    # Решает ТОЛЬКО количество пойманного текста, но не количество листов. По
+    # числу листов разбиение по рамкам однажды выигрывало вчистую, теряя всё
+    # содержимое: у «КР1 Пристройка» layout ловит 364 подписи из 374, а рамки
+    # не ловят ни одной — они там очерчивают не листы, а мелкие блоки 140×100.
+    # Файл превращался в 11 пустых листов вместо одного полного.
     caught_by_layouts = sum(len(s.texts) for s in sheets)
     if caught_by_layouts < len(model_texts):
         by_frames = _sheets_from_frames(doc.modelspace(), model_texts)
         caught_by_frames = sum(len(s.texts) for s in by_frames)
-        if by_frames and (
-            caught_by_frames > caught_by_layouts or len(by_frames) > len(sheets)
-        ):
+        if by_frames and caught_by_frames > caught_by_layouts:
             return by_frames
 
     # Окно вьюпорта бывает настроено мимо чертежа: в «КР1 Планы» вид смотрит на
@@ -1261,6 +1334,70 @@ def sheet_extras(msp, sheet: Sheet):
     return tables, ole
 
 
+# Чем оказался лист, когда текста на нём не нашлось. Исхода «просто пусто» быть
+# не должно: либо мы не выбили текст, либо текста на листе и нет — и тогда это
+# графика, и это надо сказать прямо, а не отдать пустую страницу.
+CONTENT_TEXT = "text"  # подписи есть — обычный случай
+CONTENT_DRAWING = "drawing"  # текста нет, но лист вычерчен: чертёж или схема
+CONTENT_LOST = "lost"  # нет ни текста, ни линий — до нас лист не дошёл
+CONTENT_BLANK = "blank"  # лист пуст и в самом чертеже: заготовка layout'а
+
+# Заглушка на месте содержимого. Стоит вместо пустоты, чтобы нумерация листов
+# и структура отчёта не рвались, а читатель видел причину.
+MOCK_DRAWING = (
+    "**[mock] Лист графический: подписей в файле нет.**\n\n"
+    "_На листе {shapes} и ни одной текстовой подписи — расшифровывать нечего. "
+    "Содержимое такого листа разбирается отдельно, по чертежу._"
+)
+MOCK_BLANK = (
+    "**[mock] Лист пуст и в самом чертеже.**\n\n"
+    "_Это заготовка: в файле лист есть, но на нём ничего не вычерчено — "
+    "комплект нарисован в пространстве модели. Его содержимое отдаётся "
+    "отдельным листом в конце документа._"
+)
+MOCK_LOST = (
+    "**[mock] Лист не прочитан: потеря при конвертации DWG → DXF.**\n\n"
+    "_В файле от этого листа не осталось ни рамки, ни линий, ни подписей. "
+    "В исходном чертеже содержимое может быть на месте: у листов ПЗУ так и "
+    "было — открывайте DWG в чертёжной программе._"
+)
+
+
+def sheet_content(sheet: Sheet, layers=None, flow=None) -> str:
+    """Чем оказался лист: текстом, графикой или потерей конвертера.
+
+    Потерей считаем только то, что при чтении оказалось пустым по-настоящему
+    (`Sheet.lost`). Судить по «нет ни слоёв, ни окон» нельзя: у файла опорных
+    точек ПОС в модели 112 вставок, а окно вида одно и нечитаемое — лист
+    графический, а выглядел бы потерянным.
+    """
+    if flow:
+        return CONTENT_TEXT
+    if any((item.text or "").strip() for item in sheet.texts):
+        return CONTENT_TEXT
+    if sheet.lost:
+        return CONTENT_LOST
+    return CONTENT_BLANK if sheet.blank else CONTENT_DRAWING
+
+
+def _mock_block(sheet: Sheet, layers=None) -> str:
+    """Заглушка вместо содержимого — с описанием того, что на листе всё же есть."""
+    content = sheet_content(sheet, layers)
+    if content == CONTENT_LOST:
+        return MOCK_LOST
+    if content == CONTENT_BLANK:
+        return MOCK_BLANK
+    if layers:
+        entities = sum(st.entities for st in layers)
+        length = sum(st.length_m for st in layers)
+        shapes = f"{entities} объектов черчения в {len(layers)} слоях"
+        if length >= 0.1:
+            shapes += f", общей длиной {length:.0f} м"
+    else:
+        shapes = "есть вычерченное содержимое"
+    return MOCK_DRAWING.format(shapes=shapes)
+
+
 def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
     """Содержимое листа в порядке чертежа: подписи сверху вниз, таблицы на месте.
 
@@ -1359,6 +1496,21 @@ def sheet_markdown(
         f"- текстовых объектов: {len(sheet.texts)}",
         "",
     ]
+    content = sheet_content(sheet, layers)
+    if content != CONTENT_TEXT:
+        # Признак для тех, кто читает паспорт машиной: лист без текста — это
+        # не пустой лист, а либо графика, либо потеря.
+        parts[-1:] = [
+            "- содержимое: "
+            + (
+                "только графика, текста нет (mock)"
+                if content == CONTENT_DRAWING
+                else "лист пуст и в самом чертеже — заготовка (mock)"
+                if content == CONTENT_BLANK
+                else "лист потерян при конвертации DWG → DXF (mock)"
+            ),
+            "",
+        ]
     if sheet.note:
         parts[-1:] = [f"- разбор листа неполон: {sheet.note}", ""]
     # Карта листа идёт в PASS-A, а не отдельной секцией PASS-0: сервис
@@ -1415,7 +1567,11 @@ def sheet_markdown(
         "_Текст взят из чертежа как данные: модель не вызывалась._",
         "",
     ]
-    parts.extend(sheet_flow(sheet, tables))
+    # Пустой раздел означал бы «текста нет», не отличая графический лист от
+    # нашей недоработки. Отдаём заглушку с причиной — читать пустую страницу
+    # и гадать инженеру не приходится.
+    flow = sheet_flow(sheet, tables)
+    parts.extend(flow or [_mock_block(sheet, layers)])
     return "\n".join(parts).rstrip() + "\n"
 
 

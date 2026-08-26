@@ -235,6 +235,10 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
         "scale": sheet.scale(),
         "primitives": len(primitives),
         "texts": len(sheet.texts),
+        # Лист не пережил конвертацию — отрисовке это нужно, чтобы отличить
+        # «здесь чертёж без подписей» от «листа до нас не дошло».
+        "lost": bool(sheet.lost),
+        "blank": bool(sheet.blank),
     }
     return primitives, meta
 
@@ -334,7 +338,9 @@ def sheet_primitives(
     sheet = sheets[page_number - 1]
     box = sheet_box(sheet)
     if box is None:
-        return [], {}, units
+        # Рисовать нечего, но отрисовке всё равно надо знать, почему: лист
+        # потерян конвертером или просто не дал кадра.
+        return [], {"lost": bool(sheet.lost), "blank": bool(sheet.blank), "primitives": 0, "texts": 0}, units
     doc = ezdxf.readfile(str(dxf_path))
     if sheet.views:
         # Лист собран в координатах бумаги, а бумага всегда в миллиметрах —
