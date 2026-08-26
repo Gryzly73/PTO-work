@@ -448,9 +448,13 @@ def sheet_preview(path: Path, page_number: int, fmt: str = "svg", target: Path |
     from dwg_geometry import sheet_primitives
 
     primitives, meta, _ = sheet_primitives(path, page_number)
-    # Пустой ответ здесь означал бы для интерфейса «картинки нет», и лист,
-    # потерянный конвертером, выглядел бы так же, как сбой отдачи. Рисуем
-    # плашку — она и есть ответ.
+    # Служебный лист без координат рисовать нечем и незачем: интерфейс покажет
+    # его содержимое текстом, а на месте картинки — свою плашку.
+    if meta.get("flat"):
+        return "" if fmt == "svg" else None
+    # В остальных случаях пустой ответ означал бы для интерфейса «картинки
+    # нет», и лист, потерянный конвертером, выглядел бы так же, как сбой
+    # отдачи. Рисуем плашку — она и есть ответ.
     if fmt == "svg":
         return render_svg(primitives, meta)
     if target is None:

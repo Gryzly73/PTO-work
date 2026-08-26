@@ -336,6 +336,11 @@ def sheet_primitives(
     if not 1 <= page_number <= len(sheets):
         raise IndexError(f"в чертеже {len(sheets)} листов, запрошен {page_number}")
     sheet = sheets[page_number - 1]
+    # Служебный список подписей без координат («Текст из исходного DWG, не
+    # найденный на листах»). Рисовать его нельзя: всё легло бы в одну точку.
+    # Пустой ответ честнее — интерфейс покажет содержимое текстом.
+    if getattr(sheet, "flat", False):
+        return [], {"flat": True, "primitives": 0, "texts": len(sheet.texts)}, units
     box = sheet_box(sheet)
     if box is None:
         # Рисовать нечего, но отрисовке всё равно надо знать, почему: лист
