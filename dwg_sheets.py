@@ -978,6 +978,19 @@ _SERVICE_BLOCKS = {"*model_space", "*paper_space", "_none"}
 # последнем.
 _TABLE_PARTS = ("начало", "продолжение", "окончание")
 
+# Корни этих слов и их порядок. По корню, а не по слову целиком: в чертежах
+# встречаются «окочание», «продолж.» и прочие сокращения.
+_PART_ROOTS = (("нача", 0), ("продолж", 1), ("оконч", 2), ("окоч", 2), ("оконьч", 2))
+
+
+def _part_order(word: str) -> int | None:
+    """Какая это часть таблицы: начало, продолжение, окончание. None — не часть."""
+    low = " ".join((word or "").split()).lower()
+    for root, order in _PART_ROOTS:
+        if low.startswith(root):
+            return order
+    return None
+
 # Строки, по которым видно, что подпись — не заголовок, а шапка таблицы.
 _TABLE_HEADS = ("обозначение", "наименование", "примечание", "номер тома")
 
@@ -994,9 +1007,14 @@ def _table_caption(texts: list) -> tuple[str, int] | None:
         text = " ".join((item.text or "").split())
         if not text or text.lower() in _TABLE_HEADS:
             continue
-        match = re.match(r"^(.*?)\s*\((начало|продолжение|окончание)\)\s*$", text, re.I)
+        # Слово в скобках пишут как придётся: у ТБЭ в чертеже стоит
+        # «Содержание (окочание)» — с опечаткой. Ловим по корню, иначе такая
+        # таблица не садится на лист из-за одной пропущенной буквы.
+        match = re.match(r"^(.*?)\s*\(\s*([^)]{3,20}?)\s*\)\s*$", text)
         if match:
-            return match.group(1).strip(), _TABLE_PARTS.index(match.group(2).lower())
+            part = _part_order(match.group(2))
+            if part is not None:
+                return match.group(1).strip(), part
         return text, 0
     return None
 
@@ -1075,9 +1093,15 @@ def attach_tables(sheets: list[Sheet], orphans: list[tuple[str, list]]):
             if rows and _fold(rows[0][2].title) == folded:
                 target = rows
                 break
-        if target is None or len(target) < len(group):
+        if target is None:
             left += [(name, texts) for _, name, texts in group]
             continue
+        if len(target) < len(group):
+            # Частей больше, чем листов документа: сажаем по порядку сколько
+            # есть, остаток отдаём отдельными листами. Лучше вернуть на место
+            # две таблицы из трёх, чем ни одной.
+            left += [(name, texts) for _, name, texts in group[len(target):]]
+            group = group[: len(target)]
         for (_, name, texts), (_number, sheet, _mark) in zip(group, target):
             sheet.attached.append((name, texts))
             sheet.recovered = True
