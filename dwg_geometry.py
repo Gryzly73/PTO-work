@@ -163,6 +163,84 @@ def _record(doc, entities) -> list[dict]:
     return out
 
 
+def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
+    """Примитивы таблиц, посаженных на лист по заголовку.
+
+    Место известно только приблизительно: вставку конвертер потерял. Вписываем
+    таблицу в верхние три четверти листа — низ занят основной надписью, — и
+    сохраняем пропорции, чтобы сетка не растянулась.
+    """
+    attached = list(getattr(sheet, "attached", []) or [])
+    if not attached:
+        return []
+    frame = _bounds(placed)
+    if frame is None:
+        return []
+    fx0, fy0, fx1, fy1 = frame
+    width, height = fx1 - fx0, fy1 - fy0
+    if width <= 0 or height <= 0:
+        return []
+    # Поле под таблицу: отступ от рамки по бокам и сверху, четверть листа снизу
+    # оставлена штампу.
+    # Слева на листе идут боковые графы («Согласовано», «Взаим. инв. №»),
+    # поэтому отступ там больше.
+    tx0, tx1 = fx0 + width * 0.13, fx1 - width * 0.04
+    ty0, ty1 = fy0 + height * 0.26, fy1 - height * 0.06
+
+    out: list[dict] = []
+    for name, texts in attached:
+        block = None
+        try:
+            block = doc.blocks.get(name)
+        except Exception:
+            block = None
+        source = _record(doc, list(block)) if block is not None else []
+        points = [p for item in source for p in item["points"]]
+        points += [(item.x, item.y) for item in texts]
+        box = _bounds([{"points": points}]) if points else None
+        if box is None:
+            continue
+        bx0, by0, bx1, by1 = box
+        span_x, span_y = (bx1 - bx0) or 1.0, (by1 - by0) or 1.0
+        scale = min((tx1 - tx0) / span_x, (ty1 - ty0) / span_y)
+        shift_x = tx0 + ((tx1 - tx0) - span_x * scale) / 2
+        shift_y = ty1 - span_y * scale
+
+        def to_sheet(x: float, y: float) -> tuple[float, float]:
+            return shift_x + (x - bx0) * scale, shift_y + (y - by0) * scale
+
+        for item in source:
+            out.append(
+                dict(item, points=[to_sheet(x, y) for x, y in item["points"]])
+            )
+        for item in texts:
+            x, y = to_sheet(item.x, item.y)
+            out.append(
+                {
+                    "type": "text",
+                    "layer": "",
+                    "color": "#000000",
+                    "lw": 0,
+                    "points": [(x, y)],
+                    "text": _wrapped(item),
+                    "width": round((item.width or 0) * scale, 1) or "",
+                    "size": round(max(item.height * scale, 0.8), 2),
+                    "rot": round(item.rotation, 1) or "",
+                    "anchor": item.anchor,
+                    "valign": item.valign,
+                }
+            )
+    return out
+
+
+def _bounds(items: list[dict]) -> tuple[float, float, float, float] | None:
+    xs = [x for item in items for x, _ in (item.get("points") or [])]
+    ys = [y for item in items for _, y in (item.get("points") or [])]
+    if not xs or not ys:
+        return None
+    return min(xs), min(ys), max(xs), max(ys)
+
+
 def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
     """Примитивы листа и его метаданные — всё в координатах листа.
 
@@ -198,6 +276,13 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
     else:
         # Лист найден по рамке в модели: чертёж и рамка уже в одной системе.
         primitives.extend(_record(doc, _entities(doc, box)))
+
+    # Таблицы, потерявшие вставку и опознанные по заголовку (dwg_sheets
+    # .attach_tables). Их место на листе конвертер потерял вместе с вставкой,
+    # но сама таблица — сетка и подписи — цела. Без неё лист выглядит пустым:
+    # в расшифровке состав проекта есть, а на чертеже белое поле. Вписываем в
+    # свободную часть листа, оставляя низ под штамп.
+    primitives.extend(_attached_primitives(doc, sheet, primitives))
 
     for item in sheet.texts:
         primitives.append(

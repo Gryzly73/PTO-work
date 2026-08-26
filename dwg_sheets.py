@@ -501,6 +501,23 @@ _MTEXT_ANCHOR = {
 }
 
 
+# Межстрочный интервал MTEXT по умолчанию: полтора кегля с небольшим — так
+# AutoCAD расставляет строки, и по нему же считается отступ пустых строк.
+_LINE_SPACING = 1.5
+
+
+def _leading_blanks(entity) -> int:
+    """Сколько пустых строк стоит в начале блока MTEXT."""
+    try:
+        plain = entity.plain_text()
+    except Exception:
+        return 0
+    if not plain:
+        return 0
+    stripped = plain.lstrip(chr(13) + chr(10))
+    return plain[: len(plain) - len(stripped)].count(chr(10))
+
+
 def _placement(entity) -> tuple[float, float, str, str]:
     """Где на самом деле стоит подпись: (x, y, привязка по X, привязка по Y)."""
     kind = entity.dxftype()
@@ -510,7 +527,13 @@ def _placement(entity) -> tuple[float, float, str, str]:
             anchor, valign = _MTEXT_ANCHOR.get(
                 int(entity.dxf.get("attachment_point", 1) or 1), ("left", "top")
             )
-            return point.x, point.y, anchor, valign
+            # Пустые строки в начале блока — это вертикальный отступ, которым
+            # чертёжник опускает подпись. На титульном листе ПЗ у блока
+            # «Генеральный директор» их 31: без поправки текст встаёт наверх и
+            # ложится поверх блока «Заказчик», у которого та же точка вставки.
+            # Сам текст очищается, поэтому отступ переносим в координату.
+            shift = _leading_blanks(entity) * _text_height(entity) * _LINE_SPACING
+            return point.x, point.y - shift, anchor, valign
         halign = int(entity.dxf.get("halign", 0) or 0)
         valign = int(entity.dxf.get("valign", 0) or 0)
         point = entity.dxf.insert
