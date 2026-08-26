@@ -153,6 +153,13 @@ class Sheet:
     # Служебный список подписей без координат: рисовать нечего, всё легло бы в
     # одну точку. Ставится только там, где координаты и правда неизвестны.
     flat: bool = False
+    # Таблицы, потерявшие вставку, но опознанные как принадлежащие этому листу:
+    # (имя блока, подписи). Место на листе неизвестно, поэтому в геометрию они
+    # не идут — только в текст листа. Подробности — в `attach_tables()`.
+    attached: list = field(default_factory=list)
+    # Заметка листа говорит о находке, а не о недостаче: тогда в паспорте она
+    # идёт как «восстановлено», а не «разбор листа неполон».
+    recovered: bool = False
     # Сколько подписей пришло из пространства модели через окна вьюпортов.
     # Ноль при непустом чертеже означает, что окно настроено мимо, — и это
     # надо отличать от «на листе просто нет текста»: собственный штамп в
@@ -850,6 +857,105 @@ def _sheets_from_frames(msp, model_texts: list[TextItem]) -> list[Sheet]:
 _ANON_BLOCK_PREFIXES = ("*T", "*U", "*X", "*D")
 
 
+# Слова, которыми чертёжник делит длинную таблицу между листами. Порядок
+# здесь — это и есть порядок листов: «(начало)» на первом, «(окончание)» на
+# последнем.
+_TABLE_PARTS = ("начало", "продолжение", "окончание")
+
+# Строки, по которым видно, что подпись — не заголовок, а шапка таблицы.
+_TABLE_HEADS = ("обозначение", "наименование", "примечание", "номер тома")
+
+
+def _table_caption(texts: list) -> tuple[str, int] | None:
+    """Заголовок таблицы: (имя без части, порядок части).
+
+    Читаем верхнюю подпись блока. У комплекта «Жуковский» это «Содержание
+    (начало)», «Состав проектной документации (окончание)» и так далее — то
+    есть имя документа плюс указание, какая это часть.
+    """
+    ordered = sorted(texts, key=lambda item: -item.y)
+    for item in ordered[:3]:
+        text = " ".join((item.text or "").split())
+        if not text or text.lower() in _TABLE_HEADS:
+            continue
+        match = re.match(r"^(.*?)\s*\((начало|продолжение|окончание)\)\s*$", text, re.I)
+        if match:
+            return match.group(1).strip(), _TABLE_PARTS.index(match.group(2).lower())
+        return text, 0
+    return None
+
+
+def attach_tables(sheets: list[Sheet], orphans: list[tuple[str, list]]):
+    """Сажает потерянные таблицы на их листы. Возвращает то, что не село.
+
+    Вставку таблицы конвертер теряет вместе с местом на листе, и содержимое
+    приходилось отдавать отдельным листом в конце. Инженер при этом открывал
+    лист «Содержание» и видел пустую рамку со штампом, а само содержание —
+    где-то в конце документа. Это и читалось как «таблицы пропали».
+
+    Место на листе восстановить неоткуда, а вот ЛИСТ — вполне: у таблицы есть
+    заголовок («Содержание (продолжение)»), а у листа — основная надпись с
+    наименованием и номером. Совпало наименование — значит это листы того
+    документа; часть «продолжение» садится на второй лист по порядку номеров.
+
+    Привязку делаем только там, где она однозначна: имя таблицы совпало с
+    наименованием листа, а листов документа хватает на все её части.
+    """
+    if not orphans:
+        return []
+    import stamp as stamp_module
+
+    # Листы, у которых прочитана основная надпись, разложенные по документам.
+    documents: dict[str, list[tuple[int, Sheet, object]]] = {}
+    for sheet in sheets:
+        if sheet.source_block or not sheet.texts:
+            continue
+        try:
+            mark = stamp_module.from_dwg_sheet(sheet)
+        except Exception:
+            continue
+        if not mark.code:
+            continue
+        number = int(mark.sheet) if str(mark.sheet).isdigit() else 0
+        documents.setdefault(mark.code, []).append((number, sheet, mark))
+    for group in documents.values():
+        group.sort(key=lambda row: row[0])
+
+    # Таблицы одного документа — в порядке частей, а при равенстве в порядке
+    # блоков: имена анонимных блоков конвертер выдаёт по порядку создания.
+    by_name: dict[str, list[tuple[int, str, list]]] = {}
+    unnamed: list[tuple[str, list]] = []
+    for index, (name, texts) in enumerate(orphans):
+        caption = _table_caption(texts)
+        if caption is None:
+            unnamed.append((name, texts))
+            continue
+        title, part = caption
+        by_name.setdefault(_fold(title), []).append((part * 1000 + index, name, texts))
+
+    left: list[tuple[str, list]] = []
+    for folded, group in by_name.items():
+        group.sort(key=lambda row: row[0])
+        target = None
+        for rows in documents.values():
+            # Наименование документа стоит в надписи первого листа: дальше
+            # чертёжник пишет в этой графе «Сод2», «СП2» и подобное.
+            if rows and _fold(rows[0][2].title) == folded:
+                target = rows
+                break
+        if target is None or len(target) < len(group):
+            left += [(name, texts) for _, name, texts in group]
+            continue
+        for (_, name, texts), (_number, sheet, _mark) in zip(group, target):
+            sheet.attached.append((name, texts))
+            sheet.recovered = True
+            sheet.note = (
+                "таблица листа: конвертер потерял её привязку к листу, лист "
+                "определён по заголовку таблицы и основной надписи"
+            )
+    return left + unnamed
+
+
 def orphan_blocks(doc) -> list[tuple[str, list]]:
     """Блоки с текстом, на которые в файле никто не ссылается.
 
@@ -1090,10 +1196,10 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
             )
     sheets.sort(key=lambda s: (s.number is None, s.number or 0, s.name))
 
-    # Потерянные при конвертации таблицы — отдельными листами в конце. Иначе
-    # состав проекта из файла ТБЭ пропадал целиком: на своём листе он не
-    # появлялся, а больше его взять неоткуда.
-    for name, texts in orphan_blocks(doc):
+    # Потерянные при конвертации таблицы. Сначала пробуем посадить каждую на
+    # свой лист — по заголовку и штампу; что не село, идёт отдельными листами
+    # в конце, как раньше.
+    for name, texts in attach_tables(sheets, orphan_blocks(doc)):
         xs = [t.x for t in texts]
         ys = [t.y for t in texts]
         sheets.append(
@@ -1200,7 +1306,10 @@ def _missing_texts(sheets: list[Sheet], every_text: list[str]) -> list[str]:
     """
     have: dict[str, int] = {}
     for sheet in sheets:
-        for item in sheet.texts:
+        # Таблицы, посаженные на лист (`attach_tables`), в `texts` не входят,
+        # но в вывод листа попадают — иначе вся таблица числилась бы потерей.
+        carried = [item for _name, texts in getattr(sheet, "attached", []) for item in texts]
+        for item in list(sheet.texts) + carried:
             key = _fold(item.text)
             if key:
                 have[key] = have.get(key, 0) + 1
@@ -1602,6 +1711,55 @@ def sheet_extras(msp, sheet: Sheet):
         tables = sheet_tables(space, sheet, sheet.texts)
     except Exception:
         tables = []
+    # Таблицы, вставку которых потерял конвертер, а лист опознан по заголовку
+    # и надписи (`attach_tables`). Сетка и подписи у них лежат внутри своего
+    # блока, поэтому строим их из него же, а не из модели.
+    for block_name, texts in getattr(sheet, "attached", []):
+        try:
+            from dwg_tables import sheet_tables as _tables
+
+            # Окна и виды исходного листа сюда тащить нельзя: по ним
+            # считаются границы, а подписи блока лежат в своих координатах —
+            # сетка тогда не находится, и таблица выходит плоским текстом.
+            # Границы листа считаются по окнам, поэтому подсовываем окно по
+            # габаритам самих подписей блока — так же, как это делалось, пока
+            # такая таблица была отдельным листом. Без него границ нет и сетка
+            # не ищется вовсе.
+            xs = [item.x for item in texts]
+            ys = [item.y for item in texts]
+            # С запасом: крайние линии сетки стоят ШИРЕ подписей (у «Содержания»
+            # текст лежит в 30..170, а рамка таблицы — в 0..185), и по границам
+            # ровно по тексту они отсекались, оставляя таблицу без колонок.
+            pad_x = (max(xs) - min(xs)) * 0.25 + 1.0
+            pad_y = (max(ys) - min(ys)) * 0.1 + 1.0
+            carrier = replace(
+                sheet,
+                texts=list(texts),
+                windows=[
+                    (
+                        min(xs) - pad_x,
+                        min(ys) - pad_y,
+                        max(xs) + pad_x,
+                        max(ys) + pad_y,
+                        1.0,
+                    )
+                ],
+                views=[],
+                source_block=block_name,
+                attached=[],
+            )
+            block = msp.doc.blocks.get(block_name)
+            found = _tables(block, carrier, carrier.texts, trusted=True)
+        except Exception:
+            found = []
+        if found:
+            tables += found
+        else:
+            # Сетку восстановить не вышло — отдаём хотя бы подписи по порядку
+            # чтения, иначе содержимое таблицы пропало бы совсем.
+            body = "\n".join(reading_order(list(texts)))
+            if body.strip():
+                tables.append(((0.0, 0.0, 0.0, 0.0), body))
     box = sheet.extent()
     ole = 0
     # У листа, собранного из потерянного блока, своей области на чертеже нет —
@@ -1799,7 +1957,8 @@ def sheet_markdown(
             "",
         ]
     if sheet.note:
-        parts[-1:] = [f"- разбор листа неполон: {sheet.note}", ""]
+        label = "восстановлено" if sheet.recovered else "разбор листа неполон"
+        parts[-1:] = [f"- {label}: {sheet.note}", ""]
     # Карта листа идёт в PASS-A, а не отдельной секцией PASS-0: сервис
     # считает PASS-0 служебным паспортом и в интерфейс его не выводит, а карта
     # нужна как раз на экране и в промпте.

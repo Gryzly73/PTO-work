@@ -202,11 +202,20 @@ def _to_gfm(rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def sheet_tables(space, sheet, texts) -> list[tuple[tuple[float, float, float, float], str]]:
+def sheet_tables(
+    space, sheet, texts, *, trusted: bool = False
+) -> list[tuple[tuple[float, float, float, float], str]]:
     """Таблицы листа: [(границы, GFM), ...], сверху вниз.
 
     `texts` — подписи листа (TextItem из dwg_sheets): по ним заполняются
     ячейки, и по ним же определяется, что сетка не пустая.
+
+    `trusted` — сетку искать в заведомой таблице: так помечается содержимое
+    блока, который в исходнике БЫЛ таблицей AutoCAD и потерял только вставку.
+    Тогда две проверки снимаются, потому что отличать таблицу от штампа уже не
+    нужно, а обе на таких таблицах ошибаются: в «Содержании» у большинства
+    строк заполнена одна колонка из трёх («Прилагаемый материал», перечень
+    технических условий), и признак многоколоночности браковал её целиком.
     """
     box = sheet.extent()
     if box is None or not texts:
@@ -241,11 +250,14 @@ def sheet_tables(space, sheet, texts) -> list[tuple[tuple[float, float, float, f
         # У штампа почти каждая строка — одна подпись в одной ячейке, у
         # настоящей таблицы строки многоколоночные. Признак тот же, что в
         # pdf_tables: он не привязан к конкретному чертежу.
-        multi = sum(1 for row in grid if sum(1 for c in row if c.strip()) >= 2)
-        if multi / max(len(grid), 1) < 0.5:
-            continue
-        if any(word in " ".join(row).lower() for row in grid for word in _STAMP_WORDS):
-            continue  # основная надпись листа, а не таблица с данными
+        if not trusted:
+            multi = sum(1 for row in grid if sum(1 for c in row if c.strip()) >= 2)
+            if multi / max(len(grid), 1) < 0.5:
+                continue
+            if any(
+                word in " ".join(row).lower() for row in grid for word in _STAMP_WORDS
+            ):
+                continue  # основная надпись листа, а не таблица с данными
         # В таблице есть подписи, а не одни числа. Без этого в «таблицы»
         # попадает разметка узла: сетка арматуры с размерами 300, 600, 180
         # выглядит заполненной сеткой, но таблицей не является.
