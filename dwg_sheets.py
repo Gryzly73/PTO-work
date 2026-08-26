@@ -459,6 +459,22 @@ def _plain(entity) -> str:
     return "" if _FIELD_STUB.fullmatch(text.strip()) else text
 
 
+def _plain_direct(value: str) -> str:
+    """То же для строки, прочитанной прямо из DWG.
+
+    Через ezdxf её не пропустить — сущности там нет, есть только строка, а
+    разметка MTEXT в ней та же самая: `{\\fISOCPEUR|b1;Раздел 1.0}` без
+    очистки попал бы в вывод целиком.
+    """
+    from ezdxf.tools.text import plain_mtext
+
+    try:
+        text = clean_text(plain_mtext(value or ""))
+    except Exception:
+        text = clean_text(value or "")
+    return "" if _FIELD_STUB.fullmatch(text.strip()) else text
+
+
 # Выравнивание текста в DXF. Точка вставки у выровненной подписи лежит НЕ в
 # группе 10 (insert), а в группе 11 (align_point) — это правило формата, и без
 # него подписи уезжают: на листе фундаментов таких 336 штук, часть из них
@@ -884,8 +900,12 @@ def orphan_blocks(doc) -> list[tuple[str, list]]:
     return found
 
 
-def read_sheets(dxf_path: Path) -> list[Sheet]:
-    """Листы чертежа с текстом, привязанным к каждому."""
+def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
+    """Листы чертежа с текстом, привязанным к каждому.
+
+    `source` — исходный DWG, если он есть. По нему восстанавливаются листы,
+    которые не пережили конвертацию: см. `recover_lost_sheets()`.
+    """
     import ezdxf
 
     doc = ezdxf.readfile(str(dxf_path))
@@ -971,6 +991,12 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
                 "пространстве модели — смотрите его отдельным листом"
             )
 
+    # Второй путь: читаем исходный DWG и дополняем им разбор. Оттуда берутся
+    # окна вида потерянных листов и сверяется полнота текста.
+    direct_texts: list[str] = []
+    if source is not None:
+        direct_texts = enrich_from_dwg(source, sheets, model_texts)
+
     # Layout'ы бывают пустыми: комплект вычерчен прямо в модели, листы стоят
     # рядом каждый в своей рамке. Тогда листы ищем по рамкам.
     #
@@ -1031,6 +1057,34 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
                 )
             )
             return sheets
+
+    # Остаток: подписи модели, не попавшие НИ В ОДНО окно. Раньше их подбирал
+    # только случай выше — «не попало вообще ничего», — а частичный промах
+    # проходил молча: у ПЗУ так терялись шесть подписей («Граница участка
+    # строительства», «Площадка для отдыха…»), потому что окна листов их не
+    # накрывают. Терять текст, который в файле есть, нельзя ни в каком объёме.
+    if model_texts and caught:
+        placed = {item.text for sheet in sheets for item in sheet.texts}
+        orphans = [item for item in model_texts if item.text not in placed]
+        if orphans:
+            xs = [item.x for item in orphans]
+            ys = [item.y for item in orphans]
+            sheets.append(
+                Sheet(
+                    number=None,
+                    name="Текст вне листов комплекта",
+                    paper="",
+                    paper_width=0.0,
+                    paper_height=0.0,
+                    texts=list(orphans),
+                    windows=[(min(xs), min(ys), max(xs), max(ys), 1.0)],
+                    note=(
+                        "подписи есть в пространстве модели, но не попадают ни "
+                        "в одно окно вида — на каком они листе, из файла не "
+                        "видно"
+                    ),
+                )
+            )
     sheets.sort(key=lambda s: (s.number is None, s.number or 0, s.name))
 
     # Потерянные при конвертации таблицы — отдельными листами в конце. Иначе
@@ -1056,7 +1110,236 @@ def read_sheets(dxf_path: Path) -> list[Sheet]:
                 ),
             )
         )
+
+    # Сверка со вторым путём — последней, когда все листы уже собраны, включая
+    # восстановленные таблицы. То, что есть в исходном DWG и не нашлось ни на
+    # одном листе, отдаём отдельным листом: истина в DWG, промолчать о
+    # расхождении нельзя.
+    missing = _missing_texts(sheets, direct_texts) if direct_texts else []
+    if missing:
+        sheets.append(
+            Sheet(
+                number=None,
+                name="Текст из исходного DWG, не найденный на листах",
+                paper="",
+                paper_width=0.0,
+                paper_height=0.0,
+                texts=[
+                    TextItem(0.0, 0.0, 2.5, value, "direct") for value in missing
+                ],
+                note=(
+                    f"подписей найдено в исходном DWG: {len(missing)}; на листах "
+                    "комплекта их нет. Место на листе из исходника не "
+                    "восстанавливается — часть таких подписей может лежать в "
+                    "блоках, которые нигде не вставлены"
+                ),
+            )
+        )
     return sheets
+
+
+# Больше этого исходный DWG читать вторым путём не станем: JSON от dwgread
+# выходит примерно в семь раз объёмнее файла и целиком держится в памяти. В
+# комплекте «Жуковский» самый крупный чертёж — 7,3 МБ, так что запас двойной.
+_DIRECT_LIMIT = 32 * 1024 * 1024
+
+
+def enrich_from_dwg(
+    source: Path, sheets: list[Sheet], model_texts: list[TextItem]
+) -> list[str]:
+    """Дополнить разбор чтением исходного DWG. Возвращает все подписи файла.
+
+    Делает две вещи за одно чтение файла — JSON тяжёлый, второй раз его брать
+    незачем:
+
+    1. **Восстанавливает потерянные листы.** Конвертер иногда теряет лист
+       целиком: от него не остаётся ни рамки, ни окон вида. Содержимое при
+       этом никуда не девается — чертёж лежит в модели, а модель
+       конвертируется полностью. Пропадает привязка, те самые окна вида. Их и
+       берём из DWG, а текст остаётся из DXF: он там полный, и блоки в нём уже
+       развёрнуты.
+    2. **Отдаёт все подписи файла** — для сверки полноты. Саму сверку делает
+       вызывающий, и делает её последней: листы, восстановленные из потерянных
+       таблиц, добавляются в самом конце разбора, а до того их текст выглядел
+       бы недостающим.
+
+    Ошибка второго пути не должна ронять разбор: нет `dwgread`, не прочитался
+    JSON, файл слишком велик — работаем как раньше, на одном DXF.
+    """
+    try:
+        if source.stat().st_size > _DIRECT_LIMIT:
+            return []
+        import dwg_direct
+    except Exception:
+        return []
+    data = dwg_direct.read_objects(source)
+    if not data:
+        return []
+    try:
+        by_layout = dwg_direct.layout_viewports(data)
+        paper_texts = dwg_direct.layout_texts(data)
+        every_text = dwg_direct.all_texts(data)
+    except Exception:
+        return []
+
+    _recover_lost(sheets, model_texts, by_layout, paper_texts)
+    return every_text
+
+
+def _missing_texts(sheets: list[Sheet], every_text: list[str]) -> list[str]:
+    """Подписи из DWG, которых нет ни на одном листе.
+
+    Сравниваем по голому тексту, без разметки и регистра: одна и та же надпись
+    в DWG и в DXF отличается обёрткой MTEXT, а не содержанием. Считаем с
+    кратностью — блок, вставленный на десять листов, даёт в DWG одну подпись, а
+    у нас десять, и это не расхождение.
+    """
+    have: dict[str, int] = {}
+    for sheet in sheets:
+        for item in sheet.texts:
+            key = _fold(item.text)
+            if key:
+                have[key] = have.get(key, 0) + 1
+    # Одна и та же надпись бывает нарезана по-разному: в DWG «Раздел 1.0
+    # Пояснительная записка» — один MTEXT, а в таблице DXF это две соседние
+    # ячейки. Поэтому кроме точного совпадения проверяем вхождение в сплошной
+    # текст всех листов — иначе половина состава проекта числилась бы потерей.
+    joined = " | ".join(sorted(have))
+    missing: list[str] = []
+    for value in every_text:
+        text = _plain_direct(value).strip()
+        key = _fold(text)
+        if not key:
+            continue
+        if have.get(key):
+            have[key] -= 1
+        elif key not in joined:
+            missing.append(text)
+    return missing
+
+
+def _fold(text: str) -> str:
+    """Подпись в виде, в котором её сравнивают: без лишних пробелов и регистра."""
+    return " ".join((text or "").split()).strip().lower()
+
+
+def _recover_lost(
+    sheets: list[Sheet],
+    model_texts: list[TextItem],
+    by_layout: dict,
+    paper_texts: dict,
+) -> int:
+    """Собрать потерянные листы заново по данным из DWG."""
+    fixed = 0
+    for sheet in sheets:
+        if not sheet.lost:
+            continue
+        key = sheet.layout_name or sheet.name
+        # Подписи с самой бумаги листа — их окнами вида не достать.
+        for item in paper_texts.get(key, []):
+            text = clean_text(_plain_direct(item["text"])).strip()
+            if text:
+                sheet.texts.append(
+                    TextItem(
+                        item["x"],
+                        item["y"],
+                        item["height"],
+                        text,
+                        item["kind"].lower(),
+                        math.degrees(item["rotation"]),
+                        item["width"],
+                    )
+                )
+        windows = by_layout.get(key)
+        if not windows:
+            if sheet.texts:
+                sheet.lost = False
+                sheet.note = (
+                    "лист восстановлен из исходного DWG: конвертер потерял его "
+                    "целиком, окон вида в исходнике нет — взяты подписи с бумаги"
+                )
+                fixed += 1
+            continue
+        views = [_view_from_direct(w) for w in windows]
+        views = [v for v in views if v is not None]
+        if not views:
+            continue
+        seen: set[tuple[float, float, str]] = set()
+        for view in views:
+            sheet.views.append(view)
+            sheet.windows.append((*view.world, round(view.scale, 2)))
+            sheet.scales.append(round(view.scale, 2))
+            for item in model_texts:
+                if not view.holds(item.x, item.y):
+                    continue
+                key = (round(item.x, 2), round(item.y, 2), item.text)
+                if key in seen:
+                    continue
+                seen.add(key)
+                paper_x, paper_y = view.to_paper(item.x, item.y)
+                sheet.texts.append(
+                    replace(
+                        item,
+                        x=paper_x,
+                        y=paper_y,
+                        height=item.height / view.scale if view.scale else item.height,
+                        width=item.width / view.scale if view.scale else item.width,
+                    )
+                )
+                sheet.from_model += 1
+        if not sheet.texts:
+            # Окна нашлись, а подписей в них нет — лист графический. Пометку о
+            # потере всё равно снимаем: лист восстановлен, просто без текста.
+            sheet.lost = False
+            sheet.note = (
+                "лист восстановлен из исходного DWG: конвертер потерял его "
+                "рамку и окна вида, подписей в окнах нет"
+            )
+            fixed += 1
+            continue
+        sheet.lost = False
+        sheet.note = (
+            "лист восстановлен из исходного DWG: конвертер потерял его рамку "
+            "и окна вида, содержимое взято по окнам из исходника"
+        )
+        fixed += 1
+    return fixed
+
+
+def _view_from_direct(window: dict) -> "SheetView | None":
+    """Окно вида из DWG — в тот же вид, что строит `_viewport_window` по DXF.
+
+    Формулы те же, включая поправку центра: `VIEWCTR` задан в системе координат
+    вида, а не в мировой, поэтому к «цели вида» прибавляется смещение центра,
+    повёрнутое на угол разворота. Разница между источниками одна — в DWG угол
+    хранится в радианах, в DXF в градусах.
+    """
+    try:
+        paper_w, paper_h = window["paper_size"]
+        center_x, center_y = window["view_center"]
+        target_x, target_y = window["view_target"]
+        view_h = float(window["view_height"])
+        twist = float(window["twist"])
+    except Exception:
+        return None
+    if view_h <= 0 or paper_h <= 0 or paper_w <= 0:
+        return None
+    cos_a, sin_a = math.cos(twist), math.sin(twist)
+    world_x = target_x + center_x * cos_a - center_y * sin_a
+    world_y = target_y + center_x * sin_a + center_y * cos_a
+    view_w = view_h * (paper_w / paper_h)
+    return SheetView(
+        world=(
+            world_x - view_w / 2,
+            world_y - view_h / 2,
+            world_x + view_w / 2,
+            world_y + view_h / 2,
+        ),
+        paper_center=window["paper_center"],
+        paper_size=(paper_w, paper_h),
+        scale=view_h / paper_h,
+        twist=twist,
+    )
 
 
 def reading_order(texts: list[TextItem]) -> list[str]:
@@ -1614,7 +1897,9 @@ def sheets_for(path: Path) -> tuple[Path, list]:
     cached = _DOC_CACHE.get(key)
     if cached is None:
         dxf = to_dxf(path)
-        cached = (dxf, read_sheets(dxf))
+        # Путь к исходнику передаём дальше: по нему дочитываются листы,
+        # потерянные конвертацией.
+        cached = (dxf, read_sheets(dxf, path))
         _DOC_CACHE[key] = cached
     return cached
 

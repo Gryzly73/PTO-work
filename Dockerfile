@@ -46,9 +46,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Конвертер и его библиотека. Путь кладём в PTO_DWG2DXF — dwg_sheets.py ищет
 # сначала там, и на сервере поиск по PATH уже не нужен.
 COPY --from=dwgtools /out/usr/local/bin/dwg2dxf /usr/local/bin/dwg2dxf
+# dwgread читает DWG напрямую. Нужен для листов, которые конвертер теряет
+# целиком: их окна вида берутся из исходника (dwg_direct.py). Без него разбор
+# не падает — лист просто остаётся помеченным как потерянный.
+COPY --from=dwgtools /out/usr/local/bin/dwgread /usr/local/bin/dwgread
 COPY --from=dwgtools /out/usr/local/lib/ /usr/local/lib/
-RUN ldconfig && dwg2dxf --version | head -1
+RUN ldconfig && dwg2dxf --version | head -1 && dwgread --version | head -1
 ENV PTO_DWG2DXF=/usr/local/bin/dwg2dxf
+ENV PTO_DWGREAD=/usr/local/bin/dwgread
 
 WORKDIR /app
 
