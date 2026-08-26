@@ -563,7 +563,55 @@ def _text_height(entity) -> float:
     return 2.5
 
 
-def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
+# Слои, выключенные или замороженные в самом чертеже. Их содержимое на печать
+# не идёт, и в расшифровку ему тоже не место.
+#
+# Без этого на листе ПЗУ «2 СПОЗУ» ложилось поверх наименования листа: в штампе
+# два атрибута в одной точке, и один из них — на слое
+# «ШТАМП_название-текущего-листа», который в файле отключён. В комплекте таких
+# слоёв 45 из 450, так что мусор был не единичный.
+_HIDDEN_LAYERS: dict[int, frozenset] = {}
+
+
+def hidden_layers(doc) -> frozenset:
+    """Имена слоёв, которые в чертеже не показываются. Считается раз на документ."""
+    key = id(doc)
+    cached = _HIDDEN_LAYERS.get(key)
+    if cached is None:
+        names = set()
+        try:
+            for layer in doc.layers:
+                try:
+                    if layer.is_off() or layer.is_frozen():
+                        names.add(layer.dxf.name)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        cached = frozenset(names)
+        if len(_HIDDEN_LAYERS) > 8:
+            _HIDDEN_LAYERS.clear()
+        _HIDDEN_LAYERS[key] = cached
+    return cached
+
+
+def _is_hidden(entity, hidden: frozenset) -> bool:
+    """Объект лежит на невидимом слое или помечен невидимым сам."""
+    if not hidden:
+        return False
+    try:
+        return entity.dxf.layer in hidden
+    except Exception:
+        return False
+
+
+def _collect_from(
+    space,
+    out: list[TextItem],
+    depth: int = 0,
+    hidden: frozenset = frozenset(),
+    skipped: list | None = None,
+) -> None:
     """Собирает текст из пространства, разворачивая блоки.
 
     Блоки разворачиваем через virtual_entities(): у вставки свои поворот и
@@ -575,6 +623,21 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
         return
     for e in space:
         kind = e.dxftype()
+        if _is_hidden(e, hidden):
+            # Текст с невидимого слоя не выводим, но помним: иначе сверка с
+            # исходным DWG сочтёт его потерей и вернёт обратно.
+            if skipped is not None:
+                try:
+                    value = _plain(e).strip()
+                    if value:
+                        x, y, anchor, valign = _placement(e)
+                        skipped.append(
+                            TextItem(x, y, _text_height(e), value, "hidden",
+                                     _rotation(e), _text_width(e), anchor, valign)
+                        )
+                except Exception:
+                    pass
+            continue
         try:
             if kind in ("MTEXT", "TEXT"):
                 text = _plain(e).strip()
@@ -635,6 +698,21 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                     out.append(TextItem(x, y, 2.5, text, "leader"))
             elif kind == "INSERT":
                 for attrib in e.attribs:
+                    if _is_hidden(attrib, hidden):
+                        # Атрибут на отключённом слое на печать не идёт.
+                        if skipped is not None:
+                            try:
+                                value = _plain(attrib).strip()
+                                if value:
+                                    x, y, anchor, valign = _placement(attrib)
+                                    skipped.append(
+                                        TextItem(x, y, _text_height(attrib), value,
+                                                 "hidden", _rotation(attrib),
+                                                 _text_width(attrib), anchor, valign)
+                                    )
+                            except Exception:
+                                pass
+                        continue
                     text = _plain(attrib).strip()
                     if text:
                         x, y, anchor, valign = _placement(attrib)
@@ -651,7 +729,7 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                                 valign,
                             )
                         )
-                _collect_from(e.virtual_entities(), out, depth + 1)
+                _collect_from(e.virtual_entities(), out, depth + 1, hidden, skipped)
         except Exception:
             # Один битый объект не должен ронять разбор листа.
             continue
@@ -986,6 +1064,7 @@ def orphan_blocks(doc) -> list[tuple[str, list]]:
                 except Exception:
                     continue
 
+    hidden = hidden_layers(doc)
     found: list[tuple[str, list]] = []
     seen_content: set[str] = set()
     for block in doc.blocks:
@@ -994,7 +1073,7 @@ def orphan_blocks(doc) -> list[tuple[str, list]]:
             continue
         texts: list[TextItem] = []
         try:
-            _collect_from(doc.blocks.get(name), texts)
+            _collect_from(doc.blocks.get(name), texts, hidden=hidden)
         except Exception:
             continue
         if len(texts) < 5:
@@ -1019,7 +1098,11 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
 
     doc = ezdxf.readfile(str(dxf_path))
     model_texts: list[TextItem] = []
-    _collect_from(doc.modelspace(), model_texts)
+    hidden = hidden_layers(doc)
+    # Текст с отключённых слоёв: в вывод не идёт, но нужен сверке со вторым
+    # путём чтения — иначе он вернётся обратно как «потерянный».
+    hidden_texts: list[TextItem] = []
+    _collect_from(doc.modelspace(), model_texts, hidden=hidden, skipped=hidden_texts)
 
     sheets: list[Sheet] = []
     for name in doc.layouts.names():
@@ -1040,7 +1123,7 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
             paper_height=float(d.get("paper_height", 0) or 0),
         )
         # Текст, лежащий на самом листе (рамка, штамп бывают и там).
-        _collect_from(layout, sheet.texts)
+        _collect_from(layout, sheet.texts, hidden=hidden, skipped=hidden_texts)
         # Лист, у которого в файле нет вообще ничего, — это не «пустой лист
         # комплекта», а потеря: у ПЗУ так выглядят «ПЗМ» и «Озел. и МАФ» —
         # в DXF от них остались только границы блока, без рамки и без окна
@@ -1224,7 +1307,31 @@ def read_sheets(dxf_path: Path, source: Path | None = None) -> list[Sheet]:
     # восстановленные таблицы. То, что есть в исходном DWG и не нашлось ни на
     # одном листе, отдаём отдельным листом: истина в DWG, промолчать о
     # расхождении нельзя.
-    missing = _missing_texts(sheets, direct_texts) if direct_texts else []
+    # Текст с отключённых слоёв — отдельным листом. На печать он не идёт, и
+    # смешивать его с содержимым листа нельзя: у ПЗУ так «2 СПОЗУ» ложилось
+    # поверх наименования. Но и выбросить нельзя — на слое Defpoints у «Плана
+    # кровли» лежат примечания на полторы тысячи знаков.
+    if hidden_texts:
+        sheets.append(
+            Sheet(
+                number=None,
+                name="Текст с отключённых слоёв",
+                paper="",
+                paper_width=0.0,
+                paper_height=0.0,
+                texts=list(hidden_texts),
+                flat=True,
+                note=(
+                    f"подписей на отключённых слоях: {len(hidden_texts)}. В "
+                    "чертеже они скрыты и на печать не идут — приведены, чтобы "
+                    "ничего не потерялось"
+                ),
+            )
+        )
+
+    missing = (
+        _missing_texts(sheets, direct_texts, hidden_texts) if direct_texts else []
+    )
     if missing:
         sheets.append(
             Sheet(
@@ -1296,7 +1403,9 @@ def enrich_from_dwg(
     return every_text
 
 
-def _missing_texts(sheets: list[Sheet], every_text: list[str]) -> list[str]:
+def _missing_texts(
+    sheets: list[Sheet], every_text: list[str], hidden_texts: list | None = None
+) -> list[str]:
     """Подписи из DWG, которых нет ни на одном листе.
 
     Сравниваем по голому тексту, без разметки и регистра: одна и та же надпись
@@ -1305,6 +1414,12 @@ def _missing_texts(sheets: list[Sheet], every_text: list[str]) -> list[str]:
     у нас десять, и это не расхождение.
     """
     have: dict[str, int] = {}
+    # Подписи с отключённых слоёв считаем известными: они в файле есть, но на
+    # печать не идут, и возвращать их «потерей» нельзя.
+    for item in hidden_texts or []:
+        key = _fold(_plain_direct(getattr(item, "text", str(item))))
+        if key:
+            have[key] = have.get(key, 0) + 1
     for sheet in sheets:
         # Таблицы, посаженные на лист (`attach_tables`), в `texts` не входят,
         # но в вывод листа попадают — иначе вся таблица числилась бы потерей.

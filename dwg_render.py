@@ -110,11 +110,24 @@ def _on_sheet(entity, box) -> bool:
 
 
 def _entities(doc, box):
-    """Объекты листа, годные к отрисовке, не больше MAX_ENTITIES."""
+    """Объекты листа, годные к отрисовке, не больше MAX_ENTITIES.
+
+    Слои, отключённые или замороженные в самом чертеже, пропускаем: на печать
+    они не идут, а у нас рисовались поверх — в комплекте «Жуковский» таких
+    слоёв 45 из 450, включая варианты границ участка «ВАР1/ВАР2».
+    """
+    from dwg_sheets import hidden_layers
+
+    hidden = hidden_layers(doc)
     picked = []
     for entity in doc.modelspace():
         if entity.dxftype() in SKIP_TYPES or not _on_sheet(entity, box):
             continue
+        try:
+            if hidden and entity.dxf.layer in hidden:
+                continue
+        except Exception:
+            pass
         picked.append(entity)
         if len(picked) >= MAX_ENTITIES:
             break
