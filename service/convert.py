@@ -342,7 +342,14 @@ def build_page_markdown(
             parts += [f"## {text_title}", "", layer_text.strip(), ""]
 
     # Хвост: всё, что ПРО лист, а не сам лист.
-    tail: list[str] = [f"- файл: `{file_name}`", f"- тип листа: {KIND_TITLE.get(kind, kind)}"]
+    # Метку «**Файл:**» трогать нельзя: без неё фронтенд в storage.ts считает
+    # лист незаполненным и затирает результат прогона своей заглушкой. Она
+    # переехала вниз вместе с остальным служебным, но осталась дословной.
+    tail: list[str] = [
+        f"**Файл:** `{file_name}`",
+        "",
+        f"**Тип листа:** {KIND_TITLE.get(kind, kind)}",
+    ]
     passport = _passport_lines(pass_0)
     if passport:
         tail += ["", passport]
