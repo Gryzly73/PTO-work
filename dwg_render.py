@@ -34,8 +34,11 @@ from pathlib import Path
 from ezdxf import bbox
 from ezdxf.addons.drawing import config
 
-# Маскировки, подложки и размеры — см. шапку модуля.
-SKIP_TYPES = ("WIPEOUT", "IMAGE", "DIMENSION")
+# Маскировки и подложки — см. шапку модуля. Размеры (DIMENSION) здесь больше
+# не значатся: они несут то, что инженер и сверяет. Битые экземпляры, из-за
+# которых их когда-то выключили целиком, отсекаются по габаритам — так же, как
+# любой другой объект не с этого листа.
+SKIP_TYPES = ("WIPEOUT", "IMAGE")
 
 # Потолок на число объектов листа. Стройгенплан с 12 тысячами линий рисуется
 # около минуты, а разборчивее от этого не становится.
@@ -138,7 +141,10 @@ def _configuration() -> config.Configuration:
     return config.Configuration(
         color_policy=config.ColorPolicy.COLOR_SWAP_BW,
         background_policy=config.BackgroundPolicy.OFF,
-        hatch_policy=config.HatchPolicy.IGNORE,
+        # Штриховку рисуем контуром, без заливки: разрез перестаёт выглядеть
+        # пустым, а лист не заливается чёрным и не тяжелеет вдвое, как было бы
+        # с настоящим узором.
+        hatch_policy=config.HatchPolicy.SHOW_OUTLINE,
         lineweight_scaling=0.5,
     )
 
