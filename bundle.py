@@ -14,16 +14,22 @@ PDF, отпечатанный из тех же чертежей. Инженер�
   по порядку страниц в файле;
 * находит листы, пришедшие из двух источников сразу, и сводит их в один.
 
-**Истина — DWG.** Когда один лист есть и в чертеже, и в PDF, в отчёт идёт
-версия из DWG: там текст лежит данными и читается дословно, тогда как в PDF он
-приходит через отрисовку и восстанавливается — по глифам, а на сканах вообще
-моделью. Версия из PDF при этом не выбрасывается: расхождение попадает в
-отдельный раздел отчёта, потому что несовпадение наименований у одного и того
-же листа обычно значит, что альбом печатали с другой редакции чертежа, и это
-как раз то, что проверяющий обязан заметить.
+**Основа — DWG, но выбора между источниками нет.** Когда один лист есть и в
+чертеже, и в PDF, за основу берётся версия из DWG: там текст лежит данными и
+читается дословно, тогда как в PDF он приходит через отрисовку и
+восстанавливается — по глифам, а на сканах вообще моделью. Но версия из PDF
+не отбрасывается: из неё добираются строки, таблицы и описание листа, которых
+в чертеже нет (`fuse.py`). Чертёж приходит без внешних ссылок, и у листов,
+собранных из xref, в нём нет вообще ничего, кроме рамки со штампом, — тогда
+как в альбоме этот лист отпечатан целиком.
+
+Расхождения реквизитов при этом никуда не деваются: несовпадение наименований
+у одного и того же листа обычно значит, что альбом печатали с другой редакции
+чертежа, и это как раз то, что проверяющий обязан заметить.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +49,7 @@ class Variant:
     stamp: stamp_mod.Stamp
     job_id: str = ""      # прогон, в котором лист посчитан
     run_dir: str = ""     # где лежат готовые страницы прогона
+    source_path: str = "" # сам файл: по нему досчитывается то, чего нет в прогоне
 
     @property
     def is_vector(self) -> bool:
@@ -63,6 +70,37 @@ class Variant:
             return path.read_text(encoding="utf-8")
         except OSError:
             return ""
+
+    def objects(self) -> list[dict]:
+        """Карта «строка текста → объекты чертежа», если она посчитана.
+
+        Есть только у листов чертежа: у страницы PDF объектов нет, там адрес
+        места — сама страница. Кладётся рядом с листом при разборе
+        (`service.pipeline._save_objects`).
+        """
+        if not self.run_dir or not self.is_vector:
+            return []
+        path = Path(self.run_dir) / "pages" / f"page_{self.index:04d}.objects.json"
+        try:
+            return json.loads(path.read_text(encoding="utf-8")).get("lines", [])
+        except (OSError, ValueError):
+            pass
+        # Прогон сделан до появления карты — досчитываем и кладём рядом, чтобы
+        # второй раз не считать. Разбор листа стоит секунды, а без карты
+        # подсветка просто молча не работает, и понять это по интерфейсу нельзя.
+        if not self.source_path:
+            return []
+        try:
+            from dwg_sheets import sheet_objects
+
+            lines = sheet_objects(Path(self.source_path), self.index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"lines": lines}, ensure_ascii=False), encoding="utf-8"
+            )
+            return lines
+        except Exception:
+            return []
 
 
 @dataclass
@@ -95,6 +133,79 @@ class SheetEntry:
             if variant.stamp.title:
                 return variant.stamp.title
         return ""
+
+    @property
+    def sheet_id(self) -> str:
+        """Чем лист адресуется снаружи: шифр документа плюс его номер.
+
+        Косую черту шифра («28-ХСА-1/25-КР1») меняем на подчёркивание: id
+        живёт в пути URL, а косая там делит сегменты. Номер листа сам по себе
+        не годится — лист «19» есть и в чертежах, и в пояснительной записке.
+        """
+        main = self.main
+        code = main.stamp.section or main.stamp.code
+        if code and self.number:
+            return f"{_slug(code)}:{self.number}"
+        # Без шифра или без номера лист адресуется тем единственным, что у него
+        # есть, — файлом и страницей в нём. Так адрес остаётся однозначным,
+        # даже когда в комплекте два таких листа: обложка и титул шифра не
+        # несут, и по «без-шифра:1» они оба отзывались бы одинаково.
+        return f"{_slug(Path(main.source_name).stem)}#{main.index}"
+
+    def match(self) -> dict | None:
+        """Счётная сверка источников листа. None — сверять не с чем."""
+        import fuse as fuse_mod
+
+        vector = next((v for v in self.variants if v.is_vector), None)
+        raster = next((v for v in self.variants if not v.is_vector), None)
+        if vector is None or raster is None:
+            return None
+        first, second = vector.body(), raster.body()
+        if not (first.strip() and second.strip()):
+            return None
+        return fuse_mod.compare(first, second)
+
+    def verified_by(self) -> list[str]:
+        """Какие источники подтвердили лист: у каких есть готовое содержимое."""
+        return sorted({v.source_kind for v in self.variants if v.body().strip()})
+
+    def fused_body(self) -> str:
+        """Содержимое листа, сведённое из всех его источников.
+
+        Раньше здесь выбирался один вариант — из чертежа, — а версия из PDF
+        отбрасывалась целиком вместе со всем, чего в чертеже не было: у листов,
+        собранных из внешних ссылок, это всё содержимое. Теперь основа —
+        чертёж, а из PDF добираются недостающие строки, таблицы и описание
+        листа (см. `fuse.py`).
+        """
+        import fuse as fuse_mod
+
+        main = self.main
+        body = _strip_page_heading(main.body())
+        if not main.is_vector:
+            # Основа не векторная — сводить не с чем: два прочтения одного
+            # растра не дополняют друг друга, а повторяют.
+            return body
+        for other in self.others:
+            if other.is_vector:
+                continue
+            second = _strip_page_heading(other.body())
+            if second.strip():
+                body = fuse_mod.fuse(body, second, raster_name=other.source_name)
+        found = self.conflicts()
+        if found:
+            # Расхождение показываем прямо в листе, а не только сводкой по
+            # документу: читающий лист должен видеть, что источники описывают
+            # его по-разному, не уходя в другой раздел отчёта.
+            body = body.rstrip() + "\n\n" + "\n".join(
+                [f"##### {fuse_mod.SRC_DIFF} Расхождения между источниками", ""]
+                + [
+                    f"- {label}: в чертеже «{left}», в «{who}» — «{right}»"
+                    for label, left, right, who in found
+                ]
+                + [""]
+            )
+        return body
 
     def conflicts(self) -> list[tuple[str, str, str, str]]:
         """Расхождения между источниками: (поле, у главного, у другого, чей).
@@ -195,6 +306,12 @@ class Section:
         return names
 
 
+def _slug(text: str) -> str:
+    """Кусок id, годный для пути URL: без косых, пробелов и точек в конце."""
+    out = re.sub(r"[\/\s]+", "_", (text or "").strip())
+    return re.sub(r"[?#%]+", "", out).strip("_.") or "без-имени"
+
+
 def _norm_title(text: str) -> str:
     """Наименование к сравнимому виду: регистр, пробелы и кавычки не в счёт."""
     low = text.strip().lower().replace("ё", "е")
@@ -253,6 +370,7 @@ def _read_vector(
                 source_name=name,
                 source_kind="DWG",
                 index=index,
+                source_path=str(path),
                 stamp=stamp_mod.from_dwg_sheet(sheet),
                 job_id=job_id,
                 run_dir=run_dir,
@@ -281,12 +399,72 @@ def _read_pdf(
                     source_name=name,
                     source_kind="PDF",
                     index=index,
-                    stamp=stamp_mod.from_pdf_page(doc[index - 1], glyph_map=glyph_map),
+                    source_path=str(path),
+                    stamp=_pdf_stamp(doc[index - 1], glyph_map, run_dir, index),
                     job_id=job_id,
                     run_dir=run_dir,
                 )
             )
     return out
+
+
+# Обозначение документа в тексте разобранного листа: «28-ХСА-1/25-КР1»,
+# «28-ХСА-1/25-ПЗ.С». Пробелов внутри быть не может — иначе под шаблон
+# попадает обычное название листа (см. `stamp._looks_like_code`).
+_CODE_IN_TEXT = re.compile(r"\b\d{2,}-[А-ЯA-Z]{2,}-[\w./-]*\d[\w./-]*", re.UNICODE)
+
+# «- лист: 3» и «- лист: 3 из 12» из паспорта листа.
+_SHEET_IN_TEXT = re.compile(r"(?m)^-\s*лист:\s*(\d+)")
+
+
+def _pdf_stamp(page, glyph_map: dict, run_dir: str, index: int) -> stamp_mod.Stamp:
+    """Основная надпись страницы PDF, а если её негде прочитать — из разбора.
+
+    У печатного альбома текстового слоя нет вовсе: у ПЗ комплекта «Жуковский»
+    во всех восьми страницах ноль знаков текста. Читать надпись не из чего, и
+    лист остаётся без шифра — то есть не связывается со своим двойником из
+    чертежа, и сведение источников не происходит именно там, где оно нужнее
+    всего.
+
+    Поэтому у страниц без слоя шифр берётся из готового разбора листа: к тому
+    времени по картинке уже прошлась модель, и обозначение стоит в тексте.
+    Разбор для этого не запускается — берём только то, что уже посчитано.
+    """
+    found = stamp_mod.from_pdf_page(page, glyph_map=glyph_map)
+    if found.code or not run_dir:
+        return found
+    body = Variant("", "PDF", index, found, run_dir=run_dir).body()
+    code, number = code_from_body(body)
+    if not code:
+        return found
+    found.code = code
+    if number:
+        found.sheet = number
+    found.note = (
+        "шифр взят из разобранного листа: текстового слоя у страницы нет"
+    )
+    return found
+
+
+def code_from_body(body: str) -> tuple[str, str]:
+    """Обозначение документа и номер листа из готового разбора листа.
+
+    Кандидат на шифр проверяем тем же правилом, каким он опознаётся в самой
+    надписи (`stamp._looks_like_code`): два похожих шаблона разъедутся при
+    первой же правке одного из них, и в отчёт поедет «ГОСТ 14098-2014».
+    """
+    code = next(
+        (
+            match.group(0)
+            for match in _CODE_IN_TEXT.finditer(body or "")
+            if stamp_mod._looks_like_code(match.group(0))
+        ),
+        "",
+    )
+    if not code:
+        return "", ""
+    number = _SHEET_IN_TEXT.search(body or "")
+    return code, number.group(1) if number else ""
 
 
 # ── сведение ────────────────────────────────────────────────────────────────
@@ -351,6 +529,17 @@ def _fill_section_head(section: Section, variant: Variant) -> None:
 # ── отчёт ───────────────────────────────────────────────────────────────────
 
 
+def _sources_line(entry: SheetEntry) -> str:
+    """Откуда взят лист. Источников бывает несколько — называем все."""
+    listed = [
+        f"{v.source_kind} «{v.source_name}», лист {v.index}"
+        for v in [entry.main] + entry.others
+    ]
+    if len(listed) == 1:
+        return "Источник: " + listed[0]
+    return "Сведён из источников: " + "; ".join(listed)
+
+
 def _strip_page_heading(body: str) -> str:
     """Убирает «## Страница N» из готового листа: нумерация здесь своя."""
     lines = body.splitlines()
@@ -362,7 +551,7 @@ def _strip_page_heading(body: str) -> str:
 def contents_markdown(document: Document) -> str:
     """Состав документа: лист, наименование, откуда взят."""
     rows = [
-        "| Лист | Наименование | Истина | Также есть в |",
+        "| Лист | Наименование | Основа | Добрано из |",
         "|---:|---|---|---|",
     ]
     for entry in document.sheets:
@@ -425,7 +614,8 @@ def document_markdown(document: Document, *, with_bodies: bool = True) -> list[s
         parts += [
             "### Листы из нескольких источников",
             "",
-            "_Один лист прислан дважды. В отчёт идёт версия из чертежа._",
+            "_Один лист прислан дважды. В отчёт идёт не одна из версий, а обе "
+            "сразу: основа из чертежа, недостающее добрано из PDF._",
             "",
             duplicates,
             "",
@@ -452,11 +642,11 @@ def document_markdown(document: Document, *, with_bodies: bool = True) -> list[s
         parts += [
             f"#### Лист {entry.number}. {entry.title or 'без наименования'}",
             "",
-            f"_Источник: {main.source_kind}, {main.source_name}, лист {main.index}._",
+            f"_{_sources_line(entry)}._",
             "",
         ]
-        body = main.body()
-        parts += [_strip_page_heading(body) if body else unprocessed, ""]
+        body = entry.fused_body()
+        parts += [body if body else unprocessed, ""]
     for variant in document.unnumbered:
         parts += [
             f"#### Лист без номера ({variant.source_name}, лист {variant.index})",
@@ -484,8 +674,9 @@ def section_markdown(section: Section, *, with_bodies: bool = True) -> str:
         parts += [f"Проектная организация: {section.org}", ""]
     parts += [
         "Отчёт сведён из нескольких файлов. Где лист есть и в чертеже, и в PDF, "
-        "содержимое берётся из DWG: там текст лежит данными, а в PDF "
-        "восстанавливается по отрисовке.",
+        "источники сложены: основа из DWG — там текст лежит данными, — а из "
+        "PDF добраны строки, таблицы и описание листа, которых в чертеже нет. "
+        "У каждого такого листа есть счётная сверка источников.",
         "",
     ]
     for document in section.documents:
@@ -543,6 +734,7 @@ def sections_dict(sections: list[Section]) -> list[dict]:
                     "sources": document.sources,
                     "sheets": [
                         {
+                            "sheetId": entry.sheet_id,
                             "number": entry.number,
                             "title": entry.title,
                             "main": _variant_dict(entry.main),
@@ -570,3 +762,80 @@ def sections_dict(sections: list[Section]) -> list[dict]:
         for section in sections
     ]
 
+
+
+# ── сведённый лист для интерфейса ───────────────────────────────────────────
+
+
+def sheet_dict(entry: SheetEntry, document: Document, *, with_body: bool = False) -> dict:
+    """Лист комплекта полями: откуда взят, чем подтверждён, из чего состоит.
+
+    Содержимое отдаём по запросу: в списке листов раздела оно не нужно, а у
+    стройгенплана один лист весит сотни килобайт.
+    """
+    import fuse as fuse_mod
+
+    main = entry.main
+    out = {
+        "sheetId": entry.sheet_id,
+        "number": entry.number,
+        "title": entry.title,
+        "code": document.code,
+        "kind": document.kind,
+        "primarySource": main.source_kind,
+        "variants": [_variant_dict(v) for v in [main] + entry.others],
+        "verifiedBy": entry.verified_by(),
+        "match": entry.match(),
+        "conflicts": [
+            {"field": label, "primary": left, "other": right, "source": who}
+            for label, left, right, who in entry.conflicts()
+        ],
+        "ready": bool(main.body().strip()),
+    }
+    if with_body:
+        body = entry.fused_body()
+        out["markdown"] = body
+        out["blocks"] = fuse_mod.blocks(body, base=main.source_kind)
+        # Связь строки текста с объектом на чертеже. Номер тот же, что в
+        # колонке `id` геометрии листа, — по нему интерфейс подсвечивает
+        # подпись, когда инженер ткнул в строку.
+        out["objects"] = main.objects()
+    return out
+
+
+def sheets_dict(sections: list[Section], *, with_bodies: bool = False) -> list[dict]:
+    """Все листы комплекта подряд, в порядке разделов и документов.
+
+    Листы, у которых не прочитался номер, идут наравне с остальными, в конце
+    своего документа. Молча терять лист нельзя — по нему пишут замечания, а
+    без номера чаще всего оказываются обложка и титул, которые инженер как раз
+    и открывает первыми.
+    """
+    out: list[dict] = []
+    for section in sections:
+        for document in section.documents:
+            for entry in document.sheets:
+                out.append(sheet_dict(entry, document, with_body=with_bodies))
+            for variant in document.unnumbered:
+                out.append(
+                    sheet_dict(
+                        SheetEntry(number="", variants=[variant]),
+                        document,
+                        with_body=with_bodies,
+                    )
+                )
+    return out
+
+
+def find_sheet(sections: list[Section], sheet_id: str) -> tuple[SheetEntry, Document] | None:
+    """Лист по его id. None — такого листа в комплекте нет."""
+    for section in sections:
+        for document in section.documents:
+            for entry in document.sheets:
+                if entry.sheet_id == sheet_id:
+                    return entry, document
+            for variant in document.unnumbered:
+                entry = SheetEntry(number="", variants=[variant])
+                if entry.sheet_id == sheet_id:
+                    return entry, document
+    return None

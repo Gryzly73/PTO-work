@@ -459,7 +459,11 @@ def get_page_geometry(job_id: str, page_number: int):
     # держим рядом с прогоном, вместе с ним и удалится.
     cache = Path(job.runDir) / "geometry"
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"page_{page_number:04d}.csv"
+    # В имени файла версия формата — как у превью. Без неё прогон, посчитанный
+    # прежней версией, отдавал бы старый CSV до конца жизни: колонка `id`,
+    # по которой интерфейс связывает текст с чертежом, в нём так и не
+    # появилась бы.
+    target = cache / f"page_{page_number:04d}.v2.csv"
     if not target.exists():
         from dwg_geometry import sheet_csv
 
@@ -511,7 +515,7 @@ def get_page_preview(job_id: str, page_number: int, format: str = "svg"):
     # версии интерфейс продолжал бы получать их до конца жизни прогона.
     cache = Path(job.runDir) / "preview"
     cache.mkdir(parents=True, exist_ok=True)
-    target = cache / f"page_{page_number:04d}.v3.{format}"
+    target = cache / f"page_{page_number:04d}.v4.{format}"
     if not target.exists():
         from dwg_render import sheet_preview
 
@@ -604,6 +608,44 @@ def get_project_sections(project_id: str):
         "sections": bundle.sections_dict(sections),
         "skipped": skipped,
     }
+
+
+@app.get("/projects/{project_id}/pages")
+def get_project_pages(project_id: str, bodies: bool = False):
+    """Листы комплекта, сведённые из всех источников.
+
+    Середина между двумя крайностями, которых до сих пор не хватало: отчёт по
+    комплекту отдавался только целиком, а страницами — только листы отдельных
+    файлов, где чертёж и альбом лежат порознь. Здесь лист один, сведённый, и
+    у него сказано, откуда что взято.
+
+    `bodies=true` добавляет содержимое и разметку блоков. По умолчанию нет:
+    список листов нужен для навигации, а лист стройгенплана весит сотни
+    килобайт.
+    """
+    import bundle
+
+    sections, skipped = _project_sections(project_id)
+    return {
+        "kitId": project_id,
+        "sheets": bundle.sheets_dict(sections, with_bodies=bodies),
+        "skipped": skipped,
+    }
+
+
+@app.get("/projects/{project_id}/pages/{sheet_id}")
+def get_project_page(project_id: str, sheet_id: str):
+    """Один сведённый лист комплекта: markdown плюс разметка блоков."""
+    import bundle
+
+    sections, _ = _project_sections(project_id)
+    found = bundle.find_sheet(sections, sheet_id)
+    if found is None:
+        raise HTTPException(
+            status_code=404, detail=f"В комплекте нет листа {sheet_id}"
+        )
+    entry, document = found
+    return bundle.sheet_dict(entry, document, with_body=True)
 
 
 @app.get("/projects/{project_id}/report", response_class=PlainTextResponse)

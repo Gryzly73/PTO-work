@@ -24,6 +24,7 @@ import io
 from ezdxf.addons.drawing import Frontend, RenderContext, config, recorder
 
 from dwg_render import SKIP_TYPES, _configuration, _entities
+from dwg_sheets import text_span, text_uid
 
 # Точность координат в файле. Чертёж в миллиметрах, десятой доли достаточно:
 # на листе это микрон, а объём файла падает вдвое против полной точности.
@@ -51,6 +52,9 @@ _HEADER = [
     "anchor",
     "valign",
     "width",
+    # Номер объекта. Стоит ПОСЛЕДНЕЙ колонкой намеренно: парсер, читающий
+    # колонки по номеру, от новой колонки в конце не ломается.
+    "id",
 ]
 
 
@@ -68,12 +72,6 @@ def _one_line(text: str) -> str:
     )
 
 
-# Во сколько раз средняя ширина знака меньше его высоты. Чертёжные шрифты
-# (ISOCPEUR и родня) узкие; коэффициент подобран по реальным подписям
-# комплекта: при нём строка рвётся там же, где в самом чертеже.
-_CHAR_RATIO = 0.55
-
-
 def _wrapped(item) -> str:
     """Подпись строками, как она стоит на листе.
 
@@ -81,25 +79,34 @@ def _wrapped(item) -> str:
     длинную строку сам. Мы этой ширины не применяли, и название объекта из
     штампа — 178 знаков — рисовалось одной лентой поперёк листа.
 
+    Где рвать строку, считаем той же меркой, которой картинка отводит подписи
+    место (`dwg_render.text_span`). Пока перенос считался по числу знаков, а
+    рисовалось по ширине, строка на картинке не совпадала с расчётной и
+    вылезала за блок.
+
     Переносы отдаём литералом «\n»: строка CSV остаётся одной строкой.
     """
     lines = item.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     width = getattr(item, "width", 0.0) or 0.0
     size = item.height or 2.5
-    limit = int(width / max(size * _CHAR_RATIO, 1e-6)) if width > 0 else 0
+    factor = getattr(item, "factor", 1.0) or 1.0
+    # Блок уже своей строки не бывает: такая ширина — мусор конвертера, по
+    # ней подпись рассыпалась бы по букве на строку.
+    limit = width if width > size else 0.0
     out: list[str] = []
     for line in lines:
         line = " ".join(line.split())
-        if limit < 4 or len(line) <= limit:
+        if not limit or text_span(line, size, factor) <= limit:
             out.append(line)
             continue
         current = ""
         for word in line.split(" "):
-            if current and len(current) + 1 + len(word) > limit:
+            joined = f"{current} {word}".strip()
+            if current and text_span(joined, size, factor) > limit:
                 out.append(current)
                 current = word
             else:
-                current = f"{current} {word}".strip()
+                current = joined
         if current:
             out.append(current)
     # Перенос отдаём двумя символами, а не настоящим переводом строки: иначе
@@ -277,6 +284,7 @@ def _attached_primitives(doc, sheet, placed: list[dict]) -> list[dict]:
                     "points": [(x, y)],
                     "text": _wrapped(item),
                     "width": round((item.width or 0) * scale, 1) or "",
+                    "wf": round(getattr(item, "factor", 1.0) or 1.0, 2),
                     "size": round(max(item.height * scale, 0.8), 2),
                     "rot": round(item.rotation, 1) or "",
                     "anchor": item.anchor,
@@ -358,7 +366,15 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
                 # Переносы внутри подписи сохраняем литералом: строка CSV
                 # остаётся одной строкой, а где разрывать — знает интерфейс.
                 "text": _wrapped(item),
+                # Номер объекта берём у самой подписи, а не считаем потом по
+                # примитиву: в примитиве текст уже разбит на строки литералом
+                # переноса, и номер разошёлся бы с тем, что даёт порядок
+                # чтения, — а связывает их именно он.
+                "id": text_uid(item),
                 "width": round(item.width, 1) or "",
+                # Сжатие подписи по ширине: в CSV не идёт — там ширина знака
+                # ни при чём, — но картинке без него не уложить строку в графу.
+                "wf": round(getattr(item, "factor", 1.0) or 1.0, 2),
                 "size": round(item.height, 2),
                 "rot": round(item.rotation, 1) or "",
                 "anchor": item.anchor,
@@ -394,7 +410,39 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
         "lost": bool(sheet.lost),
         "blank": bool(sheet.blank),
     }
+    _number(primitives)
     return primitives, meta
+
+
+def _number(primitives: list[dict]) -> None:
+    """Проставляет каждому объекту его номер — после всех преобразований.
+
+    Именно после: содержимое окна вида переносится в координаты бумаги уже
+    собранным, и номер, посчитанный раньше, описывал бы объект на другом
+    месте, чем показано в CSV.
+
+    Одинаковые объекты в одной точке бывают — блок, вставленный дважды. У них
+    и номер один; чтобы строки CSV всё же различались, повторам приписывается
+    счётчик.
+    """
+    from dwg_sheets import uid
+
+    seen: dict[str, int] = {}
+    for item in primitives:
+        points = item.get("points") or []
+        if item.get("type") == "text":
+            x, y = points[0] if points else (0.0, 0.0)
+            key = uid("t", x, y, " ".join(str(item.get("text") or "").split()))
+        else:
+            first = points[0] if points else (0.0, 0.0)
+            last = points[-1] if points else (0.0, 0.0)
+            key = uid(
+                "g", first[0], first[1], last[0], last[1],
+                len(points), item.get("layer") or "",
+            )
+        key = item.get("id") or key
+        seen[key] = seen.get(key, 0) + 1
+        item["id"] = key if seen[key] == 1 else f"{key}-{seen[key]}"
 
 
 def to_csv(primitives: list[dict], meta: dict, units: str = "mm") -> str:
@@ -414,6 +462,8 @@ def to_csv(primitives: list[dict], meta: dict, units: str = "mm") -> str:
       anchor  привязка по горизонтали: left | center | right
       valign  привязка по вертикали: top | middle | bottom | baseline
       width   ширина текстового блока: по ней подпись переносится по строкам
+      id      номер объекта, по нему интерфейс связывает строку текста листа
+              с подписью на чертеже (см. `dwg_sheets.uid`)
 
     Переносы внутри подписи записаны литералом «\n» (два символа), чтобы
     строка CSV осталась одной строкой.
@@ -447,6 +497,7 @@ def to_csv(primitives: list[dict], meta: dict, units: str = "mm") -> str:
                 item.get("anchor", ""),
                 item.get("valign", ""),
                 item.get("width", ""),
+                item.get("id", ""),
             ]
         )
     return buffer.getvalue()

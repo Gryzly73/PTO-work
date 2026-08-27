@@ -77,6 +77,10 @@ class TextItem:
     # центру текст рисуется от неё вправо и наезжает на соседний.
     anchor: str = "left"
     valign: str = "baseline"
+    # Во сколько раз чертёжник сжал подпись по ширине. В комплекте «Жуковский»
+    # так сжата треть подписей — 0,75 и 0,8, — и без этого множителя они
+    # рисуются шире своей графы и наезжают на соседнюю.
+    factor: float = 1.0
 
 
 @dataclass
@@ -235,10 +239,14 @@ def find_converter() -> Path | None:
 # Сколько раз повторить конвертацию, если её результат не читается. Выход
 # dwg2dxf НЕ детерминирован: восемь прогонов на одном и том же DWG дают восемь
 # разных файлов (размер гуляет на килобайты — в секцию материалов попадает
-# мусор из неинициализированной памяти), и примерно каждый восьмой оказывается
-# структурно битым. Ретрай стоит секунды и убирает эту лотерею: три неудачи
-# подряд — это уже не случайность, а свойство файла.
-_CONVERT_ATTEMPTS = 3
+# мусор из неинициализированной памяти), и часть оказывается структурно битой.
+#
+# Трёх попыток мало. У «9.Жуковский1_Блок 9 (КР3)_Фундаменты» замер по десяти
+# прогонам дал два отказа из десяти: длинный MTEXT с кодами `\U+` вылезает
+# туда, где ожидается код группы. При одной пятой отказов три неудачи подряд
+# выпадают раз на 125 прогонов — и чертёж целиком не читается. Шести попыток
+# хватает с запасом, а платим за них только в тот редкий раз, когда не повезло.
+_CONVERT_ATTEMPTS = 6
 
 
 def to_dxf(path: Path, out_dir: Path | None = None) -> Path:
@@ -433,6 +441,36 @@ def _unescape_unicode(text: str) -> str:
     return _UNI_ESCAPE.sub(repl, text)
 
 
+# Коды форматирования MTEXT, которые `plain_mtext` из ezdxf не снимает: цвет
+# `\C1;`, высота `\H0.8x;`, шрифт `\fISOCPEUR|b0;`. Вместе со скобками своей
+# группы они едут в markdown как содержание листа: размерное число 120 стоит
+# в тексте как «{\C1;120}», и таких мест на комплект — девяносто пять.
+_MTEXT_CODE = re.compile(
+    r"\\(?:C\d+|H[\d.]+x?|W[\d.]+|T[\d.-]+|Q[\d.-]+|A\d|[fF][^;\\]*|p[^;\\]*);"
+)
+
+
+def _drop_mtext_codes(text: str) -> str:
+    """Снимает оставшуюся разметку MTEXT вместе со скобками её группы."""
+    if "\\" not in text:
+        return text
+    cleaned = _MTEXT_CODE.sub("", text)
+    if cleaned == text:
+        return text
+    # Скобки остались без своего кода — снимаем и их. Трогаем только простые
+    # пары без вложенности: фигурная скобка в самом тексте чертежа не помеха.
+    return re.sub(r"\{([^{}]*)\}", r"\1", cleaned)
+
+
+# Невычисленное поле внутри строки: «∅8 А240 l=####». Целиком такую подпись
+# отбрасывает `_FIELD_STUB`, а вот внутри строки решётки надо заменить —
+# иначе они и в markdown решётки, то есть заголовок посреди текста листа.
+_FIELD_MARK = re.compile(r"#{2,}")
+
+# Заглушка невычисленного поля AutoCAD: две решётки и больше, ничего кроме.
+_FIELD_STUB = re.compile(r"#{2,}")
+
+
 def clean_text(raw: str) -> str:
     """Убирает то, что не переживёт запись в файл.
 
@@ -451,15 +489,15 @@ def clean_text(raw: str) -> str:
         if code < 0x20 and ch not in (chr(10), chr(9)):
             continue
         out.append(ch)
-    text = _unescape_unicode("".join(out))
+    text = _drop_mtext_codes(_unescape_unicode("".join(out)))
     for code, repl in _ACAD_CODES:
         if code in text:
             text = text.replace(code, repl)
+    # Подпись, состоящую из одних решёток, отбрасывает `_plain`; здесь речь
+    # только о решётках внутри строки.
+    if not _FIELD_STUB.fullmatch(text.strip()):
+        text = _FIELD_MARK.sub("—", text)
     return text
-
-
-# Заглушка невычисленного поля AutoCAD: две решётки и больше, ничего кроме.
-_FIELD_STUB = re.compile(r"#{2,}")
 
 
 def _plain(entity) -> str:
@@ -567,23 +605,146 @@ def _placement(entity) -> tuple[float, float, str, str]:
 
 
 def _rotation(entity) -> float:
-    """Угол поворота подписи в градусах. 0, если его нет."""
-    for attr in ("rotation", "text_direction", "char_height"):
-        if attr != "rotation":
-            continue
+    """Угол поворота подписи в градусах. 0, если его нет.
+
+    У MTEXT угла числом обычно нет вовсе: он записан вектором направления
+    строки (`text_direction`). В комплекте «Жуковский» из 763 блоков MTEXT
+    число не стоит ни у одного, и пока мы читали только его, все вертикальные
+    надписи штампа — «Взам. инв. №», «Подпись и дата», «Инв. № подл.» —
+    числились горизонтальными.
+    """
+    if entity.dxftype() == "MTEXT":
+        # Спрашивать `text_direction` у TEXT нельзя: такого атрибута у него
+        # нет, и ezdxf на каждую подпись бросал бы исключение.
         try:
-            return float(entity.dxf.get("rotation", 0.0) or 0.0) % 360
+            direction = entity.dxf.get("text_direction", None)
+            if direction is not None and (direction.x or direction.y):
+                return math.degrees(math.atan2(direction.y, direction.x)) % 360
         except Exception:
-            return 0.0
-    return 0.0
+            pass
+    try:
+        return float(entity.dxf.get("rotation", 0.0) or 0.0) % 360
+    except Exception:
+        return 0.0
+
+
+# ── сколько места занимает подпись на листе ─────────────────────────────────
+#
+# Ширина подписи нужна разбору не меньше, чем картинке: по ней AutoCAD рвёт
+# длинный блок на строки, и по ней же видно, стоят две подписи рядом или в
+# разных концах листа. Самого шрифта чертежа у нас нет — в комплекте это
+# isocpeur.ttf, которого нет ни на сервере, ни в образе, — поэтому ширина
+# знака взята долями высоты по ГОСТ 2.304 и выверена по подписям штампа.
+# Чертёжные шрифты узкие: знак в среднем вдвое уже своей высоты.
+
+_CHAR_DEFAULT = 0.42
+_CHAR_WIDTH = {
+    char: ratio
+    for chars, ratio in (
+        (" \t", 0.35),
+        (".,:;!|'\"`()[]{}/\\-", 0.28),
+        ("0123456789", 0.45),
+        ("мшщжюфы", 0.60),
+        ("mw", 0.62),
+        ("АБВГДЕЁЗИЙКЛНОПРСТУХЦЧЬЪЭЯ", 0.55),
+        ("ABCDEFGHIJKLNOPQRSTUVXYZ", 0.55),
+        ("МШЩЖЮФЫ", 0.72),
+        ("MW", 0.72),
+    )
+    for char in chars
+}
+
+
+# ── опознание объекта листа ─────────────────────────────────────────────────
+#
+# Интерфейсу нужно связать строку в тексте листа с подписью на чертеже: ткнул
+# в строку — подсветилась надпись. Для этого у объекта должен быть номер, и он
+# обязан пережить пересчёт документа.
+#
+# Порядковый номер строки для этого не годится. Конвертер `dwg2dxf`
+# невоспроизводим: два прогона одного файла из десяти дают вовсе нечитаемый
+# DXF, а в читаемых часть длинных MTEXT каждый раз приходит с разным хвостом.
+# Номер строки после пересчёта укажет на другой объект — то есть замечание
+# инженера переедет на чужую подпись.
+#
+# Поэтому номер считается от самого содержимого: координаты и текст. Пока
+# подпись стоит на месте и читается так же, номер у неё тот же.
+
+_UID_ROUND = 1
+
+
+def uid(kind: str, *parts) -> str:
+    """Номер объекта листа: буква вида и восемь знаков от хеша содержимого.
+
+    `kind` — «t» для подписи, «g» для линии: по первой букве видно, что за
+    объект, не заглядывая в CSV.
+    """
+    from hashlib import sha1
+
+    body = "|".join(
+        f"{part:.{_UID_ROUND}f}" if isinstance(part, (int, float)) else str(part)
+        for part in parts
+    )
+    return kind + sha1(body.encode("utf-8")).hexdigest()[:8]
+
+
+def text_uid(item: "TextItem") -> str:
+    """Номер подписи: место плюс её текст."""
+    return uid("t", item.x, item.y, " ".join((item.text or "").split()))
+
+
+def text_span(text: str, size: float, factor: float = 1.0) -> float:
+    """Ширина подписи в единицах чертежа: столько места ей отведено на листе.
+
+    У многострочной подписи это ширина самой длинной строки — столько она и
+    занимает.
+    """
+    factor = max(factor or 1.0, 0.05)
+    return size * factor * max(
+        (sum(_CHAR_WIDTH.get(char, _CHAR_DEFAULT) for char in line)
+         for line in (text or "").splitlines() or [""]),
+        default=0.0,
+    )
 
 
 def _text_width(entity) -> float:
-    """Ширина текстового блока MTEXT в единицах чертежа. 0 — не задана."""
+    """Ширина текстового блока MTEXT в единицах чертежа. 0 — не задана.
+
+    Только у MTEXT: в группе 41 у него ширина блока, а у TEXT и ATTRIB — во
+    сколько раз сжат знак (см. `_width_factor`). Пока мы читали её одинаково,
+    у подписей штампа «ширина блока» выходила равной 0,75, и перенос строк по
+    ней был бессмыслицей.
+    """
+    if entity.dxftype() != "MTEXT":
+        return 0.0
     try:
-        return float(entity.dxf.get("width", 0.0) or 0.0)
+        width = float(entity.dxf.get("width", 0.0) or 0.0)
     except Exception:
         return 0.0
+    # Блок уже одной буквы — не ширина, а мусор конвертера: по такой не
+    # переносится ничего. На комплект таких 134, и в CSV они уходили числом,
+    # которому интерфейс верит.
+    return width if width > _text_height(entity) else 0.0
+
+
+# Сжатие знака внутри MTEXT: `{\W0.8;ООО "КУРСКРЕГИОНПРОЕКТ"}`. Отдельного
+# поля у него нет — коэффициент стоит прямо в разметке, а её мы вычищаем.
+_MTEXT_FACTOR = re.compile(r"\\W([0-9]*\.?[0-9]+)")
+
+
+def _width_factor(entity) -> float:
+    """Во сколько раз подпись сжата по ширине. 1.0 — не сжата."""
+    try:
+        if entity.dxftype() == "MTEXT":
+            found = _MTEXT_FACTOR.search(entity.text or "")
+            value = float(found.group(1)) if found else 1.0
+        else:
+            value = float(entity.dxf.get("width", 1.0) or 1.0)
+    except Exception:
+        return 1.0
+    # Осмысленное сжатие — от трети до тройной ширины. За этими границами
+    # значение битое: у листа фундаментов после конвертации попадаются нули.
+    return value if 0.3 <= value <= 3.0 else 1.0
 
 
 def _text_height(entity) -> float:
@@ -678,7 +839,8 @@ def _collect_from(
                         x, y, anchor, valign = _placement(e)
                         skipped.append(
                             TextItem(x, y, _text_height(e), value, "hidden",
-                                     _rotation(e), _text_width(e), anchor, valign)
+                                     _rotation(e), _text_width(e), anchor, valign,
+                                     _width_factor(e))
                         )
                 except Exception:
                     pass
@@ -699,6 +861,7 @@ def _collect_from(
                             _text_width(e),
                             anchor,
                             valign,
+                            _width_factor(e),
                         )
                     )
             elif kind == "ATTRIB":
@@ -716,6 +879,7 @@ def _collect_from(
                             _text_width(e),
                             anchor,
                             valign,
+                            _width_factor(e),
                         )
                     )
             elif kind == "DIMENSION":
@@ -753,7 +917,8 @@ def _collect_from(
                                     skipped.append(
                                         TextItem(x, y, _text_height(attrib), value,
                                                  "hidden", _rotation(attrib),
-                                                 _text_width(attrib), anchor, valign)
+                                                 _text_width(attrib), anchor, valign,
+                                                 _width_factor(attrib))
                                     )
                             except Exception:
                                 pass
@@ -772,6 +937,7 @@ def _collect_from(
                                 _text_width(attrib),
                                 anchor,
                                 valign,
+                                _width_factor(attrib),
                             )
                         )
                 _collect_from(e.virtual_entities(), out, depth + 1, hidden, skipped)
@@ -1624,6 +1790,7 @@ def _recover_lost(
                         item["kind"].lower(),
                         math.degrees(item["rotation"]),
                         item["width"],
+                        factor=item.get("factor", 1.0),
                     )
                 )
         windows = by_layout.get(key)
@@ -1718,12 +1885,16 @@ def _view_from_direct(window: dict) -> "SheetView | None":
     )
 
 
-def reading_order(texts: list[TextItem]) -> list[str]:
-    """Текст листа строками, сверху вниз и слева направо.
+def _ordered(texts: list[TextItem]) -> list[tuple[str, list[TextItem]]]:
+    """Строки листа вместе с подписями, из которых каждая собрана.
 
     Чертёж — не поток слов: подписи разбросаны по полю, и без склейки в строки
     вывод превращается в кашу из обрывков. Строку собираем по близости Y с
     допуском от высоты самого текста: у штампа она 2.5 мм, у заголовка 10.
+
+    Подписи возвращаются вместе со строкой, а не отдельным проходом: собрать
+    их вторым разом значит повторить всю раскладку — и разойтись с ней при
+    первой же правке порога.
     """
     if not texts:
         return []
@@ -1735,35 +1906,111 @@ def reading_order(texts: list[TextItem]) -> list[str]:
             lines[-1].append(item)
         else:
             lines.append([item])
-    joined_lines: list[str] = []
+    joined_lines: list[tuple[str, list[TextItem]]] = []
     for line in lines:
         line.sort(key=lambda t: t.x)
-        joined = " ".join(t.text.replace(chr(10), " ").strip() for t in line)
-        joined = re.sub(r"\s{2,}", " ", joined).strip()
-        if joined:
-            joined_lines.append(joined)
+        for group in _row_groups(line):
+            joined = " ".join(t.text.replace(chr(10), " ").strip() for t in group)
+            joined = re.sub(r"\s{2,}", " ", joined).strip()
+            if joined:
+                joined_lines.append((joined, list(group)))
 
     # На плане одна и та же метка стоит у каждого объекта: на стройгенплане
     # ПОС отдельные подписи повторяются сотнями. Для чтения это шум, поэтому
     # частые повторы схлопываем — тем же приёмом, каким normalize_pdf_text()
     # разбирается со спамом меток в текстовом слое PDF.
-    counts = Counter(joined_lines)
-    shown: set[str] = set()
-    out: list[str] = []
-    for line in joined_lines:
-        repeats = counts[line]
+    counts = Counter(text for text, _ in joined_lines)
+    shown: dict[str, int] = {}
+    out: list[tuple[str, list[TextItem]]] = []
+    for text, group in joined_lines:
+        repeats = counts[text]
         if repeats < REPEAT_LIMIT:
-            out.append(line)
+            out.append((text, group))
             continue
-        if line in shown:
+        if text in shown:
+            # Схлопнутая метка показана один раз, но подсветить интерфейс
+            # должен все её вхождения: подписи копим в первой строке.
+            out[shown[text]][1].extend(group)
             continue
-        shown.add(line)
-        out.append(f"{line} (×{repeats} на листе — схлопнуто)")
+        shown[text] = len(out)
+        out.append((f"{text} (×{repeats} на листе — схлопнуто)", list(group)))
     return out
+
+
+def reading_order(texts: list[TextItem]) -> list[str]:
+    """Текст листа строками, сверху вниз и слева направо."""
+    return [text for text, _ in _ordered(texts)]
+
+
+def sheet_objects(path: Path, page_number: int) -> list[dict]:
+    """Карта листа: строка текста и номера объектов, из которых она собрана.
+
+    Одна на всех, кто её просит: конвейер кладёт её рядом с листом при
+    разборе, а отчёт по комплекту досчитывает для прогонов, сделанных до её
+    появления. Считать двумя способами нельзя — разойдутся, и подсветка
+    начнёт указывать не туда.
+    """
+    _, sheets = sheets_for(path)
+    if not 1 <= page_number <= len(sheets):
+        return []
+    return [
+        row for row in reading_order_marked(sheets[page_number - 1].texts) if row["ids"]
+    ]
+
+
+def reading_order_marked(texts: list[TextItem]) -> list[dict]:
+    """То же, но с номерами объектов, из которых собрана каждая строка.
+
+    По ним интерфейс связывает строку текста листа с подписью на чертеже:
+    ткнул в строку — подсветились её объекты в геометрии. Номер тот же, что в
+    колонке `id` CSV геометрии (`dwg_sheets.uid`).
+    """
+    return [
+        {"text": text, "ids": [text_uid(item) for item in group]}
+        for text, group in _ordered(texts)
+    ]
 
 
 # Сколько одинаковых строк на листе считать спамом меток, а не текстом.
 REPEAT_LIMIT = 4
+
+# Насколько далеко должны отстоять соседи по строке, чтобы считать их разными
+# надписями, а не одной строкой. В высотах знака.
+#
+# Лист чертежа — не страница текста: на одной высоте оказываются заголовок в
+# левом углу и номер листа в правом, размерное число одного разреза и другого.
+# Склеенные пробелом, они дают строки вроде «Ситуационный план М 1:40000 22» и
+# «750 -0.800» — факты, которых на листе нет, и модель читает их как один
+# текст. На листе фундаментов КР1 таких склеек 63% всех пар соседей.
+#
+# Порог взят по замеру: внутри одной графы штампа соседи стоят не дальше 10
+# высот («Разраб. · Терещенко · 03.26» — 5,1 и 9,7), а ложные склейки
+# начинаются с 16 и уходят в тысячи.
+ROW_GAP_RATIO = 12.0
+
+
+def _edges(item: TextItem) -> tuple[float, float]:
+    """Левый и правый край подписи в единицах чертежа."""
+    span = text_span(item.text, item.height, getattr(item, "factor", 1.0))
+    if item.anchor == "center":
+        return item.x - span / 2, item.x + span / 2
+    if item.anchor == "right":
+        return item.x - span, item.x
+    return item.x, item.x + span
+
+
+def _row_groups(line: list[TextItem]) -> list[list[TextItem]]:
+    """Подписи одной высоты кусками: разрыв шире порога — это разные надписи."""
+    groups: list[list[TextItem]] = [[line[0]]]
+    right = _edges(line[0])[1]
+    for item in line[1:]:
+        left, item_right = _edges(item)
+        if left - right > max(item.height, groups[-1][-1].height, 1.0) * ROW_GAP_RATIO:
+            groups.append([item])
+        else:
+            groups[-1].append(item)
+        right = max(right, item_right)
+    return groups
 
 
 # Код единиц чертежа ($INSUNITS) → сколько это метров. Спрашиваем у файла, а
@@ -2106,27 +2353,66 @@ def _mock_block(sheet: Sheet, layers=None) -> str:
     return MOCK_DRAWING.format(shapes=shapes)
 
 
-def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
-    """Содержимое листа в порядке чертежа: подписи сверху вниз, таблицы на месте.
+def _without_place(items: list[TextItem]) -> bool:
+    """У подписей нет места на листе: все стоят в одной точке.
 
-    Таблица врезается туда, где она нарисована, а не выносится отдельным
-    списком в конец: инженер читает лист так же, как смотрит на него.
+    Так собран служебный лист с подписями, которые нашлись только в исходном
+    DWG: место в файле для них потеряно вместе с привязкой, и координаты у
+    всех нулевые. Прочие служебные листы место как раз имеют — им порядок
+    чтения нужен.
     """
+    if len(items) < 2:
+        return False
+    first = items[0]
+    return all(item.x == first.x and item.y == first.y for item in items)
+
+
+def _plain_list(items: list[TextItem]) -> list[str]:
+    """Подписи без места: по строке на подпись, повторы схлопнуты.
+
+    Порядок чтения по ним не строится — строить его не по чему, — и вся
+    тысяча меток склеивалась в одну строку. На листе сетей связи ИОС5 это
+    была строка в девять тысяч знаков, которую модель читает как одно
+    предложение.
+    """
+    counts = Counter(" ".join((item.text or "").split()) for item in items)
+    return [
+        text if repeats < REPEAT_LIMIT else f"{text} (×{repeats} в чертеже)"
+        for text, repeats in counts.items()
+        if text
+    ]
+
+
+def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
+    """Содержимое листа: сперва таблицы сверху вниз, затем подписи по зонам.
+
+    Таблицы идут первыми и в том порядке, в каком лежат на листе, — у каждой
+    подписано её место. Врезать их между подписями нельзя: подписи к этому
+    моменту уже собраны в строки чтения и координат за собой не несут, а по
+    высоте первой строки таблица встала бы наугад. Раньше они шли первыми, но
+    задом наперёд — нижняя таблица листа оказывалась в отчёте верхней.
+    """
+    if _without_place(sheet.texts):
+        return _plain_list(sheet.texts)
     tables = tables or []
-    lines: list[tuple[float, str]] = []
+    box = sheet.extent()
+    numbered: list[tuple[float, str]] = []
     covered = []
     number = 0
-    for box, markdown in tables:
-        covered.append(box)
+    for table_box, markdown in tables:
+        covered.append(table_box)
         grid = [ln for ln in markdown.splitlines() if ln.startswith("|")]
         if len(grid) < 2 or grid[0].count("|") - 1 < 2:
             # Сетки нет — это просто подписи, лежавшие рядом. Заголовок
             # «Таблица» над одной строкой обманывает: на листе ИГР таких
             # заголовков набиралось десять, и ни один не вёл к таблице.
-            lines.append((box[3], markdown))
+            numbered.append((table_box[3], markdown))
             continue
         number += 1
-        lines.append((box[3], chr(10).join([f"**Таблица {number}**", "", markdown])))
+        where = f" · {_zone(table_box, box)}" if box else ""
+        numbered.append(
+            (table_box[3], chr(10).join([f"**Таблица {number}**{where}", "", markdown]))
+        )
     outside = [
         item
         for item in sheet.texts
@@ -2134,16 +2420,8 @@ def sheet_flow(sheet: Sheet, tables=None) -> list[str]:
             b[0] <= item.x <= b[2] and b[1] <= item.y <= b[3] for b in covered
         )
     ]
-    for text in _text_by_zone(sheet, outside):
-        lines.append((None, text))
-    # Таблицы расставляем по своей высоте, текст идёт своим порядком чтения:
-    # смешивать их по одному ключу нельзя — у строк текста высоты уже нет.
-    ordered: list[str] = []
-    table_lines = sorted([ln for ln in lines if ln[0] is not None], key=lambda ln: -ln[0])
-    text_lines = [ln[1] for ln in lines if ln[0] is None]
-    ordered.extend(text_lines)
-    for _, block in table_lines:
-        ordered.insert(0, block)
+    ordered = [block for _, block in sorted(numbered, key=lambda item: -item[0])]
+    ordered.extend(_text_by_zone(sheet, outside))
     return ordered
 
 
@@ -2230,6 +2508,45 @@ def sheet_map(sheet: Sheet, layers=None, tables=None, ole=0) -> str:
     return "\n".join(rows) if len(rows) > 2 else ""
 
 
+# Формат листа в файле записан строкой принтера: «ISO_full_bleed_A2_(420.00_
+# x_594.00_MM)». Модели она ничего не говорит, а в паспорте занимает строку.
+_PAPER_NAME = re.compile(r"(?<![A-Za-z0-9])A(\d)(?![0-9])", re.IGNORECASE)
+
+# Масштаб, написанный на самом листе: «М 1:500». Ему верим больше, чем
+# масштабу окна вида, — его поставил чертёжник, а окно бывает настроено как
+# угодно: у листа ситуационного плана оно даёт 1:40 при надписи «М 1:500».
+_SCALE_IN_TEXT = re.compile(r"\bМ\s*1\s*[:：]\s*(\d{1,6})\b")
+
+
+def _paper_name(sheet: Sheet) -> str:
+    """Формат листа по-человечески: «А2 (420×594 мм)».
+
+    Строку принтера («UserDefinedMetric (1783.00 x 841.00мм)») повторять
+    незачем: свои же размеры она и содержит.
+    """
+    size = f"{sheet.paper_width:g}×{sheet.paper_height:g} мм" if sheet.paper_width else ""
+    found = _PAPER_NAME.search(sheet.paper or "")
+    if found:
+        return f"А{found.group(1)}" + (f" ({size})" if size else "")
+    return size or (sheet.paper or "—")
+
+
+# Меньше этого масштаб окна вида не бывает: чертёж крупнее натуры на целом
+# листе не вычерчивают. 1:1 и «увеличения» вроде 1:0,5 означают не масштаб, а
+# что мерить нечем — окно настроено мимо чертежа или вида в модель нет вовсе.
+_SANE_VIEW_SCALE = 2.0
+
+
+def _sheet_scale(sheet: Sheet, found) -> str:
+    """Масштаб листа: сперва по надписи на нём, потом по окну вида."""
+    for source in (found.title, *(t.text for t in sheet.texts)):
+        written = _SCALE_IN_TEXT.search(source or "")
+        if written:
+            return f"1:{written.group(1)} (по надписи на листе)"
+    value = sheet.scale()
+    return f"1:{value:g} (по окну вида)" if value >= _SANE_VIEW_SCALE else ""
+
+
 def sheet_markdown(
     sheet: Sheet,
     file_name: str,
@@ -2240,23 +2557,40 @@ def sheet_markdown(
     ole: int = 0,
 ) -> str:
     """Лист в том же контракте, что и страница PDF: ## Страница N / ### PASS-*."""
+    import stamp as stamp_mod
+
     number = sheet.number if sheet.number is not None else 0
-    scale = f"1:{sheet.scale():g}" if sheet.scale() else ""
+    # Паспорт заполняем по основной надписи, а не по имени макета в файле.
+    # Макет зовётся «1 Сит.» или «Обл.» — модель по такому названию лист не
+    # опознает, а в штампе рядом лежит и шифр, и стадия, и наименование по
+    # ГОСТ 21.101. Разбор надписи уже есть (`stamp.py`) и работает на обоих
+    # источниках сразу, до сих пор он просто не доезжал до листа чертежа.
+    found = stamp_mod.from_dwg_sheet(sheet)
+    passport = [
+        f"- источник: `{file_name}` (DWG)",
+        f"- обозначение: {found.code}" if found.code else "",
+        f"- лист: {found.sheet}"
+        + (f" из {found.sheets_total}" if found.sheets_total else "")
+        if found.sheet
+        else "",
+        f"- стадия: {found.stage}" if found.stage else "",
+        f"- наименование листа: {found.title or sheet.title}",
+        f"- объект: {found.object_name}" if found.object_name else "",
+        f"- организация: {found.org}" if found.org else "",
+        f"- формат: {_paper_name(sheet)}",
+        f"- масштаб: {_sheet_scale(sheet, found)}" if _sheet_scale(sheet, found) else "",
+        f"- текстовых объектов: {len(sheet.texts)}",
+        # Имя макета оставляем последней строкой: по нему лист ищут в самом
+        # файле, но опознаётся он не по нему.
+        f"- макет в файле: `{sheet.name}`" if sheet.name != found.title else "",
+        f"- основная надпись: {found.note}" if found.note else "",
+    ]
     parts = [
         f"## Страница {number}",
         "",
         "### PASS-0 Паспорт листа",
         "",
-        f"- источник: `{file_name}` (DWG)",
-        f"- название листа: {sheet.title}",
-        f"- формат: {sheet.paper or '—'}"
-        + (
-            f" ({sheet.paper_width:g}×{sheet.paper_height:g} мм)"
-            if sheet.paper_width
-            else ""
-        ),
-        f"- масштаб: {scale or '—'}",
-        f"- текстовых объектов: {len(sheet.texts)}",
+        *[line for line in passport if line],
         "",
     ]
     content = sheet_content(sheet, layers)

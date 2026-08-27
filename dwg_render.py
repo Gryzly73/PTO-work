@@ -29,10 +29,13 @@
 """
 from __future__ import annotations
 
+from functools import lru_cache
 from pathlib import Path
 
 from ezdxf import bbox
 from ezdxf.addons.drawing import config
+
+from dwg_sheets import text_span
 
 # Маскировки и подложки — см. шапку модуля. Размеры (DIMENSION) здесь больше
 # не значатся: они несут то, что инженер и сверяет. Битые экземпляры, из-за
@@ -168,19 +171,45 @@ _PREVIEW_WIDTH_PX = 1400
 _MIN_STROKE_MM = 0.05
 
 _ANCHOR_TO_SVG = {"left": "start", "center": "middle", "right": "end"}
-_VALIGN_TO_SVG = {
-    "top": "hanging",
-    "middle": "central",
-    "bottom": "auto",
-    "baseline": "auto",
-}
-_ANCHOR_TO_MPL = {"left": "left", "center": "center", "right": "right"}
-_VALIGN_TO_MPL = {
-    "top": "top",
-    "middle": "center",
-    "bottom": "bottom",
-    "baseline": "baseline",
-}
+
+
+# ── сколько места занимает подпись ──────────────────────────────────────────
+#
+# Мерка ширины живёт в разборе (`dwg_sheets.text_span`), а не здесь: место,
+# занятое подписью на листе, — свойство чертежа, а не картинки. По ней тут
+# вписывается строка в её место, там же — переносятся строки по ширине блока
+# и разделяются подписи, стоящие в одной строке далеко друг от друга.
+
+# Межстрочный интервал MTEXT: так строки расставляет AutoCAD (тот же
+# коэффициент в dwg_sheets считает отступ пустых строк).
+_LINE_SPACING = 1.5
+
+# Какую долю кегля занимает прописная буква в шрифте картинки (DejaVu Sans).
+# Высота текста в чертеже — это высота прописной, а не кегль, поэтому без
+# поправки подпись рисуется на четверть мельче, чем стоит в файле.
+_CAP_RATIO = 0.73
+
+# Насколько «у» и «р» свисают ниже строки — долями высоты прописной.
+_DESCENT = 0.25
+
+
+def _first_baseline(lines: int, size: float, valign: str) -> float:
+    """На сколько первая строка ниже точки привязки, в единицах чертежа.
+
+    Считаем сами, а не отдаём выравнивание рисовальщику: у SVG и matplotlib
+    оно устроено по-разному (`dominant-baseline` против `va`), и один и тот
+    же лист выходил в двух картинках со сдвигом на полстроки.
+    """
+    step = size * _LINE_SPACING
+    if valign == "top":
+        return size
+    if valign == "middle":
+        return size - ((lines - 1) * step + size) / 2
+    if valign == "bottom":
+        # Низ подписи — это низ выносных элементов «у» и «р», а не строка
+        # букв: иначе подпись в графе штампа ложится прямо на её линейку.
+        return -(lines - 1) * step - size * _DESCENT
+    return 0.0
 
 
 def _sheet_frame(meta: dict) -> tuple[float, float, float, float, float, float]:
@@ -307,22 +336,40 @@ def render_svg(primitives: list[dict], meta: dict) -> str:
             # по часовой: без смены знака вертикальные подписи ложатся зеркально.
             rotation = -float(item.get("rot") or 0)
             anchor = _ANCHOR_TO_SVG.get(str(item.get("anchor") or "left"), "start")
-            baseline = _VALIGN_TO_SVG.get(str(item.get("valign") or "baseline"), "auto")
+            valign = str(item.get("valign") or "baseline")
+            factor = float(item.get("wf") or 1.0)
+            box = float(item.get("width") or 0.0)
             lines = _text_lines(str(item["text"]))
-            spans = "".join(
-                f'<tspan x="{sx:.2f}" dy="{0 if n == 0 else size * 1.2:.2f}">'
-                f"{_escape(line)}</tspan>"
-                for n, line in enumerate(lines)
-            )
+            first = _first_baseline(len(lines), size, valign)
+            step = size * _LINE_SPACING
+            spans = []
+            for n, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                # Строку укладываем ровно в её место на листе: браузер сожмёт
+                # или растянет знаки под заданную ширину сам. Без этого лист
+                # рисуется шрифтом браузера, который шире чертёжного.
+                span = text_span(line, size, factor)
+                if box > size:
+                    span = min(span, box)
+                spans.append(
+                    f'<tspan x="{sx:.2f}" y="{sy + first + n * step:.2f}" '
+                    f'textLength="{span:.2f}" lengthAdjust="spacingAndGlyphs">'
+                    f"{_escape(line)}</tspan>"
+                )
+            if not spans:
+                continue
             transform = (
                 f' transform="rotate({rotation:.1f} {sx:.2f} {sy:.2f})"'
                 if rotation
                 else ""
             )
             texts.append(
-                f'<text x="{sx:.2f}" y="{sy:.2f}" font-size="{size:.2f}" '
+                # Кегль задаём от высоты прописной: в чертеже размер текста —
+                # это её высота, а не кегль шрифта.
+                f'<text font-size="{size / _CAP_RATIO:.2f}" '
                 f'fill="{item.get("color") or "#000000"}" text-anchor="{anchor}" '
-                f'dominant-baseline="{baseline}"{transform}>{spans}</text>'
+                f'dominant-baseline="auto"{transform}>{"".join(spans)}</text>'
             )
             continue
         if len(points) < 2:
@@ -367,6 +414,79 @@ def render_svg(primitives: list[dict], meta: dict) -> str:
     )
 
 
+_TEXT_FONT = None
+
+
+@lru_cache(maxsize=4096)
+def _line_path(line: str):
+    """Контуры букв строки, кеглем в единицу. Размер задаётся преобразованием.
+
+    Кеш держим по самой строке: на листе фундаментов из шести сотен подписей
+    добрая половина — повторяющиеся отметки и номера свай, а разбор строки в
+    контуры стоит около шести миллисекунд.
+    """
+    from matplotlib.font_manager import FontProperties
+    from matplotlib.textpath import TextPath
+
+    global _TEXT_FONT
+    if _TEXT_FONT is None:
+        _TEXT_FONT = FontProperties()
+    path = TextPath((0, 0), line, size=1.0, prop=_TEXT_FONT)
+    return path, path.get_extents()
+
+
+def _text_glyphs(item: dict):
+    """Подпись листа глифами, вписанными в её место на чертеже.
+
+    matplotlib умеет ставить текст только своим шрифтом и только целиком: ни
+    сжать строку по ширине, ни задать высоту прописной он не даёт. Поэтому
+    строку переводим в контуры букв и кладём их аффинным преобразованием —
+    высота прописной ровно из чертежа, ширина строки ровно та, что отведена
+    ей на листе. Иначе подписи наезжают друг на друга: экранный шрифт шире
+    чертёжного примерно в полтора раза.
+    """
+    from matplotlib.transforms import Affine2D
+
+    x, y = item["points"][0]
+    size = float(item.get("size") or 2.5)
+    factor = float(item.get("wf") or 1.0)
+    box = float(item.get("width") or 0.0)
+    anchor = str(item.get("anchor") or "left")
+    rotation = float(item.get("rot") or 0)
+    lines = _text_lines(str(item["text"]))
+    first = _first_baseline(len(lines), size, str(item.get("valign") or "baseline"))
+    step = size * _LINE_SPACING
+    em = size / _CAP_RATIO
+
+    out = []
+    for n, line in enumerate(lines):
+        if not line.strip():
+            continue
+        path, ink = _line_path(line)
+        if ink.width <= 0:
+            continue
+        span = text_span(line, size, factor)
+        if box > size:
+            span = min(span, box)
+        # Крайние значения обрезаем: подпись из одних скобок или редких знаков
+        # наша мерка считает почти нулевой, и буквы схлопнулись бы в полоску.
+        squeeze = min(max(span / (ink.width * em), 0.25), 1.6)
+        # Привязку считаем по тому, что вышло, а не по расчётной ширине: у
+        # обрезанной строки они расходятся, и подпись уехала бы от своей точки.
+        drawn = ink.width * em * squeeze
+        shift = {"center": -drawn / 2, "right": -drawn}.get(anchor, 0.0)
+        out.append(
+            Affine2D()
+            .translate(-ink.x0, 0)
+            .scale(em * squeeze, em)
+            .translate(shift, -(first + n * step))
+            .rotate_deg(rotation)
+            .translate(x, y)
+            .transform_path(path)
+        )
+    return out
+
+
 def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
     """Лист как PNG — для ленты миниатюр и как запасной путь интерфейса.
 
@@ -377,6 +497,8 @@ def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
+    from matplotlib.patches import PathPatch
+    from matplotlib.path import Path as GlyphPath
 
     banner = banner_for(primitives, meta)
     if not primitives:
@@ -399,24 +521,14 @@ def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
         return max(value, _MIN_STROKE_MM) * px_per_unit * 72.0 / dpi
 
     segments: dict[tuple[str, float], list] = {}
+    glyphs: dict[str, list] = {}
     for item in primitives:
         points = item.get("points") or []
         if item.get("type") == "text":
             if not points or not item.get("text"):
                 continue
-            size = float(item.get("size") or 2.5)
-            lines = _text_lines(str(item["text"]))
-            axes.text(
-                points[0][0],
-                points[0][1],
-                "\n".join(lines),
-                fontsize=to_points(size),
-                color=str(item.get("color") or "#000000"),
-                rotation=float(item.get("rot") or 0),
-                rotation_mode="anchor",
-                ha=_ANCHOR_TO_MPL.get(str(item.get("anchor") or "left"), "left"),
-                va=_VALIGN_TO_MPL.get(str(item.get("valign") or "baseline"), "baseline"),
-                linespacing=1.2,
+            glyphs.setdefault(str(item.get("color") or "#000000"), []).extend(
+                _text_glyphs(item)
             )
             continue
         if len(points) < 2:
@@ -427,6 +539,20 @@ def render_png(primitives: list[dict], meta: dict, target: Path) -> Path | None:
     for (color, lw), lines in segments.items():
         axes.add_collection(
             LineCollection(lines, colors=color, linewidths=to_points(lw))
+        )
+
+    # Все буквы одного цвета — одной фигурой: на листе фундаментов их шесть
+    # сотен, и по отдельной фигуре на подпись отрисовка идёт вдесятеро дольше.
+    for color, paths in glyphs.items():
+        if not paths:
+            continue
+        axes.add_patch(
+            PathPatch(
+                GlyphPath.make_compound_path(*paths),
+                facecolor=color,
+                edgecolor="none",
+                linewidth=0,
+            )
         )
 
     if banner:

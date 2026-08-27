@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -146,6 +147,7 @@ class Pipeline:
                 "dwg2dxf или ODA File Converter (путь в PTO_DWG2DXF); DXF "
                 "читается без него."
             ) from e
+        _save_objects(path, page_number, run_dir)
         # Тип листа кладём в паспорт: конвертер PDF берёт его из PASS-0, и
         # тем же способом он доедет до интерфейса.
         nl = chr(10)
@@ -245,6 +247,42 @@ class Pipeline:
         pages_dir.mkdir(parents=True, exist_ok=True)
         page_file(run_dir, page_number).write_text(content, encoding="utf-8")
         return content
+
+
+def objects_file(run_dir: Path, page_number: int) -> Path:
+    """Файл с картой «строка текста листа → объекты чертежа»."""
+    return run_dir / "pages" / f"page_{page_number:04d}.objects.json"
+
+
+def _save_objects(path: Path, page_number: int, run_dir: Path) -> None:
+    """Сохраняет карту строк листа рядом с самим листом.
+
+    По ней интерфейс связывает строку в тексте с подписью на чертеже: ткнул в
+    строку — подсветилась надпись. Считать её при запросе нельзя: разобранного
+    листа к тому времени уже нет, а разбирать чертёж заново ради подсветки —
+    секунды на каждый клик.
+
+    Номер объекта здесь тот же, что в колонке `id` геометрии: обе стороны
+    считают его одной функцией (`dwg_sheets.text_uid`), иначе связь развалится
+    при первой же правке одной из них.
+
+    Ошибка здесь не должна стоить листа: без карты лист читается, просто без
+    подсветки.
+    """
+    try:
+        from dwg_sheets import sheet_objects
+
+        marked = sheet_objects(path, page_number)
+        target = objects_file(run_dir, page_number)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps({"lines": marked}, ensure_ascii=False), encoding="utf-8"
+        )
+    except Exception as error:
+        print(
+            f"[pipeline] карта объектов листа {page_number} не сохранена: {error}",
+            flush=True,
+        )
 
 
 def rebuild_out_md(run_dir: Path) -> Path | None:

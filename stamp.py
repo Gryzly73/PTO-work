@@ -218,16 +218,10 @@ def read(items: list[Item], *, source: str = "") -> Stamp:
     anchors = _anchors(items)
     stamp = Stamp(source=source)
 
-    # Стадия — самый надёжный якорь: слово встречается на листе один раз и
-    # стоит в фиксированном месте надписи. От него же берём масштаб штампа:
-    # расстояние «Стадия» → «Листов» по ГОСТ равно 35 мм.
-    stage_anchor = _next_anchor(anchors, "стадия")
-    total_anchor = _next_anchor(anchors, "листов")
-    scale = 1.0
-    if stage_anchor and total_anchor:
-        span = abs(total_anchor.x - stage_anchor.x)
-        if span > 1:
-            scale = span / 35.0
+    # Стадия — самый надёжный якорь: слово стоит в фиксированном месте
+    # надписи. От него же берём масштаб штампа: расстояние «Стадия» → «Листов»
+    # по ГОСТ равно 35 мм.
+    stage_anchor, total_anchor, scale = _stamp_pair(items, anchors)
 
     # Строка надписи по ГОСТу 8 мм, но подпись графы и её значение прижаты к
     # разным краям ячейки, и на реальных чертежах между ними выходит чуть
@@ -259,6 +253,43 @@ def read(items: list[Item], *, source: str = "") -> Stamp:
     if not stamp.found:
         stamp.note = "основная надпись не распознана"
     return stamp
+
+
+def _stamp_pair(
+    items: list[Item], anchors: dict[str, list[Item]]
+) -> tuple[Item | None, Item | None, float]:
+    """Якоря «Стадия» и «Листов» настоящей надписи плюс масштаб штампа.
+
+    Надписей на листе бывает две: заполненная и пустая заготовка рядом — так
+    сделаны шестнадцать листов ПОС, где справа от готового штампа лежит
+    порожняя форма с теми же словами. Пока из одинаковых слов брали самое
+    правое, якорем становилась заготовка: под ней пусто, а зона поиска шифра
+    отсчитывается от неё — и лист уходил в отчёт без шифра, стадии, номера и
+    наименования, хотя всё это на нём написано.
+
+    Поэтому выбираем ту надпись, под «Стадией» которой что-то стоит. Если
+    заполненных нет — прежнее правило, самая правая-нижняя.
+    """
+    stages = anchors.get("стадия") or []
+    totals = anchors.get("листов") or []
+    if not stages:
+        return None, _next_anchor(anchors, "листов"), 1.0
+    best = None
+    for stage in stages:
+        # «Листов» из той же надписи: та же строка, правее «Стадии».
+        same_row = [
+            item
+            for item in totals
+            if item.x > stage.x and abs(item.y - stage.y) <= max(stage.size, 1.0) * 2
+        ]
+        total = min(same_row, key=lambda i: i.x) if same_row else None
+        span = abs(total.x - stage.x) if total else 0.0
+        scale = span / 35.0 if span > 1 else 1.0
+        filled = _below(items, stage, max_dy=12.0 * scale, max_dx=9.0 * scale)
+        key = (filled is not None, stage.x - stage.y)
+        if best is None or key > best[0]:
+            best = (key, stage, total, scale)
+    return best[1], best[2], best[3]
 
 
 def _next_anchor(anchors: dict[str, list[Item]], key: str) -> Item | None:

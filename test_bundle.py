@@ -140,6 +140,36 @@ def case_sheet_order() -> tuple[bool, str]:
     return True, "листы в порядке комплекта"
 
 
+def case_code_from_processed_body() -> tuple[bool, str]:
+    """У растрового PDF шифр берётся из разобранного листа.
+
+    У печатного альбома текстового слоя нет вовсе — у ПЗ комплекта
+    «Жуковский» это ноль знаков на всех восьми страницах. Без этого запасного
+    пути лист остаётся без шифра, не связывается с двойником из чертежа, и
+    сведение источников не происходит именно там, где нужнее всего.
+    """
+    body = "\n".join(
+        [
+            "### PASS-0 Паспорт листа",
+            "",
+            "- лист: 3",
+            "",
+            "### PASS-B Текст листа",
+            "",
+            "Шифр 28-ХСА-1/25-КР1",
+            "Сварка по ГОСТ 14098-2014, бетон В25 W6 F150",
+        ]
+    )
+    code, number = bundle.code_from_body(body)
+    if code != "28-ХСА-1/25-КР1":
+        return False, f"шифр прочитан как {code!r}"
+    if number != "3":
+        return False, f"номер листа прочитан как {number!r}"
+    if bundle.code_from_body("Сварка по ГОСТ 14098-2014")[0]:
+        return False, "ссылка на ГОСТ принята за шифр"
+    return True, "шифр и номер взяты из разбора, ГОСТ отвергнут"
+
+
 def main() -> int:
     cases = [
         ("лист из двух источников", case_one_sheet_two_sources),
@@ -148,6 +178,7 @@ def main() -> int:
         ("регистр — не расхождение", case_same_title_not_a_conflict),
         ("лист без номера", case_unnumbered_kept),
         ("порядок листов", case_sheet_order),
+        ("шифр из разбора листа", case_code_from_processed_body),
     ]
     failed = 0
     for title, case in cases:

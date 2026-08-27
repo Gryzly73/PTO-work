@@ -229,6 +229,9 @@ def layout_texts(data: dict) -> dict[str, list[dict]]:
                 "y": point[1],
                 "height": height,
                 "width": _number(item.get("rect_width")) or 0.0,
+                # Во сколько раз знак сжат по ширине: в штампе так подписи
+                # укладывают в графу. Без множителя они рисуются шире её.
+                "factor": _number(item.get("width_factor")) or 1.0,
                 "rotation": _number(item.get("rotation")) or 0.0,
             }
         )
