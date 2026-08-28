@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "qualityGates": {
+    "minInstanceRecall": 0.9,
+    "minBindingPrecision": 0.95,
+    "maxFalseConfirmedBindings": 0
+  },
+  "fixtures": [
+    {
+      "id": "example-plan-sheet-1",
+      "documentPath": "local/example-plan.dwg",
+      "page": 1,
+      "split": "development",
+      "groundTruthStatus": "needs_human_annotation",
+      "expected": {
+        "instanceKeys": [
+          "modelspace|2AF"
+        ],
+        "bindings": [],
+        "unknownInstanceKeys": [
+          "modelspace|2AF"
+        ],
+        "relationships": []
+      }
+    }
+  ]
+}

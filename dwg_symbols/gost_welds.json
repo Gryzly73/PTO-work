@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "standard": "GOST 2.312",
+  "note": "Fail-closed: only rows with gostCode are applied. Visual dumps (review_weld_crops definitions, review_weld_inserts sheet crops) are not 2.312 marks — codes stay empty.",
+  "welds": [
+    {
+      "signature": "blockdef-v1:f9d0fcc0bd5e119d8dabacdf95843cbf12c18edcc7ab1bb372b36f4d772c7120",
+      "blockName": "ФС1_Есипово 3_стр3",
+      "gostCode": "",
+      "label": "",
+      "status": "rejected_visual",
+      "instanceCount": 30,
+      "visualNote": "Канал + подпись ФС1; сущности блока на METALL. Марка типового элемента, не знак 2.312."
+    },
+    {
+      "signature": "blockdef-v1:0b5125cf6c36cbaf24d6781efaa9145bb359a8dfc566d1b915e98857e3d8c8ed",
+      "blockName": "*U129",
+      "gostCode": "",
+      "label": "",
+      "status": "rejected_visual",
+      "instanceCount": 18,
+      "visualNote": "Пять параллельных отрезков. Штриховка/шов на покрытии, тип 2.312 не читается."
+    },
+    {
+      "signature": "blockdef-v1:15248181be09f4c7cb52c983a6fd8864f6066399fb37b42c636c3b08932102a9",
+      "blockName": "*U140",
+      "gostCode": "",
+      "label": "",
+      "status": "rejected_visual",
+      "instanceCount": 12,
+      "visualNote": "Два разрозненных наклонных отрезка. Не вилка 2.312."
+    },
+    {
+      "signature": "blockdef-v1:00157b83b26c20e2350c4d733db2331cf7cd918afe19383f62b11a8ded1ded7c",
+      "blockName": "*U152",
+      "gostCode": "",
+      "label": "",
+      "status": "rejected_visual",
+      "instanceCount": 12,
+      "visualNote": "Пять пар пересекающихся линий (кресты вдоль шва). Изображение шва на стыке, не обозначение из таблицы 2.312."
+    }
+  ]
+}

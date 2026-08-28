@@ -10,6 +10,11 @@ venv/
 # Прогоны и их артефакты (сотни мегабайт)
 hf_runs/
 hf_runs_mock/
+local_runs/
+h[0-9]_*/
+s[0-9]_*/
+page35*_review.png
+h*_contact_sheet.png
 service/state/
 service/state-mock/
 *_viewer/
@@ -24,6 +29,8 @@ match_viewer*/
 *.rar
 ЭТАЛОН*/
 new_files/
+symbols/fixtures/local/
+symbols/fixtures/MANIFEST.local.json
 
 # Секреты: .env подключается через env_file в compose, внутрь образа не кладём
 .env

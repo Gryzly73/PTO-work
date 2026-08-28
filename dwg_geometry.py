@@ -35,6 +35,9 @@ _FLATTEN = 0.5
 # Потолок на число примитивов. Стройгенплан целиком — это сотни тысяч
 # отрезков: браузер такое рисует минуту, а инженеру столько и не нужно.
 MAX_PRIMITIVES = 60000
+# Нативные HATCH не идут в Recorder (HatchPolicy.IGNORE). Снимаем отдельно,
+# только для клика на поле, не для картинки листа.
+MAX_HATCHES = 4000
 
 _HEADER = [
     "type",
@@ -124,6 +127,94 @@ def _points_of(record) -> list[tuple[float, float]]:
     return []
 
 
+def _hatch_points(entity) -> list[tuple[float, float]]:
+    """Boundary vertices of a HATCH, in the entity's own coordinates."""
+
+    points: list[tuple[float, float]] = []
+    try:
+        paths = entity.paths
+    except Exception:
+        paths = ()
+    for path in paths or ():
+        vertices = getattr(path, "vertices", None)
+        if vertices:
+            for vertex in vertices:
+                try:
+                    points.append((float(vertex[0]), float(vertex[1])))
+                except (TypeError, IndexError, ValueError):
+                    continue
+            continue
+        for edge in getattr(path, "edges", ()) or ():
+            for name in ("start", "end"):
+                value = getattr(edge, name, None)
+                if value is None:
+                    continue
+                try:
+                    points.append((float(value[0]), float(value[1])))
+                except (TypeError, IndexError, ValueError):
+                    continue
+    if len(points) >= 2:
+        return points
+    try:
+        box = entity.bbox()
+        if box is not None and getattr(box, "has_data", False):
+            x0, y0, _ = box.extmin
+            x1, y1, _ = box.extmax
+            return [
+                (float(x0), float(y0)),
+                (float(x1), float(y0)),
+                (float(x1), float(y1)),
+                (float(x0), float(y1)),
+                (float(x0), float(y0)),
+            ]
+    except Exception:
+        return []
+    return []
+
+
+def _hatch_dict(entity) -> dict | None:
+    """One native HATCH as a field primitive. Not fed to the sheet SVG."""
+
+    if getattr(entity, "dxftype", lambda: "")() != "HATCH":
+        return None
+    points = _hatch_points(entity)
+    if len(points) < 2:
+        return None
+    try:
+        solid = bool(entity.dxf.solid_fill)
+    except Exception:
+        solid = False
+    try:
+        pattern = str(entity.dxf.pattern_name or "").strip().upper()
+    except Exception:
+        pattern = ""
+    if solid:
+        pattern = "SOLID"
+    if not pattern:
+        return None
+    try:
+        scale = round(float(entity.dxf.pattern_scale or 1.0), 1)
+    except Exception:
+        scale = 1.0
+    rgb = getattr(entity, "rgb", None)
+    if rgb and len(rgb) >= 3:
+        color = f"#{int(rgb[0]):02x}{int(rgb[1]):02x}{int(rgb[2]):02x}"
+    else:
+        try:
+            color = f"aci:{int(entity.dxf.color)}"
+        except Exception:
+            color = ""
+    return {
+        "type": "hatch",
+        "layer": str(getattr(entity.dxf, "layer", "") or ""),
+        "color": color,
+        "lw": 0.0,
+        "pattern": pattern,
+        "pattern_scale": scale,
+        "points": points,
+    }
+
+
 def _settings() -> config.Configuration:
     base = _configuration()
     return config.Configuration(
@@ -174,6 +265,7 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
     сжимаются в точки по разным углам кадра.
     """
     primitives: list[dict] = []
+    hatches: list[dict] = []
 
     # 1. То, что нарисовано на самом листе: рамка, штамп, таблицы.
     layout = None
@@ -183,7 +275,14 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
         except Exception:
             layout = None
     if layout is not None:
-        primitives.extend(_record(doc, [e for e in layout if e.dxftype() not in SKIP_TYPES]))
+        layout_entities = [e for e in layout if e.dxftype() not in SKIP_TYPES]
+        primitives.extend(_record(doc, layout_entities))
+        for entity in layout_entities:
+            payload = _hatch_dict(entity)
+            if payload is not None:
+                hatches.append(payload)
+                if len(hatches) >= MAX_HATCHES:
+                    break
 
     # 2. Чертёж из модели — по каждому окну вида, с переносом в лист.
     if sheet.views:
@@ -195,9 +294,27 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
                 primitives.append(item)
                 if len(primitives) >= MAX_PRIMITIVES:
                     break
+            if len(hatches) < MAX_HATCHES:
+                for entity in in_view:
+                    payload = _hatch_dict(entity)
+                    if payload is None:
+                        continue
+                    payload["points"] = [
+                        view.to_paper(x, y) for x, y in payload["points"]
+                    ]
+                    hatches.append(payload)
+                    if len(hatches) >= MAX_HATCHES:
+                        break
     else:
         # Лист найден по рамке в модели: чертёж и рамка уже в одной системе.
-        primitives.extend(_record(doc, _entities(doc, box)))
+        boxed = _entities(doc, box)
+        primitives.extend(_record(doc, boxed))
+        for entity in boxed:
+            payload = _hatch_dict(entity)
+            if payload is not None:
+                hatches.append(payload)
+                if len(hatches) >= MAX_HATCHES:
+                    break
 
     for item in sheet.texts:
         primitives.append(
@@ -235,6 +352,7 @@ def sheet_geometry(doc, box, sheet) -> tuple[list[dict], dict]:
         "scale": sheet.scale(),
         "primitives": len(primitives),
         "texts": len(sheet.texts),
+        "hatches": hatches,
     }
     return primitives, meta
 

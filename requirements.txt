@@ -9,3 +9,6 @@ huggingface_hub>=0.27.0
 # читает DXF, в который его переводит внешний конвертер (LibreDWG dwg2dxf или
 # ODA File Converter, путь в PTO_DWG2DXF).
 ezdxf>=1.4
+
+# Формирование автономных DOCX-отчётов с изображениями DWG-символов.
+python-docx

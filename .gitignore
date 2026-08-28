@@ -46,10 +46,13 @@ new_files/*
 new_files/pto_scoring_kit/*
 !new_files/pto_scoring_kit/score_real_testset.py
 !new_files/pto_scoring_kit/README.md
+dwg_symbols/fixtures/MANIFEST.local.json
+dwg_symbols/fixtures/local/
 
 # === Результаты прогонов (регенерируется запуском раннера) ===
 hf_runs/
 hf_runs_mock/
+local_runs/
 # Логи и отчёты замеров качества вывода (measure_output.py)
 bench_lean/
 bench_*.md

@@ -77,6 +77,9 @@ class TextItem:
     # центру текст рисуется от неё вправо и наезжает на соседний.
     anchor: str = "left"
     valign: str = "baseline"
+    # Слой DXF. Нужен, чтобы клик по TEXT не сваливал оси, размеры и штамп
+    # в одну кучу: буква оси живёт на OSI, число цепи — на RAZMER / DIMENSION.
+    layer: str = ""
 
 
 @dataclass
@@ -483,6 +486,13 @@ def _text_height(entity) -> float:
     return 2.5
 
 
+def _entity_layer(entity) -> str:
+    try:
+        return str(entity.dxf.get("layer") or "")
+    except Exception:
+        return ""
+
+
 def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
     """Собирает текст из пространства, разворачивая блоки.
 
@@ -511,6 +521,7 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                             _text_width(e),
                             anchor,
                             valign,
+                            layer=_entity_layer(e),
                         )
                     )
             elif kind == "ATTRIB":
@@ -528,6 +539,7 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                             _text_width(e),
                             anchor,
                             valign,
+                            layer=_entity_layer(e),
                         )
                     )
             elif kind == "DIMENSION":
@@ -543,7 +555,16 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                     text = value if text in ("", "<>") else text.replace("<>", value)
                 if text:
                     p = e.dxf.text_midpoint
-                    out.append(TextItem(p.x, p.y, 2.5, text, "dimension"))
+                    out.append(
+                        TextItem(
+                            p.x,
+                            p.y,
+                            2.5,
+                            text,
+                            "dimension",
+                            layer=_entity_layer(e),
+                        )
+                    )
             elif kind == "MULTILEADER":
                 try:
                     text = clean_text(e.get_mtext_content() or "").strip()
@@ -552,7 +573,9 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                 if text:
                     p = e.dxf.get("insert", None)
                     x, y = (p.x, p.y) if p is not None else (0.0, 0.0)
-                    out.append(TextItem(x, y, 2.5, text, "leader"))
+                    out.append(
+                        TextItem(x, y, 2.5, text, "leader", layer=_entity_layer(e))
+                    )
             elif kind == "INSERT":
                 for attrib in e.attribs:
                     text = _plain(attrib).strip()
@@ -569,6 +592,7 @@ def _collect_from(space, out: list[TextItem], depth: int = 0) -> None:
                                 _text_width(attrib),
                                 anchor,
                                 valign,
+                                layer=_entity_layer(attrib) or _entity_layer(e),
                             )
                         )
                 _collect_from(e.virtual_entities(), out, depth + 1)

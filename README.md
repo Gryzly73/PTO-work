@@ -467,6 +467,90 @@ python dwg_sheets.py "чертёж.dwg" -o out.md
 python dwg_sheets.py "чертёж.dwg" --sheet 22 -o лист22.md
 ```
 
+Проверяемый аудит комплектов и первый block-based baseline условных обозначений
+вынесены в `dwg_symbols`. Методика, контракт sidecar-файлов, порядок разметки и
+quality gates описаны в
+[`docs/active/МЕТОДИКА_DWG_SYMBOL_HARNESS.md`](docs/active/МЕТОДИКА_DWG_SYMBOL_HARNESS.md).
+
+```bash
+# Реестр DWG/DXF без конвертации; --deep добавляет units/layouts/XREF.
+python -m dwg_symbols audit new_files/dwg --out local_runs/dwg_audit.json
+
+# H2: видимые INSERT одного листа и кластеры неизвестных кандидатов.
+python -m dwg_symbols extract-blocks "чертёж.dwg" --page 1 --out local_runs/symbols
+
+# H3: H2 плюс строки легенды, векторные сигнатуры и SVG-crops образцов.
+python -m dwg_symbols extract-legends "чертёж.dwg" --page 1 --out local_runs/symbols
+
+# H4a: подтверждённые совпадения block definition и пересчёт unknown-кластеров.
+python -m dwg_symbols resolve-exact "чертёж.dwg" --page 1 --out local_runs/symbols
+
+# H4b: H4a плюс probable-сопоставления замкнутых линейных профилей.
+python -m dwg_symbols resolve-geometry "чертёж.dwg" --page 1 --out local_runs/symbols
+
+# H4c: H4b плюс уникальный контекст значимых терминов подписи и слоя.
+python -m dwg_symbols resolve-context "чертёж.dwg" --page 1 --out local_runs/symbols
+
+# Проверочный комплект: sidecars, crops и overlay для одного листа.
+python -m dwg_symbols review-sheet "чертёж.dwg" --page 1 --id sheet-1 --out local_runs/review
+
+# Все листы одного DWG: H2-H4c, объединённая легенда и межлистовые кандидаты.
+python -m dwg_symbols review-file "чертёж.dwg" --id document-1 --out local_runs/file_review
+
+# Все DWG/DXF комплекта: иерархическая легенда разделов и проекта.
+python -m dwg_symbols review-project new_files/dwg --out local_runs/project_legend
+
+# Применить построенную проектную легенду ко всем листам комплекта.
+python -m dwg_symbols apply-project-legend new_files/dwg \
+  local_runs/project_legend/project_legend_catalog.json \
+  --out local_runs/project_application
+
+# Подробные HTML-отчёты по готовой выборке: общий индекс и отдельный отчёт на лист.
+python -m dwg_symbols render-review-html local_runs/review/selection.json local_runs/review
+
+# Пересчёт ролей INSERT по готовым sidecar без конвертации DWG.
+python -m dwg_symbols recount-non-symbols local_runs/project_application \
+  --out local_runs/project_application/non_symbol_recount.json
+
+# Каталог уникальных block-signature из sidecar: применение и черновые полки.
+python -m dwg_symbols catalog-symbol-types local_runs/project_application \
+  --out local_runs/project_application/symbol_type_catalog.json
+
+# Автономный DOCX с физически встроенными изображениями примеров.
+python scripts/generate_dwg_short_report_docx.py --review-root local_runs/review_10
+```
+
+Для Windows весь Docker-цикл автоматизирован:
+`.\scripts\dwg-harness-docker.ps1 build|verify|audit`.
+
+Block baseline не классифицирует каждый INSERT как оборудование: до извлечения
+легенды все экземпляры имеют статус `unresolved`. Это сохраняет различие между
+проверяемой инвентаризацией и предположением.
+
+`review-file` создаёт `file_legend_catalog.json` и `FILE_LEGEND_REPORT.md`.
+Одинаковые подписи объединяются с сохранением листов-источников. Если одна
+block-signature связана с разными подписями, каталог фиксирует конфликт и
+блокирует автоматическое применение. Уникальное точное совпадение на другом
+листе выдаётся только как `probable`-кандидат и не меняет листовые sidecars до
+ручной проверки.
+
+`review-project` сначала дешёво проверяет текст всех листов и запускает H2-H4c
+только там, где есть явный заголовок «Условные обозначения» или «Легенда».
+Результат возобновляемый: по каждому DWG сохраняется `document_scan.json`, а
+повторный запуск пропускает уже обработанные файлы. Итоговые
+`project_legend_catalog.json` и `PROJECT_LEGEND_REPORT.md` сохраняют раздел,
+файл, лист, crop и все сигнатуры источника. Одинаковая сигнатура с разными
+подписями блокируется как конфликт; межфайловая классификация автоматически не
+переходит в `confirmed`.
+
+`apply-project-legend` проходит все представления каждого DWG. На листах с
+локальной легендой сначала выполняется H2-H4c; на остальных — H2. Затем только
+оставшиеся `INSERT` проверяются по уникальным непротиворечивым block signatures
+общей легенды. Межфайловый результат всегда `probable` с evidence
+`project_exact_block_definition`. Геометрические проектные совпадения и связи
+на этом этапе не строятся. Проход возобновляется по fingerprints исходного DWG
+и версии каталога.
+
 Через сервис — тот же `POST /documents`, что и для PDF: расширение `.dwg`
 или `.dxf`, число листов приходит в `pageCount`, разметка листа та же
 (`PASS-0` / `PASS-A` / `PASS-B`), так что инструменты поверх markdown
