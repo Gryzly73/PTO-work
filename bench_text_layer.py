@@ -56,6 +56,12 @@ def bench(pdf: Path) -> dict:
         # шапкой «Информация о листе».
         md = page["markdown"]
         body = md.split("## Информация о листе")[0]
+        # Заголовок «# Лист N» — наш, а не документа: его номер считался
+        # «числом, которого нет в слое», и достоверность на текстовых
+        # страницах показывала 80–97 % при нуле настоящих расхождений.
+        body = "\n".join(
+            ln for ln in body.splitlines() if not ln.startswith("# Лист ")
+        )
         raw = raw_layers[number - 1]
         rw, rn, _ = tokens_of(raw)
         usable = len(layer.strip()) >= 40 or len(raw.strip()) >= 40
