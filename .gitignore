@@ -144,3 +144,8 @@ scratch/
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Выходы бенчмарков DWG и текстового слоя: тяжёлые, пересчитываются скриптами
+bench_dwg/
+bench_dwg_log.txt
+bench_text/
