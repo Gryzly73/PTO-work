@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import fitz
@@ -63,6 +64,32 @@ def _overlap(block: tuple[float, float, float, float], table: fitz.Rect) -> floa
     return (x1 - x0) * (y1 - y0) / area
 
 
+# Слова от двух букв и числа целиком («5.2», «12,5»): строка из одного
+# номера тома без числа-токена считалась бы пустой, то есть «разложенной по
+# ячейкам», и терялась.
+_WORD_RE = re.compile(r"[A-Za-zА-Яа-яЁё]{2,}|\d+(?:[.,]\d+)*")
+
+
+def _words(text: str) -> set[str]:
+    return {w.lower() for w in _WORD_RE.findall(text)}
+
+
+def _covered(text: str, table_words: set[str]) -> bool:
+    """Есть ли текст блока в таблице — по словам, а не по координатам.
+
+    Строка считается разложенной по ячейкам, если в таблице нашлось не
+    меньше четырёх пятых её слов. Не все сто процентов: ячейки склеиваются и
+    режутся иначе, чем строки блока, и требовать полного совпадения значило
+    бы печатать каждую таблицу дважды. Но и не половина: короткая строка
+    «5.2 Система водоснабжения» при половине совпадала по словам из соседних
+    ячеек и терялась вместе со своим номером.
+    """
+    words = _words(text)
+    if not words:
+        return True
+    return len(words & table_words) >= max(1, 0.8 * len(words))
+
+
 def _looks_like_stamp(text: str) -> bool:
     low = text.lower()
     return sum(1 for word in _STAMP_WORDS if word in low) >= 2
@@ -106,11 +133,33 @@ def page_elements(
         page_rect = page.rect
 
         elements: list[dict] = []
+        table_words = [_words(table_md) for _, table_md in tables]
         for rect, text in blocks:
             # Текст, попавший внутрь таблицы, второй раз не печатаем: он уже
-            # разложен по её ячейкам.
-            if any(_overlap(rect, table_rect) > 0.6 for table_rect, _ in tables):
-                continue
+            # разложен по её ячейкам. Но только если он там действительно
+            # есть. На листах «Содержание» рамка таблицы накрывает весь лист,
+            # а сетка забирает не все строки: «Прилагаемые документы»,
+            # приложения и штамп в неё не попадали и по одному лишь
+            # перекрытию выбрасывались — лист терял до половины слов.
+            inside = [
+                index
+                for index, (table_rect, _) in enumerate(tables)
+                if _overlap(rect, table_rect) > 0.6
+            ]
+            if inside:
+                # Блок MuPDF бывает крупнее таблицы — целая колонка текста, —
+                # и половина его строк в сетке есть, а половина нет. Поэтому
+                # отсеиваем построчно: печатаем только строки, которых в
+                # таблице не нашлось.
+                covered_words = set().union(*(table_words[i] for i in inside))
+                rest = [
+                    line
+                    for line in text.splitlines()
+                    if line.strip() and not _covered(line, covered_words)
+                ]
+                if not rest:
+                    continue
+                text = "\n".join(rest)
             if _looks_like_stamp(text):
                 kind = "stamp"
             elif _looks_like_heading(text):

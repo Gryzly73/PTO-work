@@ -95,7 +95,40 @@ def _words_with_glyphs(page: fitz.Page, glyph_map: dict[str, str] | None) -> lis
     пробел. Для сверки с ТЗ это уже другой шифр, поэтому слова собираем сами
     из посимвольного разбора, где глиф на месте и его можно починить.
     """
+    from deglyph import font_glyph_tables, is_broken_any
+
     out: list = []
+
+    # Починка та же и в том же порядке, что у пути текста
+    # (`deglyph.page_blocks_fixed`): сперва по глифам встроенного шрифта —
+    # это точно, — потом кроссвордная карта, и только для слов, где остались
+    # подменённые символы. Раньше карта применялась ко всем символам
+    # страницы подряд, и на здоровом шрифте портила текст: «Block 1-7»
+    # приезжал в ячейку как «#MPDL 1-7», запятые пропадали, а один и тот же
+    # лист в таблице и в потоке читался по-разному.
+    trace: dict[tuple[float, float], tuple[int, int, str]] = {}
+    tables: dict = {}
+    try:
+        tables = font_glyph_tables(page.parent)
+        if tables:
+            for span in page.get_texttrace():
+                for unicode_value, gid, origin, *_ in span["chars"]:
+                    trace[(round(origin[0], 1), round(origin[1], 1))] = (
+                        unicode_value,
+                        gid,
+                        span["font"],
+                    )
+    except Exception:
+        trace = {}
+
+    def by_font(ch: dict, c: str) -> str:
+        origin = ch.get("origin")
+        hit = trace.get((round(origin[0], 1), round(origin[1], 1))) if origin else None
+        if hit and hit[0] == 0xFFFD:
+            candidates = tables.get(hit[2], {}).get(hit[1], set())
+            if len(candidates) == 1:
+                return chr(next(iter(candidates)))
+        return c
 
     def flush(chars: list) -> None:
         if not chars:
@@ -104,7 +137,10 @@ def _words_with_glyphs(page: fitz.Page, glyph_map: dict[str, str] | None) -> lis
         y0 = min(b[1] for b, _ in chars)
         x1 = max(b[2] for b, _ in chars)
         y1 = max(b[3] for b, _ in chars)
-        out.append((x0, y0, x1, y1, "".join(c for _, c in chars)))
+        word = "".join(c for _, c in chars)
+        if glyph_map and any(is_broken_any(c) for c in word):
+            word = "".join(glyph_map.get(c, c) for c in word)
+        out.append((x0, y0, x1, y1, word))
 
     try:
         data = page.get_text("rawdict")
@@ -116,9 +152,16 @@ def _words_with_glyphs(page: fitz.Page, glyph_map: dict[str, str] | None) -> lis
                 chars: list = []
                 for ch in span.get("chars", ()):
                     c = ch.get("c", "")
-                    if glyph_map:
+                    # И для «пробельных» тоже: запятая сломанного шрифта
+                    # приходит как «\r», а по таблице глифов это gid запятой.
+                    if c:
+                        c = by_font(ch, c)
+                    # Управляющий код — это подменённая пунктуация сломанного
+                    # шрифта («\r» на месте запятой), а не пробел. Сначала
+                    # карта, и только если она его не знает — разделитель.
+                    if c and ord(c) < 0x20 and c not in "\n\t" and glyph_map:
                         c = glyph_map.get(c, c)
-                    if not c or c.isspace():
+                    if not c or c.isspace() or ord(c) < 0x20:
                         flush(chars)
                         chars = []
                         continue
@@ -419,8 +462,15 @@ def page_tables_placed(
         if _swallowed_page(page, raw):
             continue  # рамка листа, в которую ссыпался весь свободный текст
         if glyph_map:  # оценки заполненности считаем уже по починенному тексту
+            from deglyph import is_broken_any
+
             raw = [
-                ["".join(glyph_map.get(ch, ch) for ch in (c or "")) for c in r]
+                [
+                    "".join(glyph_map.get(ch, ch) for ch in (c or ""))
+                    if any(is_broken_any(ch) for ch in (c or ""))
+                    else (c or "")
+                    for c in r
+                ]
                 for r in raw
             ]
         filled = sum(1 for r in raw for c in r if (c or "").strip())

@@ -94,7 +94,7 @@ def render_file(path: Path, out_dir: Path) -> dict:
         pages.append(
             {
                 "index": index,
-                "kind": dwg_sheets.sheet_kind(layers),
+                "kind": dwg_sheets.sheet_kind(layers, len(sheet.texts), blocks),
                 "code": found.code,
                 "sheet": found.sheet,
                 "title": (found.title or sheet.title or "")[:80],
