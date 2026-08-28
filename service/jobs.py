@@ -52,6 +52,10 @@ class Job:
     processingPage: int | None = None
     errorMessage: str | None = None
     pageErrors: dict[str, str] = field(default_factory=dict)
+    # Лист посчитан, но с дырами: часть фрагментов модель не прочитала, слоя
+    # нет и всё читалось по картинке, и т. п. Отдельно от pageErrors: там
+    # листы, которых нет вовсе, здесь — те, которым нельзя верить целиком.
+    pageWarnings: dict[str, str] = field(default_factory=dict)
     usage: dict = field(default_factory=dict)
     profile: dict = field(default_factory=dict)
     cancelRequested: bool = False

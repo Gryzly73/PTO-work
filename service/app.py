@@ -726,6 +726,7 @@ def retry_job(job_id: str, reset: bool = False):
         cancelRequested=False,
         pagesDone=[] if reset else job.pagesDone,
         pageErrors={},
+        pageWarnings={} if reset else job.pageWarnings,
         finishedAt=None,
         elapsedSec=None,
     )

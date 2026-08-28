@@ -269,12 +269,23 @@ class Worker(threading.Thread):
             # Лист уже посчитан — сохраняем, но дальше цикл остановится.
             pass
 
-        store_page_json(job, page_number, result["markdown"])
+        page = store_page_json(job, page_number, result["markdown"])
+        warnings = list(page.get("warnings") or [])
+        if warnings:
+            print(
+                f"[worker] {job.id} лист {page_number}: с предупреждениями — "
+                + "; ".join(warnings),
+                flush=True,
+            )
 
         def mark_done(item: Job) -> None:
             if page_number not in item.pagesDone:
                 item.pagesDone = sorted(item.pagesDone + [page_number])
             item.pageErrors.pop(str(page_number), None)
+            if warnings:
+                item.pageWarnings[str(page_number)] = "; ".join(warnings)
+            else:
+                item.pageWarnings.pop(str(page_number), None)
             item.usage = merge_usage(item.usage, [result["usage"]])
 
         self._store.update(job.id, mark_done)

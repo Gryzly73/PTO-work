@@ -17,6 +17,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 
 from build_ios2_md import extract_pass, is_garbled_pdf_text, normalize_pdf_text
+from score_vs_pdftext import tokens_of
 
 from service import config
 
@@ -38,7 +39,28 @@ KIND_TITLE = {
 
 # Версия формата страницы. Растёт, когда меняется состав markdown — по ней
 # сервис понимает, что кэш листа собран старым кодом, и пересобирает его.
-PAGE_SCHEMA = 7
+PAGE_SCHEMA = 8
+
+# Так конвейер записывает в лист неудавшийся вызов модели при keep-going
+# (hf_api_bench, fail_fast=False): «(ошибка тайла: <исключение>)». Для
+# читателя это не содержимое листа, а дыра в нём, и дыра должна быть видна
+# как предупреждение, а не читаться как текст.
+_MODEL_ERROR_RE = re.compile(r"\((ошибка тайла|ошибка описания):")
+_MODEL_ERROR_MARK = "_[фрагмент не прочитан: ошибка вызова модели]_"
+
+# Уровни доверия листа — что было источником его содержимого.
+TRUST_DWG = "dwg"        # текст прочитан из данных чертежа
+TRUST_LAYER = "layer"    # текст и таблицы из текстового слоя PDF, описание — модель
+TRUST_VLM = "vlm"        # слоя нет: всё прочитано моделью по изображению
+TRUST_NONE = "none"      # с листа ничего не извлечено
+TRUST_TITLE = {
+    TRUST_DWG: "высокая — текст прочитан из данных чертежа, модель не вызывалась",
+    TRUST_LAYER: "высокая — текст и таблицы взяты из текстового слоя PDF дословно; "
+    "«Описание листа» написано моделью",
+    TRUST_VLM: "низкая — текстового слоя нет, всё содержимое прочитано моделью по "
+    "изображению; числа и марки сверять с оригиналом",
+    TRUST_NONE: "нет данных — с листа ничего не извлечено",
+}
 
 # Выводить ли PASS-B в markdown интерфейса. По умолчанию нет: на чертеже это
 # до 100 тыс. символов на лист. Данные остаются в поле fragments и в файле
@@ -236,6 +258,136 @@ def page_flow_elements(pdf_path: Path, page_number: int) -> list[dict]:
 _TABLE_LINE_RE = re.compile(r"^\s*\|.*\|\s*$")
 
 
+def strip_model_errors(text: str) -> tuple[str, int]:
+    """Убирает из текста сырые «(ошибка тайла: …)», возвращает их число.
+
+    Сам текст исключения провайдера инженеру не нужен, а модели-сверщику
+    вреден: она прочитает его как содержимое. Остаётся короткая пометка на
+    месте дыры, а число дыр уходит в предупреждения листа.
+    """
+    if not text or "(ошибка " not in text:
+        return text, 0
+    # Регулярным выражением не обойтись: внутри скобок лежит текст исключения,
+    # а в нём свои скобки — «(Request ID: …)» — и многострочный JSON ответа.
+    # Идём по тексту и закрываем скобку по балансу.
+    out: list[str] = []
+    pos = 0
+    count = 0
+    while True:
+        match = _MODEL_ERROR_RE.search(text, pos)
+        if match is None:
+            out.append(text[pos:])
+            break
+        start = match.start()
+        depth = 0
+        end = None
+        for i in range(start, min(len(text), start + 4000)):
+            ch = text[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        if end is None:
+            # Скобка не закрылась — режем по концу абзаца.
+            cut = text.find("\n\n", start)
+            end = cut if cut >= 0 else len(text)
+        out.append(text[pos:start])
+        out.append(_MODEL_ERROR_MARK)
+        count += 1
+        pos = end
+    return "".join(out), count
+
+
+def assess_trust(
+    *,
+    vector: bool,
+    layer_is_source: bool,
+    layer_text: str,
+    flow: str,
+    tables: list[str],
+    pass_a: str,
+    pass_b: str,
+    model_errors: int = 0,
+    mock: bool = False,
+) -> dict:
+    """Чему на листе можно верить и что должно насторожить.
+
+    Уровень — по источнику содержимого: данные чертежа, текстовый слой PDF
+    или картинка через модель. Предупреждения — про дыры: неудавшиеся
+    вызовы модели, имитация, пустой лист.
+    """
+    has_layer = bool(layer_text.strip()) and (bool(flow.strip()) or bool(tables) or layer_is_source)
+    has_model = bool(pass_a.strip()) or bool(pass_b.strip())
+    if vector:
+        level = TRUST_DWG
+    elif has_layer:
+        level = TRUST_LAYER
+    elif has_model:
+        level = TRUST_VLM
+    else:
+        level = TRUST_NONE
+    warnings: list[str] = []
+    if mock:
+        warnings.append("имитация: сервис работал в режиме mock, модель не вызывалась")
+    if model_errors:
+        warnings.append(
+            f"{model_errors} {_plural(model_errors, 'фрагмент листа не прочитан', 'фрагмента листа не прочитаны', 'фрагментов листа не прочитаны')} "
+            "(ошибка вызова модели) — содержимое листа неполное"
+        )
+    if level == TRUST_VLM:
+        warnings.append("текстового слоя нет: числа и марки прочитаны по изображению")
+    if level == TRUST_NONE:
+        warnings.append("с листа ничего не извлечено")
+    return {"level": level, "title": TRUST_TITLE[level], "warnings": warnings}
+
+
+def check_numbers(reference: str, model_text: str) -> dict | None:
+    """Числа из текста модели, которых нет в документе.
+
+    Главный риск проекта — выдуманная марка или расход, которые на вид не
+    отличить от настоящих. Когда у листа есть текстовый слой, проверка
+    бесплатная: каждое число описания ищется в слое (и в таблицах, собранных
+    из него). Числа, которых там нет, — кандидаты в галлюцинации; они не
+    удаляются, а помечаются, чтобы сверка с ТЗ и инженер видели, чему не
+    верить. Без слоя проверять не с чем — возвращается None.
+    """
+    if len(reference.strip()) < 40 or not model_text.strip():
+        return None
+    _, ref_nums, _ = tokens_of(reference)
+    _, hyp_nums, _ = tokens_of(model_text)
+    if not hyp_nums:
+        return {"checked": True, "total": 0, "found": 0, "precision": None, "suspect": []}
+    found = hyp_nums & ref_nums
+    suspect = sorted(hyp_nums - ref_nums, key=lambda s: (len(s), s))
+    return {
+        "checked": True,
+        "total": len(hyp_nums),
+        "found": len(found),
+        "precision": round(100.0 * len(found) / len(hyp_nums), 1),
+        "suspect": suspect[:40],
+    }
+
+
+def numbers_line(numbers: dict | None) -> str:
+    """Строка «Проверка чисел» для листа."""
+    if numbers is None:
+        return "не выполнялась — у листа нет текстового слоя, сверять не с чем"
+    if not numbers["total"]:
+        return "в описании нет чисел"
+    if not numbers["suspect"]:
+        return f"все {numbers['total']} чисел описания найдены в документе"
+    shown = "; ".join(numbers["suspect"][:12])
+    more = len(numbers["suspect"]) - 12
+    tail = f" и ещё {more}" if more > 0 else ""
+    return (
+        f"{numbers['found']} из {numbers['total']} чисел описания найдены в документе; "
+        f"не найдены (возможно, выдуманы моделью): {shown}{tail}"
+    )
+
+
 def drop_tables_from_description(pass_a: str) -> str:
     """Убирает из описания листа таблицы, которые мы и так собрали скриптом.
 
@@ -299,6 +451,8 @@ def build_page_markdown(
     text_title: str = "Текст с листа (из PDF, дословно)",
     sheet_map: str = "",
     flow: str = "",
+    trust: dict | None = None,
+    numbers: dict | None = None,
 ) -> str:
     # Первым идёт СОДЕРЖИМОЕ листа — текст и таблицы, то, что на нём
     # напечатано. Всё служебное (карта листа, описание, паспорт) уходит вниз,
@@ -350,6 +504,16 @@ def build_page_markdown(
         "",
         f"**Тип листа:** {KIND_TITLE.get(kind, kind)}",
     ]
+    # Надёжность — первое, что должен увидеть тот, кто читает лист про лист:
+    # человек и модель-сверщик. Без неё описание по картинке читается с той
+    # же уверенностью, что и текст из слоя.
+    if trust:
+        tail += ["", f"**Надёжность:** {trust['title']}"]
+        if trust.get("warnings"):
+            tail += ["", "**Предупреждения:**", ""]
+            tail += [f"- {w}" for w in trust["warnings"]]
+        if not vector_kind(kind, trust):
+            tail += ["", f"**Проверка чисел:** {numbers_line(numbers)}"]
     passport = _passport_lines(pass_0)
     if passport:
         tail += ["", passport]
@@ -368,6 +532,11 @@ def build_page_markdown(
     if not any(s.strip() for s in (pass_a, pass_b, layer_text, flow)) and not tables:
         parts += ["_С листа пока ничего не извлечено._", ""]
     return "\n".join(parts).rstrip() + "\n"
+
+
+def vector_kind(kind: str, trust: dict | None) -> bool:
+    """Лист чертежа DWG/DXF: проверка чисел ему не нужна, модели не было."""
+    return bool(trust) and trust.get("level") == TRUST_DWG
 
 
 def page_to_frontend(
@@ -422,6 +591,13 @@ def page_to_frontend(
 
             sheet_map = empty_sheet_map()
 
+    # Неудавшиеся вызовы модели: из текста — в предупреждения.
+    pass_a, errors_a = strip_model_errors(pass_a)
+    pass_b, errors_b = strip_model_errors(pass_b)
+    # Лист старого формата, без секций PASS: ошибки лежат в сыром тексте.
+    _, errors_raw = strip_model_errors(raw_page_md)
+    model_errors = max(errors_a + errors_b, errors_raw)
+
     fragments, removed = ("", 0)
     # У чертежа PASS-B — не описания тайлов, а точный текст листа: пара
     # килобайт, ради которых векторный путь и затевался. Прятать его за
@@ -430,6 +606,26 @@ def page_to_frontend(
         layer_text = pass_b.strip()
     elif pass_b.strip():
         fragments, removed = dedupe_fragment_lines(pass_b)
+
+    trust = assess_trust(
+        vector=vector,
+        layer_is_source=layer_is_source,
+        layer_text=layer_text,
+        flow=flow,
+        tables=tables,
+        pass_a=pass_a,
+        pass_b=pass_b,
+        model_errors=model_errors,
+        mock="[MOCK]" in raw_page_md,
+    )
+    # Числа описания против документа. Эталон — текстовый слой и таблицы из
+    # него; проверяемое — всё, что написала модель (описание и фрагменты).
+    numbers = None
+    if not vector:
+        numbers = check_numbers(
+            "\n".join([layer_text, flow, *tables]),
+            "\n".join([pass_a, pass_b]),
+        )
 
     summary = ""
     if fragments and not include_fragments:
@@ -443,6 +639,13 @@ def page_to_frontend(
 
     if tables:
         pass_a = drop_tables_from_description(pass_a)
+    # На текстовом листе с исправным слоем PASS-A — это тот же текст слоя с
+    # пометкой «модель не вызывалась». Поток листа уже собран из слоя в
+    # порядке исходника, и второй экземпляр того же текста под заголовком
+    # «Описание листа» удваивал страницу (на ИОС2 стр. 8 — 2 121 знак из
+    # 3 860). Источник теперь виден в строке «Надёжность».
+    if layer_is_source and flow.strip():
+        pass_a = ""
 
     markdown = build_page_markdown(
         page_number=page_number,
@@ -462,12 +665,22 @@ def page_to_frontend(
         ),
         sheet_map=sheet_map,
         flow=flow,
+        trust=trust,
+        numbers=numbers,
     )
     return {
         "pageNumber": page_number,
         "kind": kind,
         "markdown": markdown,
         "extractedText": layer_text,
+        # Надёжность листа: источник содержимого и предупреждения. Модель-
+        # сверщик по level решает, чему верить; warnings уходят в pageWarnings
+        # задания, чтобы лист с дырами не выглядел готовым.
+        "trust": trust,
+        "warnings": trust["warnings"],
+        # Числа описания, которых нет в документе, — кандидаты в галлюцинации.
+        # None — проверить нечем (нет текстового слоя) или лист чертежа.
+        "numbers": numbers,
         # Паспорт листа: служебная классификация конвейера. Полем, а не в
         # markdown — на экране он был третьим пересказом тех же меток.
         "passport": pass_0.strip(),
