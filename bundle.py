@@ -110,6 +110,12 @@ class SheetEntry:
 
     number: str
     variants: list[Variant] = field(default_factory=list)
+    # Расхождения считаются по содержимому листов, то есть с чтением файлов
+    # прогона. Спрашивают их дважды — из самого листа и из сводки по
+    # документу, — поэтому считаем один раз.
+    _conflicts: list[tuple[str, str, str, str]] | None = field(
+        default=None, repr=False, compare=False
+    )
 
     @property
     def main(self) -> Variant:
@@ -209,12 +215,26 @@ class SheetEntry:
         return body
 
     def conflicts(self) -> list[tuple[str, str, str, str]]:
-        """Расхождения между источниками: (поле, у главного, у другого, чей).
+        """Расхождения между источниками: (что, у главного, у другого, чей).
 
-        Сравниваем только то, что инженер сверяет глазами: наименование листа
-        и стадию. Разница в числе текстовых объектов или в порядке блоков —
-        следствие способа чтения, а не разных редакций документа.
+        Два рода расхождений, и оба означают разные редакции документа, а не
+        разное чтение одного и того же:
+
+        * **реквизиты** — наименование листа и стадия из основной надписи;
+        * **числа** — строка, которая в обоих источниках написана теми же
+          словами, но с другими числами: «Отметка низа −2.050» против
+          «−2.150». Для ПТО это главное: расхождение в цифре и есть замечание.
+
+        Разница в числе текстовых объектов или в порядке блоков сюда не
+        входит — это следствие способа чтения, и её считает `fuse.compare()`.
         """
+        if self._conflicts is None:
+            self._conflicts = self._find_conflicts()
+        return self._conflicts
+
+    def _find_conflicts(self) -> list[tuple[str, str, str, str]]:
+        import fuse as fuse_mod
+
         main = self.main
         found: list[tuple[str, str, str, str]] = []
         for other in self.others:
@@ -224,6 +244,23 @@ class SheetEntry:
             ):
                 if left and right and _norm_title(left) != _norm_title(right):
                     found.append((label, left, right, other.source_name))
+        # Числа сверяем только с источником другого рода: два чтения одного
+        # чертежа расходиться числами не могут, а вот чертёж и отпечатанный
+        # с него альбом — могут, и это то самое.
+        main_body = main.body()
+        if main_body.strip():
+            for other in self.others:
+                if other.is_vector == main.is_vector:
+                    continue
+                other_body = other.body()
+                if not other_body.strip():
+                    continue
+                for phrase, left, right in fuse_mod.number_conflicts(
+                    main_body, other_body
+                ):
+                    found.append(
+                        (f"числа в строке «{phrase}»", left, right, other.source_name)
+                    )
         return found
 
 

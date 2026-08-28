@@ -211,6 +211,96 @@ def _new_lines(
     return out, known
 
 
+# ── расхождения в числах ─────────────────────────────────────────────────────
+#
+# Счётная сверка выше отвечает на вопрос «сколько совпало». Она не видит
+# главного для ПТО: когда обе версии листа говорят одно и то же, но **разными
+# числами** — «Отметка низа −2.050» в чертеже против «−2.150» в альбоме. Это и
+# есть разные редакции, ровно то, что проверяющий обязан заметить.
+#
+# Ищем так: у каждой строки берём «скелет» — текст, в котором все числа
+# заменены на «#». Если один и тот же скелет есть в обоих источниках, а числа
+# в нём разные — это расхождение, и его можно показать дословно, обеими
+# строками. Отличие «есть только в чертеже» сюда не попадает: это разница
+# чтения, а не редакции, и её считает `compare()`.
+
+_NUMBER = re.compile(r"[-−]?\d+(?:[.,]\d+)?")
+# Строки конвейера: заголовки проходов, наши же маркеры, разделители таблиц.
+_SKIP_LINE = re.compile(
+    r"^\s*(?:#{1,6}\s|\|[\s:|-]+\|\s*$|_[^_]*_\s*$|-{3,}\s*$|>\s)"
+)
+# Скелет короче этого сравнивать нельзя: «# #» совпадёт с чем угодно.
+_MIN_SKELETON_CHARS = 12
+_MIN_SKELETON_LETTERS = 4
+
+
+def _norm_number(text: str) -> str:
+    """Число к сравнимому виду: запятая → точка, минус один, нули в хвосте."""
+    value = text.replace("−", "-").replace(",", ".")
+    if "." in value:
+        value = value.rstrip("0").rstrip(".")
+    if value in ("-", ""):
+        return "0"
+    return value
+
+
+def _skeleton(line: str) -> tuple[str, tuple[str, ...]]:
+    """(текст без чисел, сами числа) — ключ для сравнения строк источников."""
+    numbers = tuple(_norm_number(m.group()) for m in _NUMBER.finditer(line))
+    bare = _NUMBER.sub("#", line)
+    # Разделители таблиц и лишние пробелы к делу не относятся: одна и та же
+    # надпись в DXF нарезана ячейками, а в PDF идёт строкой.
+    bare = re.sub(r"[|·•]+", " ", bare)
+    bare = re.sub(r"\s+", " ", bare).strip().lower().replace("ё", "е")
+    return bare, numbers
+
+
+def _skeletons(body: str) -> dict[str, list[tuple[tuple[str, ...], str]]]:
+    out: dict[str, list[tuple[tuple[str, ...], str]]] = {}
+    for raw in (body or "").splitlines():
+        line = raw.strip()
+        if not line or _SKIP_LINE.match(line) or any(m in line for m in MARKERS):
+            continue
+        bare, numbers = _skeleton(line)
+        if not numbers:
+            continue
+        if len(bare) < _MIN_SKELETON_CHARS:
+            continue
+        if sum(1 for ch in bare if ch.isalpha()) < _MIN_SKELETON_LETTERS:
+            continue
+        out.setdefault(bare, []).append((numbers, line))
+    return out
+
+
+def number_conflicts(
+    vector_body: str, raster_body: str, *, limit: int = 12
+) -> list[tuple[str, str, str]]:
+    """Строки, совпавшие словами, но разошедшиеся числами.
+
+    Возвращает `(что за строка, как в чертеже, как во втором источнике)`.
+
+    Сравниваем только те скелеты, которые встречаются в каждом источнике
+    **ровно один раз**. Если одна и та же формулировка идёт столбцом таблицы
+    («Отметка низа») — какое из значений какому соответствует, мы не знаем, и
+    выдавать пару наугад значило бы придумывать расхождение. Пропуск лучше
+    выдумки: такие строки просто не показываем.
+    """
+    left = _skeletons(vector_body)
+    right = _skeletons(raster_body)
+    found: list[tuple[str, str, str]] = []
+    for bare, entries in left.items():
+        other = right.get(bare)
+        if not other or len(entries) != 1 or len(other) != 1:
+            continue
+        (numbers, line), (other_numbers, other_line) = entries[0], other[0]
+        if numbers == other_numbers:
+            continue
+        found.append((bare.replace("#", "…"), line, other_line))
+        if len(found) >= limit:
+            break
+    return found
+
+
 def compare(vector_body: str, raster_body: str) -> dict:
     """Счётная сверка двух чтений одного листа.
 
