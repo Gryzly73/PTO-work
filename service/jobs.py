@@ -56,6 +56,9 @@ class Job:
     # нет и всё читалось по картинке, и т. п. Отдельно от pageErrors: там
     # листы, которых нет вовсе, здесь — те, которым нельзя верить целиком.
     pageWarnings: dict[str, str] = field(default_factory=dict)
+    # Сколько листов задания ушло в модель (нет пригодного слоя или скан) —
+    # против бюджета PTO_MAX_MODEL_PAGES.
+    modelPages: int = 0
     usage: dict = field(default_factory=dict)
     profile: dict = field(default_factory=dict)
     cancelRequested: bool = False

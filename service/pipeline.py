@@ -99,6 +99,53 @@ class Pipeline:
         return info
 
     # --- работа -------------------------------------------------------------
+    def skipped_page(
+        self, pdf_path: Path, page_number: int, run_dir: Path, *, passport, reason: str
+    ) -> dict:
+        """Лист, который сознательно не считался (скан при PTO_SCAN_POLICY=skip).
+
+        Пишется в том же контракте, что и обычный лист: паспорт в PASS-0 и
+        причина в PASS-A. Так лист остаётся в документе на своём месте, а
+        интерфейс и модель-сверщик видят, почему он пуст, вместо того чтобы
+        считать его потерянным.
+        """
+        from sheet_aware import passport_markdown
+
+        started = time.time()
+        content = (
+            "### PASS-0 Паспорт листа\n\n"
+            + passport_markdown(passport)
+            + "\n### PASS-A Описание листа\n\n"
+            + f"_Лист не обрабатывался: {reason}_\n"
+        )
+        target = page_file(run_dir, page_number)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {
+            "markdown": content,
+            "usage": {},
+            "elapsed": round(time.time() - started, 1),
+            "skipped": True,
+        }
+
+    def page_needs_model(self, pdf_path: Path, page_number: int, passport) -> bool:
+        """Уйдёт ли лист в модель: скан или слой, на который нельзя опереться."""
+        if is_vector(pdf_path) or self.mode != "real":
+            return False
+        if passport is not None and passport.needs_model:
+            return True
+        if not config.LAYER_AWARE:
+            return True
+        try:
+            import hf_api_bench as hb
+
+            with fitz.open(pdf_path) as doc:
+                page = doc[page_number - 1]
+                kind = passport.kind if passport is not None else None
+                return not hb.page_layer_is_usable(page, page_number, kind)
+        except Exception:
+            return True
+
     def run_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> dict:
         """Считает один лист. Возвращает markdown, usage и время."""
         started = time.time()

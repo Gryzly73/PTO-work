@@ -245,7 +245,8 @@ class Worker(threading.Thread):
     ) -> None:
         if self._cancel_requested(job.id):
             return
-        kind = convert.kind_from_page(pdf_path, page_number)
+        passport = convert.passport_for_page(pdf_path, page_number)
+        kind = convert.KIND_MAP.get(passport.kind, "mixed") if passport else "mixed"
         self._store.patch(
             job.id,
             processingPage=page_number,
@@ -253,8 +254,50 @@ class Worker(threading.Thread):
         )
         if self._cancel_requested(job.id):
             return
+        # Скан и бюджет — до вызова модели. Скан при политике skip не
+        # считается вовсе; лист сверх бюджета модельных листов — тоже, но
+        # это ошибка листа, а не предупреждение: его досчитает «Повтор»
+        # после того, как лимит поднимут.
+        skip_reason = None
+        if passport is not None and passport.needs_model and config.SCAN_POLICY == "skip":
+            skip_reason = (
+                (
+                    "скан (нет текстового слоя, изображение на весь лист)"
+                    if passport.scan
+                    else "нет текстового слоя (текст выведен контурами)"
+                )
+                + "; сервис настроен не считать такие листы моделью (PTO_SCAN_POLICY=skip)"
+            )
+        elif config.MAX_MODEL_PAGES and self._pipeline.page_needs_model(
+            pdf_path, page_number, passport
+        ):
+            current = self._store.get(job.id)
+            used = current.modelPages if current else 0
+            if used >= config.MAX_MODEL_PAGES:
+                message = (
+                    f"лист не считался: исчерпан бюджет листов через модель "
+                    f"({used} из {config.MAX_MODEL_PAGES}, PTO_MAX_MODEL_PAGES); "
+                    "поднимите лимит и нажмите «Повтор» — досчитаются только они"
+                )
+                print(f"[worker] {job.id} лист {page_number}: {message}", flush=True)
+
+                def mark_budget(item: Job) -> None:
+                    item.pageErrors[str(page_number)] = message
+
+                self._store.update(job.id, mark_budget)
+                return
+
+            def count_model_page(item: Job) -> None:
+                item.modelPages = used + 1
+
+            self._store.update(job.id, count_model_page)
         try:
-            result = self._pipeline.run_page(pdf_path, page_number, run_dir)
+            if skip_reason:
+                result = self._pipeline.skipped_page(
+                    pdf_path, page_number, run_dir, passport=passport, reason=skip_reason
+                )
+            else:
+                result = self._pipeline.run_page(pdf_path, page_number, run_dir)
         except Exception as error:  # keep-going: лист падает, документ живёт
             message = f"{type(error).__name__}: {error}"
             print(f"[worker] {job.id} лист {page_number}: {message}", flush=True)

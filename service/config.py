@@ -176,6 +176,22 @@ ZONE_HINTS = _env_bool("PTO_ZONE_HINTS", False)
 # остаётся ручным переключателем.
 PAGE_CONCURRENCY = max(1, _env_int("PTO_PAGE_CONCURRENCY", 1))
 
+# Сканы — листы без текстового слоя с картинкой на весь лист (печать DWG в
+# PDF, отсканированный том). Через модель такой лист идёт до 15 минут и
+# 70 тыс. токенов, а результат для сверки хуже, чем у любого слоя.
+#   model — считать моделью, как раньше (лист получит «Надёжность: низкая»);
+#   skip  — не считать: лист выходит с паспортом и предупреждением, документ
+#           продолжает считаться. Для комплектов, где сканы — ошибка сборки.
+SCAN_POLICY = (_env_str("PTO_SCAN_POLICY", "model") or "model").lower()
+if SCAN_POLICY not in {"model", "skip"}:
+    raise RuntimeError(f"PTO_SCAN_POLICY={SCAN_POLICY!r}: допустимо model или skip")
+
+# Бюджет документа: сколько листов одного задания разрешено считать
+# моделью (лист без пригодного слоя или скан). 0 — без ограничения. Листы
+# сверх бюджета не считаются и попадают в pageErrors; «Повтор» после
+# увеличения лимита досчитает только их.
+MAX_MODEL_PAGES = max(0, _env_int("PTO_MAX_MODEL_PAGES", 0))
+
 # --- сеть -------------------------------------------------------------------
 HOST = _env_str("PTO_SERVICE_HOST", "127.0.0.1")
 PORT = _env_int("PTO_SERVICE_PORT", 8000)
@@ -225,6 +241,8 @@ def profile_dict() -> dict:
         "modeSource": MODE_SOURCE,
         "model": MODEL,
         "provider": PROVIDER,
+        "scanPolicy": SCAN_POLICY,
+        "maxModelPages": MAX_MODEL_PAGES,
         "sheetAware": SHEET_AWARE,
         "lean": LEAN,
         "twoPass": TWO_PASS,

@@ -108,16 +108,37 @@ def kind_from_passport_md(pass_0: str) -> str | None:
     return KIND_MAP.get(raw)
 
 
-def kind_from_page(pdf_path: Path, page_number: int) -> str:
-    """Запасной путь: классификация листа без обращения к модели."""
+def passport_for_page(pdf_path: Path, page_number: int):
+    """Паспорт листа без модели; None для чертежа и при сбое разбора."""
+    if pdf_path.suffix.lower() in (".dwg", ".dxf"):
+        return None
     try:
         from sheet_aware import build_passport
 
         with fitz.open(pdf_path) as doc:
-            passport = build_passport(doc[page_number - 1], page_number)
-        return KIND_MAP.get(passport.kind, "mixed")
+            return build_passport(doc[page_number - 1], page_number)
     except Exception:
-        return "mixed"
+        return None
+
+
+def kind_from_page(pdf_path: Path, page_number: int) -> str:
+    """Запасной путь: классификация листа без обращения к модели."""
+    passport = passport_for_page(pdf_path, page_number)
+    return KIND_MAP.get(passport.kind, "mixed") if passport else "mixed"
+
+
+# «- scan: да (…)» и «- слой: нет (…)» из паспорта листа в PASS-0.
+_PASSPORT_SCAN_RE = re.compile(r"^\s*[-*]?\s*scan:\s*(да|true|yes)", re.I | re.M)
+_PASSPORT_NOLAYER_RE = re.compile(r"^\s*[-*]?\s*слой:\s*нет", re.I | re.M)
+_SKIPPED_RE = re.compile(r"_Лист не обрабатывался:")
+
+
+def scan_from_passport_md(pass_0: str) -> bool:
+    return bool(_PASSPORT_SCAN_RE.search(pass_0 or ""))
+
+
+def no_layer_from_passport_md(pass_0: str) -> bool:
+    return bool(_PASSPORT_NOLAYER_RE.search(pass_0 or ""))
 
 
 def page_layer_text(pdf_path: Path, page_number: int) -> str:
@@ -312,6 +333,9 @@ def assess_trust(
     pass_b: str,
     model_errors: int = 0,
     mock: bool = False,
+    scan: bool = False,
+    no_layer: bool = False,
+    skipped: bool = False,
 ) -> dict:
     """Чему на листе можно верить и что должно насторожить.
 
@@ -320,7 +344,9 @@ def assess_trust(
     вызовы модели, имитация, пустой лист.
     """
     has_layer = bool(layer_text.strip()) and (bool(flow.strip()) or bool(tables) or layer_is_source)
-    has_model = bool(pass_a.strip()) or bool(pass_b.strip())
+    # У пропущенного листа в PASS-A только пометка «не обрабатывался» —
+    # это не содержимое.
+    has_model = (bool(pass_a.strip()) or bool(pass_b.strip())) and not skipped
     if vector:
         level = TRUST_DWG
     elif has_layer:
@@ -330,6 +356,18 @@ def assess_trust(
     else:
         level = TRUST_NONE
     warnings: list[str] = []
+    if scan:
+        warnings.append(
+            "скан: текстового слоя нет, лист — одно изображение; "
+            + ("не обрабатывался" if skipped else "всё содержимое только по модели")
+        )
+    elif no_layer:
+        warnings.append(
+            "текстового слоя нет (текст выведен контурами, как при печати DWG в PDF); "
+            + ("лист не обрабатывался" if skipped else "всё содержимое только по модели")
+        )
+    elif skipped:
+        warnings.append("лист не обрабатывался сервисом")
     if mock:
         warnings.append("имитация: сервис работал в режиме mock, модель не вызывалась")
     if model_errors:
@@ -607,6 +645,14 @@ def page_to_frontend(
     elif pass_b.strip():
         fragments, removed = dedupe_fragment_lines(pass_b)
 
+    # Скан — из паспорта в PASS-0; если паспорта нет (лист без вывода
+    # конвейера), смотрим на саму страницу.
+    scan = scan_from_passport_md(pass_0)
+    no_layer = no_layer_from_passport_md(pass_0)
+    if not vector and not pass_0.strip():
+        passport = passport_for_page(pdf_path, page_number)
+        scan = bool(passport and passport.scan)
+        no_layer = bool(passport and passport.no_layer)
     trust = assess_trust(
         vector=vector,
         layer_is_source=layer_is_source,
@@ -617,6 +663,9 @@ def page_to_frontend(
         pass_b=pass_b,
         model_errors=model_errors,
         mock="[MOCK]" in raw_page_md,
+        scan=scan,
+        no_layer=no_layer,
+        skipped=bool(_SKIPPED_RE.search(pass_a or "")),
     )
     # Числа описания против документа. Эталон — текстовый слой и таблицы из
     # него; проверяемое — всё, что написала модель (описание и фрагменты).

@@ -44,6 +44,20 @@ class SheetPassport:
     title_hints: list[str] = field(default_factory=list)
     diam_samples: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    # Скан: текстового слоя нет (или он мусор), а лист накрыт одной
+    # картинкой. Печать DWG в PDF, отсканированный том — всё это идёт через
+    # модель целиком (до 15 минут и 70 тыс. токенов на лист), и знать это
+    # надо до того, как лист ушёл в очередь, а не по счёту от провайдера.
+    scan: bool = False
+    image_share: float = 0.0  # доля площади листа под самой большой картинкой
+    # Слоя нет, но и картинки нет: текст выведен контурами. Так печатает
+    # DWG в PDF конвертер CadConvert — 8 страниц по 0 знаков и 0 % картинки.
+    # Для конвейера это то же, что скан: всё содержимое только через модель.
+    no_layer: bool = False
+
+    @property
+    def needs_model(self) -> bool:
+        return self.scan or self.no_layer
 
     def context_pack(self, *, max_labels: int = 40) -> str:
         parts: list[str] = [
@@ -160,6 +174,19 @@ def build_passport(page: fitz.Page, page_num: int) -> SheetPassport:
             kind = "text"
             reasons.append("a4 default text")
 
+    from build_ios2_md import is_garbled_pdf_text
+
+    image_share = _largest_image_share(page)
+    layerless = len(raw.strip()) < SCAN_MAX_LAYER_CHARS or is_garbled_pdf_text(raw)
+    scan = layerless and image_share >= SCAN_IMAGE_SHARE
+    no_layer = layerless and not scan
+    if scan:
+        reasons.append(
+            f"scan: image {image_share:.0%} of sheet, layer {len(raw.strip())} chars"
+        )
+    elif no_layer:
+        reasons.append(f"no text layer: {len(raw.strip())} chars")
+
     return SheetPassport(
         page_num=page_num,
         kind=kind,
@@ -170,7 +197,34 @@ def build_passport(page: fitz.Page, page_num: int) -> SheetPassport:
         title_hints=title_hints,
         diam_samples=diams,
         reasons=reasons,
+        scan=scan,
+        image_share=image_share,
+        no_layer=no_layer,
     )
+
+
+# Скан: картинка занимает не меньше этой доли листа, а текстового слоя
+# меньше этого числа знаков (или он кракозябры). Печать DWG в PDF на
+# комплекте «Жуковский» — 8 страниц по одной картинке и ноль знаков.
+SCAN_IMAGE_SHARE = 0.6
+SCAN_MAX_LAYER_CHARS = 40
+
+
+def _largest_image_share(page: fitz.Page) -> float:
+    """Доля площади листа под самой большой картинкой (0, если картинок нет)."""
+    try:
+        infos = page.get_image_info()
+    except Exception:
+        return 0.0
+    area = max(page.rect.width * page.rect.height, 1.0)
+    best = 0.0
+    for info in infos:
+        bbox = info.get("bbox")
+        if not bbox:
+            continue
+        rect = fitz.Rect(bbox) & page.rect
+        best = max(best, rect.get_area() / area)
+    return round(min(best, 1.0), 3)
 
 
 SYSTEM_DESC_PLAN = (
@@ -781,9 +835,19 @@ def generic_describe_zones(
 
 
 def passport_markdown(passport: SheetPassport) -> str:
+    if passport.scan:
+        scan_line = (
+            f"- scan: да (изображение {passport.image_share:.0%} листа, "
+            f"слой {passport.text_len} зн.)\n"
+        )
+    elif passport.no_layer:
+        scan_line = f"- слой: нет ({passport.text_len} зн., текст выведен контурами)\n"
+    else:
+        scan_line = ""
     return (
         f"- kind: `{passport.kind}`\n"
-        f"- size_pt: {passport.width_pt:.0f}×{passport.height_pt:.0f}\n"
+        + scan_line
+        + f"- size_pt: {passport.width_pt:.0f}×{passport.height_pt:.0f}\n"
         f"- text_len: {passport.text_len}\n"
         f"- reasons: {', '.join(passport.reasons) or '—'}\n"
         f"- title_hints: {'; '.join(passport.title_hints[:4]) or '—'}\n"
