@@ -7,7 +7,7 @@
 
   python build_quality_viewer.py \\
     --pdf "new_files/Раздел ПД №5 Подраздел №2 (ИОС2).pdf" \\
-    --md ИОС2_итог.md \\
+    --md archive/измерения/ИОС2_итог.md \\
     -o quality_viewer_ios2/index.html
 """
 from __future__ import annotations
