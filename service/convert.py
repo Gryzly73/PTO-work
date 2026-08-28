@@ -38,7 +38,7 @@ KIND_TITLE = {
 
 # Версия формата страницы. Растёт, когда меняется состав markdown — по ней
 # сервис понимает, что кэш листа собран старым кодом, и пересобирает его.
-PAGE_SCHEMA = 6
+PAGE_SCHEMA = 7
 
 # Выводить ли PASS-B в markdown интерфейса. По умолчанию нет: на чертеже это
 # до 100 тыс. символов на лист. Данные остаются в поле fragments и в файле
@@ -353,6 +353,8 @@ def build_page_markdown(
     passport = _passport_lines(pass_0)
     if passport:
         tail += ["", passport]
+    # Карта листа приходит только для чертежа (пустой заготовкой — см.
+    # `flow.empty_sheet_map`); у текста и таблиц её нет.
     if sheet_map.strip():
         tail += ["", "**Что где на листе**", "", sheet_map.strip()]
     if pass_a.strip():
@@ -406,12 +408,19 @@ def page_to_frontend(
         elements = page_flow_elements(pdf_path, page_number)
         tables = [e["text"] for e in elements if e["kind"] == "table"]
         if elements:
-            from service.flow import flow_markdown, sheet_map_markdown
+            from service.flow import flow_markdown
 
-            sheet_map = sheet_map_markdown(elements)
             flow = flow_markdown(elements)
         else:
             tables = page_tables(pdf_path, page_number)
+        # Карта «что где на листе» нужна только чертежу: на листе текста или
+        # таблиц она повторяла строками «текст — север — 1 стр.» то, что и
+        # так видно в потоке. Для чертежа секция остаётся, но пустой — её
+        # заполняет разбор чертежей, а не координаты текстового слоя.
+        if kind == "drawing":
+            from service.flow import empty_sheet_map
+
+            sheet_map = empty_sheet_map()
 
     fragments, removed = ("", 0)
     # У чертежа PASS-B — не описания тайлов, а точный текст листа: пара
