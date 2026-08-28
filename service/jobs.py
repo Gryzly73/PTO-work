@@ -162,13 +162,30 @@ class JobStore:
             self._flush_locked()
             return True
 
-    def next_queued(self) -> Job | None:
+    def next_queued(self, accept: Callable[[Job], bool] | None = None) -> Job | None:
         with self._lock:
             for jid in self._order:
                 job = self._jobs.get(jid)
-                if job and job.status == STATUS_QUEUED and not job.cancelRequested:
-                    return job
+                if not job or job.status != STATUS_QUEUED or job.cancelRequested:
+                    continue
+                if accept is not None and not accept(job):
+                    continue
+                return job
             return None
+
+    def claim_next(self, accept: Callable[[Job], bool] | None = None) -> Job | None:
+        """Берёт первую подходящую задачу из очереди и сразу помечает её
+        взятой — под тем же замком. Воркеров два (модельный и чертёжный), и
+        без атомарного захвата оба могли бы подхватить одну задачу между
+        «посмотрел» и «пометил»."""
+        with self._lock:
+            job = self.next_queued(accept)
+            if job is None:
+                return None
+            job.status = STATUS_PROCESSING
+            job.startedAt = job.startedAt or now_iso()
+            self._flush_locked()
+            return job
 
     def active(self) -> list[Job]:
         return [job for job in self.list() if job.status in ACTIVE_STATUSES]

@@ -47,11 +47,26 @@ from service.pipeline import (
 )
 from service.transcribe import TranscribeError, transcribe
 from service.transcribe import describe as whisper_describe
-from service.worker import Worker, load_page_json
+from service.worker import LANE_MODEL, LANE_VECTOR, Worker, load_page_json
 
 store = JobStore()
 pipeline = Pipeline()
-worker = Worker(store, pipeline)
+# Две полосы очереди: PDF идут через модель по одной задаче, а DWG/DXF
+# считаются из данных за секунды отдельным потоком — чтобы чертёж не ждал
+# за растровым PDF, у которого один лист занимает до 15 минут.
+worker = Worker(store, pipeline, lane=LANE_MODEL)
+vector_worker = Worker(store, pipeline, lane=LANE_VECTOR)
+workers = (worker, vector_worker)
+
+
+def wake_workers() -> None:
+    for item in workers:
+        item.wake()
+
+
+def current_jobs() -> dict[str, str | None]:
+    """Что считает каждая полоса: {"model": id | None, "vector": id | None}."""
+    return {item.lane: item.current_job_id for item in workers}
 
 
 @asynccontextmanager
@@ -63,14 +78,16 @@ async def lifespan(app: FastAPI):
             f"[service] после перезапуска вернул в очередь задач: {len(revived)}",
             flush=True,
         )
-    worker.start()
+    for item in workers:
+        item.start()
     print(
         f"[service] режим={config.MODE} (источник={config.MODE_SOURCE}) "
         f"модель={config.MODEL} прогоны={config.RUNS_DIR}",
         flush=True,
     )
     yield
-    worker.shutdown()
+    for item in workers:
+        item.shutdown()
 
 
 app = FastAPI(title="ПТО: конвейер PDF → Markdown", version="0.1.0", lifespan=lifespan)
@@ -194,7 +211,7 @@ def _create_job(
         documentId=document_id,
         profile=pipeline.describe(),
     )
-    worker.wake()
+    wake_workers()
     return job
 
 
@@ -266,7 +283,10 @@ def health():
             "error": sum(1 for j in jobs if j.status == STATUS_ERROR),
             "canceled": sum(1 for j in jobs if j.status == STATUS_CANCELED),
         },
+        # currentJobId — модельная полоса (PDF), как и раньше; currentJobs —
+        # обе полосы: чертёжная считает DWG/DXF параллельно с ней.
         "currentJobId": worker.current_job_id,
+        "currentJobs": current_jobs(),
         "transcribe": whisper_describe(),
         "time": now_iso(),
     }
@@ -376,7 +396,11 @@ def list_jobs(
         jobs = [job for job in jobs if job.status in wanted]
     if active:
         jobs = [job for job in jobs if job.status in ACTIVE_STATUSES]
-    return {"jobs": [job.to_dict() for job in jobs], "currentJobId": worker.current_job_id}
+    return {
+        "jobs": [job.to_dict() for job in jobs],
+        "currentJobId": worker.current_job_id,
+        "currentJobs": current_jobs(),
+    }
 
 
 @app.get("/jobs/{job_id}")
@@ -705,7 +729,7 @@ def retry_job(job_id: str, reset: bool = False):
         finishedAt=None,
         elapsedSec=None,
     )
-    worker.wake()
+    wake_workers()
     return updated.to_dict() if updated else {}
 
 

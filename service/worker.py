@@ -1,8 +1,17 @@
 """Фоновый воркер: разбирает очередь и считает документы лист за листом.
 
-Одна задача за раз — конвейер синхронный и упирается в лимиты провайдера.
-Внутри задачи листы можно считать параллельно (PTO_PAGE_CONCURRENCY), но по
-умолчанию тоже по одному.
+Воркера два, у каждого своя полоса очереди:
+
+- модельный (`lane="model"`) — PDF. Одна задача за раз: конвейер синхронный
+  и упирается в лимиты провайдера. Внутри задачи листы можно считать
+  параллельно (PTO_PAGE_CONCURRENCY), но по умолчанию тоже по одному;
+- чертёжный (`lane="vector"`) — DWG и DXF. Модель им не нужна, лист читается
+  из данных за секунды, поэтому ждать за PDF без текстового слоя (2–15 минут
+  на лист) им незачем: на проде DWG на 7 листов считался 3,8 с, а в очереди
+  стоял минуты.
+
+Полосы не пересекаются: задачу берёт только воркер её полосы, и захват идёт
+под замком хранилища (`JobStore.claim_next`).
 
 Дисциплина ошибок повторяет CLI: keep-going. Упавший лист попадает в
 pageErrors и не роняет весь документ — на 1000 страниц потерять всё из-за
@@ -28,7 +37,16 @@ from service.jobs import (
     merge_usage,
     now_iso,
 )
-from service.pipeline import Pipeline, page_file, rebuild_out_md
+from service.pipeline import Pipeline, is_vector, page_file, rebuild_out_md
+
+# Полосы очереди: какие задачи берёт воркер.
+LANE_MODEL = "model"    # PDF — через модель, по одной задаче
+LANE_VECTOR = "vector"  # DWG/DXF — без модели, отдельным потоком
+LANES = (LANE_MODEL, LANE_VECTOR)
+
+
+def lane_of(job: Job) -> str:
+    return LANE_VECTOR if is_vector(Path(job.pdfPath)) else LANE_MODEL
 
 # Шаг, который показывает фронт (ProcessingStep в types.ts). Текстовые листы
 # идут как «Текст и таблицы», чертежи и схемы — как «Описание чертежа».
@@ -77,13 +95,21 @@ def load_page_json(job: Job, page_number: int) -> dict | None:
 
 
 class Worker(threading.Thread):
-    def __init__(self, store: JobStore, pipeline: Pipeline) -> None:
-        super().__init__(name="pto-worker", daemon=True)
+    def __init__(
+        self, store: JobStore, pipeline: Pipeline, lane: str = LANE_MODEL
+    ) -> None:
+        if lane not in LANES:
+            raise ValueError(f"Неизвестная полоса воркера: {lane!r}")
+        super().__init__(name=f"pto-worker-{lane}", daemon=True)
         self._store = store
         self._pipeline = pipeline
         self._wake = threading.Event()
         self._stop = threading.Event()
+        self.lane = lane
         self.current_job_id: str | None = None
+
+    def _accepts(self, job: Job) -> bool:
+        return lane_of(job) == self.lane
 
     # --- управление ---------------------------------------------------------
     def wake(self) -> None:
@@ -95,7 +121,7 @@ class Worker(threading.Thread):
 
     def run(self) -> None:
         while not self._stop.is_set():
-            job = self._store.next_queued()
+            job = self._store.claim_next(self._accepts)
             if job is None:
                 self._wake.wait(timeout=1.0)
                 self._wake.clear()
@@ -104,7 +130,10 @@ class Worker(threading.Thread):
                 self._run_job(job)
             except Exception:
                 message = traceback.format_exc(limit=3)
-                print(f"[worker] задача {job.id} упала:\n{message}", flush=True)
+                print(
+                    f"[worker:{self.lane}] задача {job.id} упала:\n{message}",
+                    flush=True,
+                )
                 self._store.patch(
                     job.id,
                     status=STATUS_ERROR,
