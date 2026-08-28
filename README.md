@@ -373,6 +373,7 @@ PDF между процессами не копируется: фронт кла
 cp .env.example .env                          # вписать HF_TOKEN и PTO_API_TOKEN
 docker compose --profile mock up -d --build   # имитация: связка, порты, тома
 python -m service.smoke_test                  # самопроверка: 12 проверок
+python -m pytest -q tests                     # тесты без модели (те же идут в CI перед деплоем)
 docker compose --profile mock down
 docker compose --profile real up -d --build   # настоящий прогон
 ```
