@@ -2467,15 +2467,58 @@ def _text_by_zone(sheet: Sheet, items: list[TextItem]) -> list[str]:
     return out
 
 
+# Тип листа для интерфейса и для карты: чертёж (есть вычерченная геометрия)
+# или текстовый лист. Тот же словарь, что у PDF-паспорта (`plan` → drawing).
+KIND_PLAN = "plan"
+KIND_TEXT = "text"
+
+
+# Порог по длине вычерченных линий. На листе-таблице (состав проекта,
+# спецификация) геометрия — это рамка и линейки ячеек: 2–6 м на комплекте
+# «Жуковский». У чертежа линии вычерчены в натуральную величину: узел цоколя —
+# 430 м, фундаменты — 400–3500 м, план — 6000 м. Между ними пусто.
+_PLAN_MIN_LENGTH_M = 40.0
+
+
+def sheet_kind(layers, texts: int = 0, blocks=None) -> str:
+    """Чертёж или текстовый лист.
+
+    Одного «есть ли линии» мало: у таблицы состава проекта тоже есть линии —
+    рамка и сетка ячеек, — и по прежнему правилу все листы СП шли как
+    чертёж. Смотрим на объём геометрии: длину линий, число вставленных блоков
+    и отношение объектов к подписям.
+    """
+    stats = list(layers or [])
+    total_len = sum(st.length_m for st in stats)
+    entities = sum(st.entities for st in stats)
+    inserted = sum(blocks.values()) if blocks else 0
+    if total_len <= 0 and inserted == 0:
+        return KIND_TEXT
+    if total_len >= _PLAN_MIN_LENGTH_M or inserted >= 3:
+        return KIND_PLAN
+    # Мало линий и блоков: чертёж, только если геометрии заметно больше,
+    # чем подписей (схема с парой надписей), иначе это таблица с сеткой.
+    return KIND_PLAN if entities >= 5 * max(texts, 1) else KIND_TEXT
+
+
+# Шапка карты листа — та же, что у PDF (`service/flow.py`), чтобы разбор
+# чертежей дописывал строки в готовую таблицу.
+SHEET_MAP_HEADER = ("| Блок | Где на листе | Объём |", "|---|---|---|")
+
+
 def sheet_map(sheet: Sheet, layers=None, tables=None, ole=0) -> str:
     """Карта листа: что за блок, где он и какого объёма.
 
     Пишется для модели: строки однообразны, содержимое не пересказывается —
     оно идёт ниже дословно. Нужна, чтобы вопрос «что в правом нижнем углу»
     не приходилось решать по потоку подписей.
+
+    Сервисом сейчас не вызывается: у текстовых листов карты нет, у чертежа
+    выводится пустая заготовка (см. `sheet_markdown`). Оставлена как готовый
+    инструмент для разбора чертежей.
     """
     box = sheet.extent()
-    rows = ["| Блок | Где на листе | Объём |", "|---|---|---|"]
+    rows = list(SHEET_MAP_HEADER)
     if box is None:
         return ""
     stamp = [t for t in sheet.texts if any(w in t.text.lower() for w in _STAMP_WORDS)]
@@ -2614,15 +2657,21 @@ def sheet_markdown(
     # Карта листа идёт в PASS-A, а не отдельной секцией PASS-0: сервис
     # считает PASS-0 служебным паспортом и в интерфейс его не выводит, а карта
     # нужна как раз на экране и в промпте.
-    map_md = sheet_map(sheet, layers, tables, ole)
-    if map_md:
+    #
+    # Нужна она только чертежу. На листе с текстом и таблицами (состав
+    # проекта, спецификации, записка) строки «подписи — северо-восток —
+    # 1 шт.» ничего не добавляют к тексту, который идёт ниже дословно, и
+    # только мешают модели. Поэтому у текстового листа карты нет вовсе, а у
+    # чертежа остаётся пустая заготовка: её заполняет разбор чертежей
+    # (`sheet_map` — готовая сборка по зонам, если она подойдёт).
+    if sheet_kind(layers, len(sheet.texts), blocks) == KIND_PLAN:
         parts += [
             "### PASS-A Карта листа",
             "",
             "_Что где лежит на листе. Содержимое не пересказывается — оно ниже "
             "дословно._",
             "",
-            map_md,
+            *SHEET_MAP_HEADER,
             "",
         ]
     if ole:
@@ -2750,8 +2799,7 @@ def page_markdown(path: Path, page_number: int) -> tuple[str, str]:
     head, sep, rest = body.partition(chr(10))
     if head.startswith("## Страница"):
         body = rest.lstrip()
-    kind = "plan" if any(st.length_m > 0 for st in layers) else "text"
-    return body, kind
+    return body, sheet_kind(layers, len(sheet.texts), blocks)
 
 
 def main() -> int:
