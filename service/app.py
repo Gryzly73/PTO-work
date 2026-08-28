@@ -333,14 +333,24 @@ async def create_job(
     """
     if file is not None:
         name = (file.filename or "").lower()
-        # DWG и DXF принимаем наравне с PDF: у чертежа текст, слои и размеры
-        # лежат данными, и лист читается точнее, чем из отрисованной страницы.
+        # DWG, DXF и DOCX принимаем наравне с PDF: у чертежа текст, слои и
+        # размеры лежат данными, у записки .docx — текст и таблицы. И то, и
+        # другое читается точнее, чем из отрисованной страницы.
         suffix = next(
-            (s for s in (".pdf", ".dwg", ".dxf") if name.endswith(s)), ""
+            (s for s in (".pdf", ".dwg", ".dxf", ".docx") if name.endswith(s)), ""
         )
         if not suffix:
+            # Старый бинарный .doc — другой формат, внешним конвертером его
+            # здесь нет. Говорим прямо, что делать, вместо общего отказа.
+            if name.endswith(".doc"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Старый формат .doc не читается. Откройте файл в Word "
+                    "и сохраните как .docx — текст и таблицы возьмутся из него "
+                    "как данные, без модели.",
+                )
             raise HTTPException(
-                status_code=400, detail="Принимаются PDF, DWG и DXF"
+                status_code=400, detail="Принимаются PDF, DWG, DXF и DOCX"
             )
         config.ensure_dirs()
         target = config.UPLOADS_DIR / f"{uuid.uuid4()}{suffix}"

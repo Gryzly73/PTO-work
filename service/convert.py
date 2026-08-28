@@ -50,11 +50,14 @@ _MODEL_ERROR_MARK = "_[фрагмент не прочитан: ошибка вы
 
 # Уровни доверия листа — что было источником его содержимого.
 TRUST_DWG = "dwg"        # текст прочитан из данных чертежа
+TRUST_DOCX = "docx"      # текст и таблицы прочитаны из файла записки
 TRUST_LAYER = "layer"    # текст и таблицы из текстового слоя PDF, описание — модель
 TRUST_VLM = "vlm"        # слоя нет: всё прочитано моделью по изображению
 TRUST_NONE = "none"      # с листа ничего не извлечено
 TRUST_TITLE = {
     TRUST_DWG: "высокая — текст прочитан из данных чертежа, модель не вызывалась",
+    TRUST_DOCX: "высокая — текст и таблицы прочитаны из файла .docx дословно, "
+    "модель не вызывалась",
     TRUST_LAYER: "высокая — текст и таблицы взяты из текстового слоя PDF дословно; "
     "«Описание листа» написано моделью",
     TRUST_VLM: "низкая — текстового слоя нет, всё содержимое прочитано моделью по "
@@ -325,6 +328,7 @@ def strip_model_errors(text: str) -> tuple[str, int]:
 def assess_trust(
     *,
     vector: bool,
+    docx: bool = False,
     layer_is_source: bool,
     layer_text: str,
     flow: str,
@@ -347,7 +351,9 @@ def assess_trust(
     # У пропущенного листа в PASS-A только пометка «не обрабатывался» —
     # это не содержимое.
     has_model = (bool(pass_a.strip()) or bool(pass_b.strip())) and not skipped
-    if vector:
+    if docx:
+        level = TRUST_DOCX
+    elif vector:
         level = TRUST_DWG
     elif has_layer:
         level = TRUST_LAYER
@@ -573,8 +579,9 @@ def build_page_markdown(
 
 
 def vector_kind(kind: str, trust: dict | None) -> bool:
-    """Лист чертежа DWG/DXF: проверка чисел ему не нужна, модели не было."""
-    return bool(trust) and trust.get("level") == TRUST_DWG
+    """Лист, прочитанный из данных (чертёж или .docx): модели не было,
+    проверять числа не с чем и незачем."""
+    return bool(trust) and trust.get("level") in (TRUST_DWG, TRUST_DOCX)
 
 
 def page_to_frontend(
@@ -599,13 +606,16 @@ def page_to_frontend(
     # У чертежа ни текстового слоя PDF, ни сеток MuPDF нет и быть не может:
     # его лист уже разобран конвейером в данные.
     vector = pdf_path.suffix.lower() in (".dwg", ".dxf")
+    # Записка .docx: текста PDF и сеток MuPDF у неё тоже нет — содержимое уже
+    # разобрано конвейером в данные, как у чертежа.
+    docx = pdf_path.suffix.lower() == ".docx"
     kind = kind_hint or kind_from_passport_md(pass_0)
-    if not kind and not vector:
+    if not kind and not vector and not docx:
         kind = kind_from_page(pdf_path, page_number)
     kind = kind or "mixed"
     # Всё PDF-специфичное для чертежа пропускаем.
     sheet_map, flow = "", ""
-    if vector:
+    if vector or docx:
         layer_text, tables = "", []
     else:
         # Сначала подстановка — с выводом модели как словарём-подсказкой. Иначе
@@ -640,7 +650,7 @@ def page_to_frontend(
     # У чертежа PASS-B — не описания тайлов, а точный текст листа: пара
     # килобайт, ради которых векторный путь и затевался. Прятать его за
     # «не выводится из-за объёма» бессмысленно, он идёт на экран целиком.
-    if vector:
+    if vector or docx:
         layer_text = pass_b.strip()
     elif pass_b.strip():
         fragments, removed = dedupe_fragment_lines(pass_b)
@@ -649,12 +659,13 @@ def page_to_frontend(
     # конвейера), смотрим на саму страницу.
     scan = scan_from_passport_md(pass_0)
     no_layer = no_layer_from_passport_md(pass_0)
-    if not vector and not pass_0.strip():
+    if not vector and not docx and not pass_0.strip():
         passport = passport_for_page(pdf_path, page_number)
         scan = bool(passport and passport.scan)
         no_layer = bool(passport and passport.no_layer)
     trust = assess_trust(
         vector=vector,
+        docx=docx,
         layer_is_source=layer_is_source,
         layer_text=layer_text,
         flow=flow,
@@ -670,7 +681,7 @@ def page_to_frontend(
     # Числа описания против документа. Эталон — текстовый слой и таблицы из
     # него; проверяемое — всё, что написала модель (описание и фрагменты).
     numbers = None
-    if not vector:
+    if not vector and not docx:
         numbers = check_numbers(
             "\n".join([layer_text, flow, *tables]),
             "\n".join([pass_a, pass_b]),
@@ -710,6 +721,8 @@ def page_to_frontend(
         text_title=(
             "Текст листа (из чертежа, дословно)"
             if vector
+            else "Текст записки (из DOCX, дословно)"
+            if docx
             else "Лист дословно (из PDF, в порядке исходника)"
         ),
         sheet_map=sheet_map,

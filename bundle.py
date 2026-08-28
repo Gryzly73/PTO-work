@@ -37,6 +37,7 @@ from pathlib import Path
 import stamp as stamp_mod
 
 VECTOR_SUFFIXES = {".dwg", ".dxf"}
+DOCX_SUFFIXES = {".docx"}
 
 
 @dataclass
@@ -44,7 +45,7 @@ class Variant:
     """Один лист, как он пришёл из одного конкретного файла."""
 
     source_name: str      # имя файла-источника
-    source_kind: str      # «DWG» или «PDF»
+    source_kind: str      # «DWG», «PDF» или «DOCX»
     index: int            # порядковый номер листа в файле, 1..N
     stamp: stamp_mod.Stamp
     job_id: str = ""      # прогон, в котором лист посчитан
@@ -354,6 +355,10 @@ def read_source(
         return _read_vector(
             path, name=display, run_dir=run_dir, job_id=job_id, limit=limit
         )
+    if suffix in DOCX_SUFFIXES:
+        return _read_docx(
+            path, name=display, run_dir=run_dir, job_id=job_id, limit=limit
+        )
     return _read_pdf(path, name=display, run_dir=run_dir, job_id=job_id, limit=limit)
 
 
@@ -372,6 +377,46 @@ def _read_vector(
                 index=index,
                 source_path=str(path),
                 stamp=stamp_mod.from_dwg_sheet(sheet),
+                job_id=job_id,
+                run_dir=run_dir,
+            )
+        )
+    return out
+
+
+def _read_docx(
+    path: Path, *, name: str, run_dir: str, job_id: str, limit: int | None
+) -> list[Variant]:
+    """Пояснительная записка .docx. Реквизиты — из колонтитулов Word.
+
+    Записка встаёт в тот же раздел, что и чертежи: у неё шифр вида
+    `28-ХСА-1/25-КР1.ПЗ`, а `Stamp.section` отрезает суффикс текстовой части.
+    Номер листа в колонтитуле — сквозной по записке и к нашей нумерации
+    отношения не имеет, поэтому лист нумеруем по порядку в файле.
+    """
+    import docx_text
+
+    found = docx_text.read_stamp(path)
+    sheets = docx_text.read_sheets(path)
+    out: list[Variant] = []
+    for index in range(1, len(sheets[: limit or len(sheets)]) + 1):
+        sheet_stamp = stamp_mod.Stamp(
+            code=found.code,
+            sheet=str(index),
+            stage=found.stage,
+            title=found.title,
+            object_name=found.object_name,
+            org=found.org,
+            source="DOCX",
+            note=found.note,
+        )
+        out.append(
+            Variant(
+                source_name=name,
+                source_kind="DOCX",
+                index=index,
+                source_path=str(path),
+                stamp=sheet_stamp,
                 job_id=job_id,
                 run_dir=run_dir,
             )

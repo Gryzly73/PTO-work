@@ -33,8 +33,20 @@ def page_file(run_dir: Path, page_number: int) -> Path:
 VECTOR_SUFFIXES = {".dwg", ".dxf"}
 
 
+DOCX_SUFFIXES = {".docx"}
+
+
 def is_vector(path: Path) -> bool:
     return path.suffix.lower() in VECTOR_SUFFIXES
+
+
+def is_docx(path: Path) -> bool:
+    return path.suffix.lower() in DOCX_SUFFIXES
+
+
+def without_model(path: Path) -> bool:
+    """Документ, который читается данными: чертёж или записка .docx."""
+    return is_vector(path) or is_docx(path)
 
 
 def pdf_page_count(pdf_path: Path) -> int:
@@ -43,11 +55,16 @@ def pdf_page_count(pdf_path: Path) -> int:
 
 
 def document_sheets(path: Path) -> int:
-    """Сколько листов в документе: страницы PDF или листы чертежа."""
+    """Сколько листов в документе: страницы PDF, листы чертежа или записки."""
     if is_vector(path):
         from dwg_sheets import sheet_count
 
         return sheet_count(path)
+    if is_docx(path):
+        from docx_text import sheet_count as docx_sheet_count
+
+        # В .docx страниц нет; листов столько, сколько явных разрывов в файле.
+        return docx_sheet_count(path)
     return pdf_page_count(path)
 
 
@@ -130,7 +147,7 @@ class Pipeline:
 
     def page_needs_model(self, pdf_path: Path, page_number: int, passport) -> bool:
         """Уйдёт ли лист в модель: скан или слой, на который нельзя опереться."""
-        if is_vector(pdf_path) or self.mode != "real":
+        if without_model(pdf_path) or self.mode != "real":
             return False
         if passport is not None and passport.needs_model:
             return True
@@ -149,10 +166,14 @@ class Pipeline:
     def run_page(self, pdf_path: Path, page_number: int, run_dir: Path) -> dict:
         """Считает один лист. Возвращает markdown, usage и время."""
         started = time.time()
-        if is_vector(pdf_path):
-            # Чертёж читается как данные: ни токена, ни модели не нужно,
-            # поэтому и prepare() здесь не к месту — он требует HF_TOKEN.
-            raw = self._vector_page(pdf_path, page_number, run_dir)
+        if without_model(pdf_path):
+            # Чертёж и записка читаются как данные: ни токена, ни модели не
+            # нужно, поэтому и prepare() здесь не к месту — он требует HF_TOKEN.
+            raw = (
+                self._docx_page(pdf_path, page_number, run_dir)
+                if is_docx(pdf_path)
+                else self._vector_page(pdf_path, page_number, run_dir)
+            )
             return {
                 "markdown": raw,
                 "usage": {},
@@ -179,6 +200,21 @@ class Pipeline:
             "usage": usage,
             "elapsed": round(time.time() - started, 1),
         }
+
+    def _docx_page(self, path: Path, page_number: int, run_dir: Path) -> str:
+        """Лист записки .docx. Модель не вызывается: текст лежит в файле."""
+        from docx_text import page_markdown
+
+        try:
+            body, kind = page_markdown(path, page_number)
+        except IndexError as e:
+            raise PipelineError(str(e)) from e
+        except Exception as e:
+            raise PipelineError(f"Не удалось прочитать .docx: {e}") from e
+        target = page_file(run_dir, page_number)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+        return body
 
     def _vector_page(self, path: Path, page_number: int, run_dir: Path) -> str:
         """Лист чертежа. Модель не вызывается: всё нужное лежит в файле."""

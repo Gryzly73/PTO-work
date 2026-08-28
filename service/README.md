@@ -92,7 +92,7 @@ docker compose --profile mock up --build
 | --- | --- | --- |
 | `POST` | `/transcribe` | расшифровка голосового замечания (Whisper) |
 | `GET` | `/health` | режим, профиль прогона, счётчики очереди, `currentJobs` — что считает каждая полоса (`model`, `vector`) |
-| `POST` | `/jobs` | поставить документ в очередь: multipart с файлом либо JSON `{path, originalName, projectId, documentId, pages}` |
+| `POST` | `/jobs` | поставить документ в очередь: multipart с файлом (PDF, DWG, DXF, DOCX) либо JSON `{path, originalName, projectId, documentId, pages}` |
 | `GET` | `/jobs` | очередь; фильтры `projectId`, `documentId`, `status`, `active` |
 | `GET` | `/jobs/{id}` | статус, текущий лист, `pagesDone`, `usage` |
 | `GET` | `/jobs/{id}/pages` | готовые листы; `after=N` — дельта, `pages=1,5,7` — выборочно |
@@ -174,6 +174,9 @@ hf_runs/<stamp>_<model>_svc-<id>/
   досчитываются — готовые `page_NNNN.md` не пересчитываются.
 - **Ошибка листа.** Лист попадает в `pageErrors`, документ продолжает
   считаться. Документ становится `error`, только если не вышел ни один лист.
+- **Форматы.** PDF, DWG, DXF и DOCX. Чертёж и записка `.docx` читаются
+  данными, без модели, и уровень доверия у них `dwg` и `docx`. Старый
+  бинарный `.doc` отклоняется с просьбой пересохранить в `.docx`.
 - **Сканы и листы без слоя.** Паспорт листа опознаёт скан (нет текстового
   слоя, картинка на весь лист) и лист без слоя (текст выведен контурами —
   так печатает DWG в PDF). `PTO_SCAN_POLICY=model` (по умолчанию) — считать
