@@ -50,15 +50,19 @@ new_files/pto_scoring_kit/*
 # === Результаты прогонов (регенерируется запуском раннера) ===
 hf_runs/
 hf_runs_mock/
+local_runs/
+# JSON, SVG, PNG, CSV, HTML прогонов: кропы, легенды, вьюеры, таблицы.
+# Уже отслеживаемые файлы gitignore не снимет — только новые.
+*.json
+!page_map.json
+*.svg
+*.png
+*.csv
+*.html
 # Логи и отчёты замеров качества вывода (measure_output.py)
 bench_lean/
 bench_*.md
-bench_*.md.meta.json
 bench_*.md.pages/
-bench_*.compare.json
-*.compare.json
-pdftext.json
-readiness.json
 
 # === Собранные выгрузки Markdown (артефакты, а не исходники) ===
 ИОС2_*.md
