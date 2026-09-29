@@ -76,6 +76,35 @@ def _is_label(text: str) -> bool:
     return meaningful >= 2
 
 
+def _is_legend_section_header(text: str) -> bool:
+    """Legend column category title (e.g. «Г Р А Н И Ц Ы»), not a symbol row."""
+
+    compact = "".join(_plain(text).split()).casefold().replace("ё", "е")
+    return compact == "границы"
+
+
+def _compact_caption(text: str) -> str:
+    return "".join(_plain(text).split()).casefold().replace("ё", "е")
+
+
+def _is_groundwater_level_caption(text: str) -> bool:
+    compact = _compact_caption(text)
+    return "уровнягрунтовыхвод" in compact or "уровеньгрунтовыхвод" in compact
+
+
+def _is_measurement_date_caption(text: str) -> bool:
+    return _compact_caption(text) == "датазамера"
+
+
+def _independent_groundwater_date_captions(texts: list[Any]) -> bool:
+    """УГВ mark and «дата замера» are two signs, not a wrap of one phrase."""
+
+    plains = [_plain(str(item.text)) for item in texts]
+    return any(_is_groundwater_level_caption(text) for text in plains) and any(
+        _is_measurement_date_caption(text) for text in plains
+    )
+
+
 def has_legend_heading(texts: Iterable[Any]) -> bool:
     """Whether a sheet contains an explicit legend/notation heading."""
 
@@ -504,9 +533,15 @@ def _split_symbol_line_row(
     Boundary types still split when each short caption has its own stroke.
     Complete well-diagram callouts (устье vs подошва) are different signs,
     not a wrap of one phrase, even if they share a shaft.
+    The long УГВ caption plus «дата замера» is the same case: two signs.
+    The wrap detector would keep them joined (first line ≥ 40 chars).
     """
 
-    if len(items) < 2 or _looks_like_wrapped_label(items):
+    if len(items) < 2:
+        return [items]
+    if _independent_groundwater_date_captions(items):
+        return [[item] for item in items]
+    if _looks_like_wrapped_label(items):
         return [items]
     column_x = median(item.x for item in items)
     y0 = min(item.y for item in items) - 3.0
@@ -809,7 +844,7 @@ def fill_unmatched_insert_marks(
             unmatched,
             key=lambda pair: abs(_bbox_mid_y(pair[1].symbol_bbox) - cy),
         )
-        if entry.symbol_bbox is None:
+        if entry.symbol_bbox is None or _is_legend_section_header(entry.label or ""):
             continue
         primitive = {
             "type": "line",
@@ -899,6 +934,8 @@ def detect_legend_entries(
                 )
                 vectors, exceeded = _crop_primitives(all_primitives, symbol_bbox)
                 signature = _vector_signature(vectors, symbol_bbox)
+                if _is_legend_section_header(label):
+                    signature = None
                 entry_id = stable_id(
                     "LE",
                     document_id,

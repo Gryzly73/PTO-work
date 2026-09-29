@@ -9,6 +9,7 @@ from typing import Any, Iterable
 
 from .artifacts import load_items
 from .circle_key import circle_heading
+from .named_block import NAMED_BLOCK_EVIDENCE, field_legend_type_label
 from .dimension_read import dimension_from_mapping
 from .axis_read import axis_from_mapping
 from .gost_welds import WELD_GOST_REASON, weld_entry
@@ -29,6 +30,10 @@ _EVIDENCE_DESCRIPTIONS = {
     "project_exact_block_definition": (
         "Тот же уникальный блок, что в каталоге легенды другого листа комплекта. "
         "На поле листа стык confirmed; локальная легенда не нужна."
+    ),
+    "named_block_legend": (
+        "Имя блока на поле однозначно совпадает с одной строкой легенды этого листа. "
+        "Номер образца или скважины с клетки легенды на поле не переносится."
     ),
 }
 
@@ -72,8 +77,11 @@ _FURNITURE_REASON_DESCRIPTIONS = {
         "Безымянный блок на слое фахверка / стоек / металла / фундамента — "
         "повторяющаяся конструкция, не условный знак."
     ),
+    "ANONYMOUS_DIMENSION_LAYER": (
+        "Безымянный блок *U / A$ на слое 0_dim — служебный размер, не условный знак."
+    ),
     "SERVICE_LAYER": (
-        "Вставка на служебном слое размеров, отметок или надписей."
+        "Вставка на служебном слое размеров, отметок, надписей или LinkedData."
     ),
     "AXIS_LAYER": (
         "Вставка на слое осей — буквенно-цифровая марка оси, не условный знак легенды."
@@ -338,8 +346,10 @@ def _recognized_card(
 ) -> str:
     status = binding["status"]
     label = legend.get("label") or "Описание легенды не прочитано"
-    heading = circle_heading(instance.get("blockName"), label)
     evidence = binding.get("evidence") or []
+    if any(item.get("kind") == NAMED_BLOCK_EVIDENCE for item in evidence):
+        label = field_legend_type_label(label)
+    heading = circle_heading(instance.get("blockName"), label)
     explanation = " ".join(
         _EVIDENCE_DESCRIPTIONS.get(item["kind"], item.get("detail", item["kind"]))
         for item in evidence

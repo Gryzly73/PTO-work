@@ -5,7 +5,9 @@ when a *same-sheet* sample uniquely matches: the cell's simple stroke, a native
 HATCH pattern, or the existing vector hash. That is also §5 (PZU): the row
 must live on *this* sheet. Project-catalog / GOST genplan dictionaries are not
 applied. A shared sample (one drawing — several labels) stays unlabeled.
-HatchPolicy.IGNORE still hides fills on the sheet SVG.
+Hatch uniqueness stays among *all* legend rows; a unique sample on a
+non-soil row (УГВ, дата замера, отметки, «ГРАНИЦЫ») does not label the
+fill or a field stroke. HatchPolicy.IGNORE still hides fills on the sheet SVG.
 
 Fail-closed: stamp, legend and notes windows are skipped; FORMAT-like layers
 are skipped; a shared sample across two legend rows stays unlabeled.
@@ -31,6 +33,25 @@ _SKIP_LAYERS = frozenset(
 )
 _STROKE_TYPES = frozenset({"line", "polyline"})
 _FIELD_TYPES = frozenset({"line", "polyline", "hatch"})
+_SOIL_FILL_STEMS = (
+    "глин",
+    "суглин",
+    "супес",
+    "песок",
+    "песк",
+    "торф",
+    "сапропел",
+    "известняк",
+    "почвенно-растительн",
+    "дресв",
+    "щебн",
+    "галечник",
+    "мергел",
+    "доломит",
+    "аргиллит",
+    "алевролит",
+    "песчаник",
+)
 
 
 def _folded(text: str) -> str:
@@ -169,6 +190,32 @@ def _eligible(
     if field is not None and not _in_bbox(cx, cy, field):
         return None
     return points, bbox
+
+
+def _legend_row_text(entry: Any) -> str:
+    parts = [str(getattr(entry, "label", "") or "")]
+    parts.extend(str(item) for item in getattr(entry, "source_texts", ()) or ())
+    return _folded(" ".join(parts))
+
+
+def _legend_is_soil_fill(entry: Any) -> bool:
+    """Lithology row only. УГВ, date, elevations and «ГРАНИЦЫ» are not soil."""
+
+    text = _legend_row_text(entry)
+    if not text:
+        return False
+    compact = "".join(text.split())
+    if "границ" in compact:
+        return False
+    if "датазамера" in compact:
+        return False
+    if "уровнягрунтовыхвод" in compact or "уровеньгрунтовыхвод" in compact:
+        return False
+    if "отметка" in text and any(
+        token in text for token in ("устья", "подошв", "забоя")
+    ):
+        return False
+    return any(stem in text for stem in _SOIL_FILL_STEMS)
 
 
 def _hatch_key(primitive: Mapping[str, Any]) -> str | None:
@@ -340,13 +387,16 @@ def collect_field_geometry(
                 ],
                 raw_bbox,
             )
+        kind = _kind_of(primitive, points)
         row = None
         for key in _field_keys(primitive, points, raw_bbox, signature):
             hit = unique_rows.get(key)
-            if hit is not None:
-                row = hit
-                break
-        kind = _kind_of(primitive, points)
+            if hit is None:
+                continue
+            if not _legend_is_soil_fill(hit):
+                continue
+            row = hit
+            break
         label = str(row.label or "") if row is not None else ""
         legend_id = row.id if row is not None else ""
         items.append(

@@ -4,8 +4,8 @@ Runs after H2 INSERT inventory and before H4 legend matching. Instances stay in
 the sidecar; only role and status change. Classification requires reproducible
 proof (stamp attributes, named block+layer, or a narrow service layer). Geology
 borehole marks (CPE/PR_* / Skv/Probe) stay field candidates: a unique legend
-cell INSERT is H4, otherwise an explicit «нет стыка» note — never a guessed
-abbreviation. Specification marks (axes, room numbers) are identifiers for a
+cell INSERT is H4; a unique block-name → one legend row is named_block_legend;
+otherwise an explicit «нет стыка» note — never a guessed abbreviation. Specification marks (axes, room numbers) are identifiers for a
 separate schedule, not legend symbols and not drawing objects. Welding stays
 unknown unless the block signature is in ``gost_welds.json`` with a GOST 2.312
 code (not the layer ``SVARKA`` as a whole). Slope (уклон) and building codes
@@ -42,6 +42,7 @@ TRAP_BLOCK_LAYER_REASON = "TRAP_BLOCK_LAYER"
 FURNITURE_BLOCK_LAYER_REASON = "FURNITURE_BLOCK_LAYER"
 GEOLOGY_NO_JOIN_REASON = "GEOLOGY_NO_LEGEND_JOIN"
 ANONYMOUS_CONSTRUCTION_LAYER_REASON = "ANONYMOUS_CONSTRUCTION_LAYER"
+ANONYMOUS_DIMENSION_LAYER_REASON = "ANONYMOUS_DIMENSION_LAYER"
 SERVICE_LAYER_REASON = "SERVICE_LAYER"
 AXIS_LAYER_REASON = "AXIS_LAYER"
 AXIS_ATTRIBUTE_REASON = "AXIS_ATTRIBUTE"
@@ -56,7 +57,9 @@ FRAME_COVERAGE_THRESHOLD = 0.85
 STAMP_TOKEN_MINIMUM = 2
 AXIS_LAYERS = frozenset({"osi"})
 AXIS_ATTRIBUTE_KEYS = frozenset({"ось", "ось'"})
-SERVICE_LAYERS = frozenset({"razmer", "otmetki", "nadpisi", "подписи"})
+SERVICE_LAYERS = frozenset({"razmer", "otmetki", "nadpisi", "подписи", "linkeddata"})
+# 0_dim is not a SERVICE_LAYERS dump: only anonymous *U / A$ ghosts.
+DIMENSION_LAYERS = frozenset({"0_dim"})
 GEOLOGY_LAYERS = frozenset({"skv", "probe"})
 GEOLOGY_BLOCKS = frozenset(
     {"cpe", "cce", "cme", "cge", "pr_kv", "pr_tr", "pr_vd"}
@@ -173,6 +176,13 @@ def _is_trap(instance: SymbolInstance) -> bool:
 def _is_anonymous_construction(instance: SymbolInstance) -> bool:
     return (
         _folded(instance.layer) in CONSTRUCTION_LAYERS
+        and _is_anonymous_name(instance.block_name)
+    )
+
+
+def _is_anonymous_dimension(instance: SymbolInstance) -> bool:
+    return (
+        _folded(instance.layer) in DIMENSION_LAYERS
         and _is_anonymous_name(instance.block_name)
     )
 
@@ -363,6 +373,8 @@ def classify_instance(
         return _as_ignored(instance, "specification_mark", reason)
     if _is_service_layer(instance):
         return _as_ignored(instance, "drawing_annotation", SERVICE_LAYER_REASON)
+    if _is_anonymous_dimension(instance):
+        return _as_ignored(instance, "drawing_annotation", ANONYMOUS_DIMENSION_LAYER_REASON)
     reason = label_reason(instance)
     if reason is not None:
         return _as_ignored(instance, "drawing_annotation", reason)

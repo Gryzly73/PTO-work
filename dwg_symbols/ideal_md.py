@@ -18,6 +18,7 @@ from . import SCHEMA_VERSION
 from .artifacts import load_items
 from .circle_key import circled_number, legend_display_line, parse_circle_block_name
 from .furniture import GEOLOGY_NO_JOIN_REASON
+from .named_block import NAMED_BLOCK_EVIDENCE, field_legend_type_label
 
 UNREAD = "не прочитано"
 WHOLE_SHEET_TITLE = "лист целиком"
@@ -122,10 +123,17 @@ def render_ideal_markdown(
     notes_section = _notes_section(notes)
     if notes_section:
         parts.extend(["", notes_section])
+    wells = _wells_section(legends, instances, bindings)
     parts.extend(
         [
             "",
             _description_section(scenes, instances, summary.get("sheetZones")),
+        ]
+    )
+    if wells:
+        parts.extend(["", wells])
+    parts.extend(
+        [
             "",
             _gaps_section(scenes, notes, instances, clusters),
         ]
@@ -493,6 +501,51 @@ def _description_section(
     else:
         blocks = [_description_block(WHOLE_SHEET_TITLE, None)]
     return "## Описание изображения\n\n" + "\n\n".join(blocks)
+
+
+def _wells_type_labels(
+    legends: Iterable[Mapping[str, Any]],
+    instances: Iterable[Mapping[str, Any]],
+    bindings: Iterable[Mapping[str, Any]],
+) -> list[str]:
+    """Unique field well/sample types. Legend-cell numbers 123/329 stay off the field."""
+
+    legends_by_id = {
+        str(entry.get("id") or ""): entry for entry in legends if entry.get("id")
+    }
+    bound_ids = {
+        str(item.get("instanceId") or "")
+        for item in bindings
+        if any(
+            str(evidence.get("kind") or "") == NAMED_BLOCK_EVIDENCE
+            for evidence in (item.get("evidence") or [])
+        )
+    }
+    labels: list[str] = []
+    seen: set[str] = set()
+    for item in instances:
+        if str(item.get("id") or "") not in bound_ids:
+            continue
+        entry = legends_by_id.get(str(item.get("legendEntryId") or ""))
+        if entry is None:
+            continue
+        label = field_legend_type_label(str(entry.get("label") or ""))
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+    return labels
+
+
+def _wells_section(
+    legends: Iterable[Mapping[str, Any]],
+    instances: Iterable[Mapping[str, Any]],
+    bindings: Iterable[Mapping[str, Any]],
+) -> str:
+    labels = _wells_type_labels(legends, instances, bindings)
+    if not labels:
+        return ""
+    return "### Скважины и пробы\n\n" + _bullet_list(labels)
 
 
 def _has_geology_no_join(

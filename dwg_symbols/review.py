@@ -16,6 +16,7 @@ from .artifacts import _atomic_json, write_page_result
 from .context_resolver import resolve_layer_context
 from .furniture import annotate_geology_marks, classify_sheet_furniture
 from .geometry_resolver import resolve_geometry_profiles
+from .named_block import resolve_named_block_legend
 from .legends import (
     _crop_primitives,
     _crop_svg,
@@ -456,6 +457,7 @@ def run_sheet_review(
     result = resolve_exact_blocks(result)
     result = resolve_geometry_profiles(result, extraction.primitives)
     result = resolve_layer_context(result, extraction.primitives)
+    result = resolve_named_block_legend(result)
     result = annotate_geology_marks(result)
     result = attach_dimensions(result, extraction.texts)
     result = attach_axes(result, extraction.texts)
